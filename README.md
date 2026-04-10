@@ -13,6 +13,8 @@ The current foundation covers:
 - a minimal DSL parser/validator/compiler path,
 - starter hand-authored piece programs,
 - a deterministic simulator with orthodox movement, legal-move filtering, hooks, and replay traces,
+- a search-only MCTS baseline with stable move ids and a deterministic fallback evaluator,
+- deterministic self-play records with replay traces and JSONL export helpers,
 - a CLI boundary for compile and verification flows,
 - importable interfaces for simulator, search, model, training, and evaluation work.
 
@@ -35,10 +37,11 @@ PYTHONPATH=src python3 -m pixie_solver verify-piece --file data/pieces/handautho
 
 ## Current Milestone
 
-This repo is at the M2 boundary:
+This repo is in early M4:
 
 - repository skeleton and core interfaces are in place,
 - DSL compilation works for hand-authored starter pieces,
 - the simulator covers orthodox movement plus the minimal v1 magical modifiers/effects,
 - deterministic replay is available for move/event verification,
-- search, model, training, and evaluation are still scaffolded for later milestones.
+- search-only MCTS and deterministic self-play are available,
+- the policy/value model, training loop, and tactical regression harness are still ahead.

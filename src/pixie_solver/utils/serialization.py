@@ -48,6 +48,30 @@ def canonical_json(value: Any, *, indent: int | None = None) -> str:
     )
 
 
+def write_jsonl(path: str | Path, rows: Any) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(canonical_json(row))
+            handle.write("\n")
+
+
+def read_jsonl(path: str | Path) -> list[dict[str, JsonValue]]:
+    records: list[dict[str, JsonValue]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"JSONL record on line {line_number} must be an object"
+                )
+            records.append(record)
+    return records
+
 @dataclass(frozen=True, slots=True)
 class ReplayStep:
     ply: int
