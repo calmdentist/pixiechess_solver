@@ -12,6 +12,7 @@ The current foundation covers:
 - frozen core runtime types for pieces, moves, events, and game state,
 - a minimal DSL parser/validator/compiler path,
 - starter hand-authored piece programs,
+- a deterministic simulator with orthodox movement, legal-move filtering, hooks, and replay traces,
 - a CLI boundary for compile and verification flows,
 - importable interfaces for simulator, search, model, training, and evaluation work.
 
@@ -34,9 +35,10 @@ PYTHONPATH=src python3 -m pixie_solver verify-piece --file data/pieces/handautho
 
 ## Current Milestone
 
-This repo is at the M0/M1 boundary:
+This repo is at the M2 boundary:
 
-- repository skeleton is in place,
-- core interfaces are frozen enough for parallel work,
-- DSL compilation works for simple hand-authored pieces,
-- simulator/search/model/training work is still intentionally stubbed behind explicit interfaces.
+- repository skeleton and core interfaces are in place,
+- DSL compilation works for hand-authored starter pieces,
+- the simulator covers orthodox movement plus the minimal v1 magical modifiers/effects,
+- deterministic replay is available for move/event verification,
+- search, model, training, and evaluation are still scaffolded for later milestones.
