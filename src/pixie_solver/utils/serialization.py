@@ -72,7 +72,6 @@ def read_jsonl(path: str | Path) -> list[dict[str, JsonValue]]:
             records.append(record)
     return records
 
-
 @dataclass(frozen=True, slots=True)
 class ReplayStep:
     ply: int
