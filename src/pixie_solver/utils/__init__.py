@@ -5,8 +5,10 @@ from pixie_solver.utils.serialization import (
     ReplayTrace,
     build_replay_trace,
     canonical_json,
+    read_jsonl,
     replay_trace,
     to_primitive,
+    write_jsonl,
 )
 from pixie_solver.utils.squares import (
     coords_to_square,
@@ -25,7 +27,9 @@ __all__ = [
     "coords_to_square",
     "is_valid_square",
     "normalize_square",
+    "read_jsonl",
     "replay_trace",
     "square_to_coords",
     "to_primitive",
+    "write_jsonl",
 ]

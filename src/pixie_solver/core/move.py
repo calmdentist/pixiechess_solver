@@ -27,6 +27,9 @@ class Move:
         object.__setattr__(self, "tags", tuple(self.tags))
         object.__setattr__(self, "metadata", dict(self.metadata))
 
+    def stable_id(self) -> str:
+        return stable_move_id(self)
+
     def to_dict(self) -> dict[str, JsonValue]:
         return {
             "piece_id": self.piece_id,
@@ -59,3 +62,9 @@ class Move:
             tags=tuple(str(tag) for tag in data.get("tags", [])),
             metadata=dict(data.get("metadata", {})),
         )
+
+
+def stable_move_id(move: Move) -> str:
+    from pixie_solver.core.hash import stable_digest
+
+    return stable_digest(move.to_dict())

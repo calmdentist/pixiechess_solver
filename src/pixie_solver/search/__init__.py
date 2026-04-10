@@ -1,5 +1,13 @@
-from pixie_solver.search.mcts import SearchResult, run_mcts
-from pixie_solver.search.node import SearchNode
+from pixie_solver.search.mcts import HeuristicEvaluator, SearchResult, StateEvaluator, run_mcts
+from pixie_solver.search.node import SearchEdge, SearchNode
 from pixie_solver.search.puct import puct_score
 
-__all__ = ["SearchNode", "SearchResult", "puct_score", "run_mcts"]
+__all__ = [
+    "HeuristicEvaluator",
+    "SearchEdge",
+    "SearchNode",
+    "SearchResult",
+    "StateEvaluator",
+    "puct_score",
+    "run_mcts",
+]
