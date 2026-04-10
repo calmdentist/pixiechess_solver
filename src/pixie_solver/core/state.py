@@ -7,6 +7,8 @@ from pixie_solver.core.piece import Color, PieceClass, PieceInstance
 from pixie_solver.utils.serialization import JsonValue
 from pixie_solver.utils.squares import normalize_square
 
+CASTLING_SIDES = ("king", "queen")
+
 
 @dataclass(frozen=True, slots=True)
 class GameState:
@@ -28,7 +30,7 @@ class GameState:
             self,
             "castling_rights",
             {
-                str(color): tuple(str(side) for side in rights)
+                Color(str(color)).value: _normalize_castling_sides(rights)
                 for color, rights in self.castling_rights.items()
             },
         )
@@ -69,6 +71,17 @@ class GameState:
             raise ValueError("halfmove_clock must be non-negative")
         if self.fullmove_number < 1:
             raise ValueError("fullmove_number must be at least 1")
+        if self.en_passant_square is not None and self.en_passant_square[1] not in {"3", "6"}:
+            raise ValueError("en_passant_square must be on rank 3 or 6")
+
+        for color, rights in self.castling_rights.items():
+            if color not in {Color.WHITE.value, Color.BLACK.value}:
+                raise ValueError(f"Invalid castling color key: {color!r}")
+            invalid_sides = [side for side in rights if side not in CASTLING_SIDES]
+            if invalid_sides:
+                raise ValueError(
+                    f"Invalid castling sides for {color!r}: {', '.join(invalid_sides)}"
+                )
 
         occupied_squares: dict[str, str] = {}
         for piece_id, piece in self.piece_instances.items():
@@ -169,3 +182,8 @@ class GameState:
             ),
             metadata=dict(data.get("metadata", {})),
         )
+
+
+def _normalize_castling_sides(rights: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    normalized = {str(side) for side in rights}
+    return tuple(side for side in CASTLING_SIDES if side in normalized)
