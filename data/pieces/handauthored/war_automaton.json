@@ -1,0 +1,56 @@
+{
+  "piece_id": "war_automaton",
+  "name": "War Automaton",
+  "base_piece_type": "pawn",
+  "instance_state_schema": [],
+  "movement_modifiers": [
+    {
+      "op": "inherit_base",
+      "args": {}
+    }
+  ],
+  "capture_modifiers": [
+    {
+      "op": "inherit_base",
+      "args": {}
+    }
+  ],
+  "hooks": [
+    {
+      "event": "piece_captured",
+      "conditions": [
+        {
+          "op": "self_on_board",
+          "args": {}
+        },
+        {
+          "op": "square_empty",
+          "args": {
+            "square": {
+              "relative_to": "self",
+              "offset": [
+                0,
+                1
+              ]
+            }
+          }
+        }
+      ],
+      "effects": [
+        {
+          "op": "move_piece",
+          "args": {
+            "piece": "self",
+            "to": {
+              "relative_to": "self",
+              "offset": [
+                0,
+                1
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

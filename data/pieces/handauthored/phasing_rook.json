@@ -1,0 +1,23 @@
+{
+  "piece_id": "phasing_rook",
+  "name": "Phasing Rook",
+  "base_piece_type": "rook",
+  "instance_state_schema": [],
+  "movement_modifiers": [
+    {
+      "op": "inherit_base",
+      "args": {}
+    },
+    {
+      "op": "phase_through_allies",
+      "args": {}
+    }
+  ],
+  "capture_modifiers": [
+    {
+      "op": "inherit_base",
+      "args": {}
+    }
+  ],
+  "hooks": []
+}
