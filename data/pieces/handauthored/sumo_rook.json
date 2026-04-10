@@ -1,0 +1,23 @@
+{
+  "piece_id": "sumo_rook",
+  "name": "Sumo Rook",
+  "base_piece_type": "rook",
+  "instance_state_schema": [],
+  "movement_modifiers": [
+    {
+      "op": "inherit_base",
+      "args": {}
+    }
+  ],
+  "capture_modifiers": [
+    {
+      "op": "replace_capture_with_push",
+      "args": {
+        "distance": 1,
+        "edge_behavior": "remove_if_pushed_off_board"
+      }
+    }
+  ],
+  "hooks": [],
+  "metadata": {}
+}
