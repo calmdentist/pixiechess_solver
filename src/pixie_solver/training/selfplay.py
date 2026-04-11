@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from pixie_solver.core import Color, GameState, Move, stable_move_id
 from pixie_solver.model.policy_value import PolicyValueModel
-from pixie_solver.search import SearchResult, StateEvaluator, run_mcts
+from pixie_solver.search import HeuristicEvaluator, SearchResult, StateEvaluator, run_mcts
 from pixie_solver.simulator.engine import apply_move, result
 from pixie_solver.training.dataset import SelfPlayExample, SelfPlayGame
 from pixie_solver.utils import build_replay_trace
+from pixie_solver.utils.serialization import JsonValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,11 +22,49 @@ class SelfPlayConfig:
     temperature_drop_after_ply: int = 12
     c_puct: float = 1.5
     seed: int = 0
+    adjudicate_max_plies: bool = True
+    adjudication_threshold: float = 0.2
+
+    def __post_init__(self) -> None:
+        if self.max_plies < 0:
+            raise ValueError("max_plies must be non-negative")
+        if self.adjudication_threshold < 0.0 or self.adjudication_threshold > 1.0:
+            raise ValueError("adjudication_threshold must be in [0, 1]")
 
     def temperature_for_ply(self, ply: int) -> float:
         if ply < self.temperature_drop_after_ply:
             return self.opening_temperature
         return self.final_temperature
+
+
+@dataclass(frozen=True, slots=True)
+class SelfPlayProgress:
+    event: str
+    game_index: int
+    games_total: int
+    ply: int | None = None
+    selected_move_id: str | None = None
+    legal_move_count: int | None = None
+    plies_played: int | None = None
+    outcome: str | None = None
+    termination_reason: str | None = None
+    used_model: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CutoffAdjudication:
+    outcome: str
+    score: float
+    threshold: float
+    method: str = "heuristic_material_mobility_check"
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "method": self.method,
+            "outcome": self.outcome,
+            "score": self.score,
+            "threshold": self.threshold,
+        }
 
 
 def generate_selfplay_games(
@@ -35,6 +74,7 @@ def generate_selfplay_games(
     config: SelfPlayConfig | None = None,
     policy_value_model: PolicyValueModel | None = None,
     evaluator: StateEvaluator | None = None,
+    progress_callback: Callable[[SelfPlayProgress], None] | None = None,
 ) -> list[SelfPlayGame]:
     if games < 1:
         raise ValueError("games must be at least 1")
@@ -50,10 +90,12 @@ def generate_selfplay_games(
             _play_single_game(
                 initial_state=_clone_state(seed_state),
                 game_index=game_index,
+                games_total=games,
                 config=active_config,
                 rng=rng,
                 policy_value_model=policy_value_model,
                 evaluator=evaluator,
+                progress_callback=progress_callback,
             )
         )
     return generated_games
@@ -66,20 +108,56 @@ def flatten_selfplay_examples(games: Sequence[SelfPlayGame]) -> list[SelfPlayExa
     return examples
 
 
+def adjudicate_cutoff(
+    state: GameState,
+    *,
+    threshold: float,
+    evaluator: StateEvaluator | None = None,
+) -> CutoffAdjudication:
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    evaluator_impl = HeuristicEvaluator() if evaluator is None else evaluator
+    white_state = _with_side_to_move(state, Color.WHITE)
+    score = max(-1.0, min(1.0, float(evaluator_impl.evaluate(white_state))))
+    if score > threshold:
+        outcome = Color.WHITE.value
+    elif score < -threshold:
+        outcome = Color.BLACK.value
+    else:
+        outcome = "draw"
+    return CutoffAdjudication(
+        outcome=outcome,
+        score=score,
+        threshold=threshold,
+    )
+
+
 def _play_single_game(
     *,
     initial_state: GameState,
     game_index: int,
+    games_total: int,
     config: SelfPlayConfig,
     rng: random.Random,
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator | None,
+    progress_callback: Callable[[SelfPlayProgress], None] | None,
 ) -> SelfPlayGame:
     state = initial_state
     examples: list[SelfPlayExample] = []
     moves: list[Move] = []
     termination_reason = "max_plies"
     game_result: str | None = None
+    adjudication: CutoffAdjudication | None = None
+    if progress_callback is not None:
+        progress_callback(
+            SelfPlayProgress(
+                event="game_started",
+                game_index=game_index,
+                games_total=games_total,
+                used_model=policy_value_model is not None,
+            )
+        )
 
     for ply in range(config.max_plies):
         game_result = result(state)
@@ -103,6 +181,18 @@ def _play_single_game(
             termination_reason = "no_legal_moves"
             break
 
+        if progress_callback is not None:
+            progress_callback(
+                SelfPlayProgress(
+                    event="ply_completed",
+                    game_index=game_index,
+                    games_total=games_total,
+                    ply=ply + 1,
+                    selected_move_id=chosen_move_id,
+                    legal_move_count=len(search_result.legal_moves),
+                    used_model=policy_value_model is not None,
+                )
+            )
         examples.append(
             SelfPlayExample(
                 state=state,
@@ -125,9 +215,22 @@ def _play_single_game(
     else:
         game_result = result(state)
 
-    outcome = "draw" if game_result is None else game_result
+    if game_result is None:
+        if termination_reason == "max_plies" and config.adjudicate_max_plies:
+            adjudication = adjudicate_cutoff(
+                state,
+                threshold=config.adjudication_threshold,
+                evaluator=evaluator,
+            )
+            outcome = adjudication.outcome
+        else:
+            outcome = "draw"
+    else:
+        outcome = game_result
     for example in examples:
         example.outcome = _outcome_for_perspective(outcome, example.state.side_to_move)
+        if adjudication is not None:
+            example.metadata["cutoff_adjudication"] = adjudication.to_dict()
 
     replay_trace = build_replay_trace(
         initial_state,
@@ -141,11 +244,16 @@ def _play_single_game(
             "final_temperature": config.final_temperature,
             "temperature_drop_after_ply": config.temperature_drop_after_ply,
             "c_puct": config.c_puct,
+            "adjudicate_max_plies": config.adjudicate_max_plies,
+            "adjudication_threshold": config.adjudication_threshold,
+            "cutoff_adjudication": (
+                adjudication.to_dict() if adjudication is not None else None
+            ),
             "termination_reason": termination_reason,
             "outcome": outcome,
         },
     )
-    return SelfPlayGame(
+    game = SelfPlayGame(
         replay_trace=replay_trace,
         examples=tuple(examples),
         outcome=outcome,
@@ -153,8 +261,24 @@ def _play_single_game(
             "game_index": game_index,
             "plies_played": len(moves),
             "termination_reason": termination_reason,
+            "cutoff_adjudication": (
+                adjudication.to_dict() if adjudication is not None else None
+            ),
         },
     )
+    if progress_callback is not None:
+        progress_callback(
+            SelfPlayProgress(
+                event="game_completed",
+                game_index=game_index,
+                games_total=games_total,
+                plies_played=len(moves),
+                outcome=outcome,
+                termination_reason=termination_reason,
+                used_model=policy_value_model is not None,
+            )
+        )
+    return game
 
 
 def _select_move_for_selfplay(
@@ -196,6 +320,21 @@ def _outcome_for_perspective(outcome: str, perspective: Color) -> float:
     if outcome == perspective.value:
         return 1.0
     return -1.0
+
+
+def _with_side_to_move(state: GameState, side_to_move: Color) -> GameState:
+    return GameState(
+        piece_classes=state.piece_classes,
+        piece_instances=state.piece_instances,
+        side_to_move=side_to_move,
+        castling_rights=state.castling_rights,
+        en_passant_square=state.en_passant_square,
+        halfmove_clock=state.halfmove_clock,
+        fullmove_number=state.fullmove_number,
+        repetition_counts=state.repetition_counts,
+        pending_events=state.pending_events,
+        metadata=state.metadata,
+    )
 
 
 def _clone_state(state: GameState) -> GameState:

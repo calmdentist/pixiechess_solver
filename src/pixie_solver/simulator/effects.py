@@ -129,7 +129,7 @@ def _apply_move_piece(
         raise ValueError("move_piece effect could not resolve piece reference")
     piece = piece_instances.get(piece_id)
     if piece is None or piece.square is None:
-        raise ValueError(f"move_piece effect refers to inactive piece {piece_id!r}")
+        return ()
 
     destination = resolve_square_ref(
         state=state,
@@ -139,12 +139,12 @@ def _apply_move_piece(
         square_ref=effect.args["to"],
     )
     if destination is None:
-        raise ValueError("move_piece effect resolved to an off-board square")
+        return ()
     if any(
         other.instance_id != piece_id and other.square == destination
         for other in piece_instances.values()
     ):
-        raise ValueError(f"move_piece effect destination {destination!r} is occupied")
+        return ()
 
     piece_instances[piece_id] = PieceInstance(
         instance_id=piece.instance_id,
