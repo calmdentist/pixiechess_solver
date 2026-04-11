@@ -11,17 +11,31 @@ from pixie_solver.core.hash import stable_digest
 
 from pixie_solver.core import (
     GameState,
+    Move,
     PieceClass,
     sample_standard_initial_state,
     standard_initial_state,
 )
+from pixie_solver.curriculum import run_synthetic_piece_curriculum
 from pixie_solver.dsl.canonicalize import canonicalize_piece_program
 from pixie_solver.dsl.compiler import compile_piece_file
 from pixie_solver.dsl.parser import load_piece_program
 from pixie_solver.dsl.validator import PieceValidationError, validate_piece_program
 from pixie_solver.eval import ModelEvalProgress, evaluate_policy_value_model
-from pixie_solver.llm.compile_piece import compile_piece_from_text
+from pixie_solver.llm import FrontierLLMClient, FrontierLLMPieceProgramProvider, LLMConfig
 from pixie_solver.model import PolicyValueConfig
+from pixie_solver.rules import (
+    CompileRequest,
+    JsonFileCompileProvider,
+    JsonFileRepairProvider,
+    append_verified_piece_version,
+    build_state_mismatch,
+    load_verified_piece_classes,
+    load_verified_piece_records,
+    registry_piece_digest_metadata,
+    repair_and_verify_piece,
+)
+from pixie_solver.rules.repair import default_dsl_reference
 from pixie_solver.training import (
     SelfPlayConfig,
     SelfPlayProgress,
@@ -48,11 +62,98 @@ def build_parser() -> argparse.ArgumentParser:
     compile_group.add_argument("--file", type=Path, help="Path to a JSON or YAML piece program.")
     compile_group.add_argument("--text", help="Natural-language piece description for future LLM compilation.")
     compile_parser.add_argument("--pretty", action="store_true", help="Pretty-print the compiled JSON.")
+    _add_llm_args(compile_parser)
     compile_parser.set_defaults(handler=_handle_compile_piece)
 
     verify_parser = subparsers.add_parser("verify-piece", help="Validate a piece DSL program and print a stable digest.")
     verify_parser.add_argument("--file", type=Path, required=True, help="Path to a JSON or YAML piece program.")
     verify_parser.set_defaults(handler=_handle_verify_piece)
+
+    repair_parser = subparsers.add_parser(
+        "repair-piece",
+        help="Patch a piece DSL program from an observed transition mismatch.",
+    )
+    repair_parser.add_argument("--description", required=True, help="Natural-language piece description.")
+    repair_parser.add_argument("--current-program", type=Path, required=True, help="Current JSON/YAML DSL program.")
+    repair_parser.add_argument("--before-state", type=Path, required=True, help="JSON GameState before the observed move.")
+    repair_parser.add_argument("--move", type=Path, required=True, help="JSON Move that produced the mismatch.")
+    repair_parser.add_argument("--observed-state", type=Path, required=True, help="JSON GameState observed from the oracle/live game.")
+    repair_parser.add_argument(
+        "--provider-response",
+        type=Path,
+        help="JSON file containing the provider response or raw patched DSL program. If omitted, the live LLM provider is used.",
+    )
+    _add_llm_args(repair_parser)
+    repair_parser.add_argument(
+        "--registry",
+        type=Path,
+        default=Path("data/pieces/registry.json"),
+        help="Piece registry manifest to append accepted repaired versions to.",
+    )
+    repair_parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("data/pieces/repaired"),
+        help="Directory where accepted repaired DSL programs are written.",
+    )
+    repair_parser.add_argument(
+        "--repair-attempts",
+        type=int,
+        default=1,
+        help="Repair attempt count to record in the registry metadata.",
+    )
+    repair_parser.set_defaults(handler=_handle_repair_piece)
+
+    curriculum_parser = subparsers.add_parser(
+        "piece-curriculum",
+        help="Generate a synthetic teacher piece, compile/repair a candidate, and optionally admit it to the verified registry.",
+    )
+    curriculum_parser.add_argument("--seed", type=int, required=True, help="Deterministic synthetic piece seed.")
+    curriculum_parser.add_argument(
+        "--recipe",
+        choices=("capture_sprint", "edge_sumo", "phase_rook", "turn_charge"),
+        help="Optional synthetic piece recipe. Defaults to seed-based selection.",
+    )
+    curriculum_parser.add_argument("--piece-id", help="Optional deterministic piece id override.")
+    curriculum_parser.add_argument(
+        "--compile-response",
+        type=Path,
+        help="JSON file containing a candidate_program response or raw candidate DSL. If omitted, the live LLM provider is used.",
+    )
+    curriculum_parser.add_argument(
+        "--repair-response",
+        type=Path,
+        help="Optional JSON file containing a patched_program response or raw patched DSL.",
+    )
+    curriculum_parser.add_argument(
+        "--llm-repair",
+        action="store_true",
+        help="Use the configured live LLM for mismatch repair when --repair-response is omitted.",
+    )
+    _add_llm_args(curriculum_parser)
+    curriculum_parser.add_argument(
+        "--registry",
+        type=Path,
+        default=Path("data/pieces/registry.json"),
+        help="Piece registry manifest to append accepted curriculum pieces to.",
+    )
+    curriculum_parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("data/pieces/repaired"),
+        help="Directory where accepted curriculum DSL programs are written.",
+    )
+    curriculum_parser.add_argument(
+        "--no-registry-write",
+        action="store_true",
+        help="Run verification only without writing accepted pieces to the registry.",
+    )
+    curriculum_parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        help="Optional directory for teacher, description, and probe artifacts.",
+    )
+    curriculum_parser.set_defaults(handler=_handle_piece_curriculum)
 
     selfplay_parser = subparsers.add_parser("selfplay", help="Generate self-play games/examples from serialized GameState seeds.")
     selfplay_source_group = selfplay_parser.add_mutually_exclusive_group(required=True)
@@ -79,6 +180,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory of hand-authored piece JSON/YAML files used for randomized special-piece openings.",
     )
     selfplay_parser.add_argument(
+        "--piece-registry",
+        type=Path,
+        default=Path("data/pieces/registry.json"),
+        help="Verified piece registry used when --use-verified-pieces is enabled.",
+    )
+    selfplay_parser.add_argument(
+        "--use-verified-pieces",
+        action="store_true",
+        help="Include latest verified repaired pieces from --piece-registry in randomized openings.",
+    )
+    selfplay_parser.add_argument(
         "--special-piece-inclusion-probability",
         type=float,
         default=0.5,
@@ -95,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     selfplay_parser.add_argument("--final-temperature", type=float, default=0.0, help="Sampling temperature after the drop ply.")
     selfplay_parser.add_argument("--temperature-drop-after-ply", type=int, default=12, help="Ply after which the final temperature is used.")
     selfplay_parser.add_argument("--c-puct", type=float, default=1.5, help="PUCT exploration constant.")
+    selfplay_parser.add_argument("--root-dirichlet-alpha", type=float, default=0.3, help="Symmetric Dirichlet alpha for root exploration noise during self-play.")
+    selfplay_parser.add_argument("--root-exploration-fraction", type=float, default=0.25, help="Fraction of root priors replaced by Dirichlet noise during self-play. Set to 0 to disable.")
     selfplay_parser.add_argument("--seed", type=int, default=0, help="Deterministic seed for self-play sampling.")
     selfplay_parser.add_argument(
         "--adjudicate-max-plies",
@@ -195,6 +309,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--final-temperature", type=float, default=0.0, help="Self-play final temperature.")
     train_loop_parser.add_argument("--temperature-drop-after-ply", type=int, default=12, help="Ply after which final temperature is used.")
     train_loop_parser.add_argument("--c-puct", type=float, default=1.5, help="PUCT exploration constant.")
+    train_loop_parser.add_argument("--root-dirichlet-alpha", type=float, default=0.3, help="Symmetric Dirichlet alpha for root exploration noise during self-play.")
+    train_loop_parser.add_argument("--root-exploration-fraction", type=float, default=0.25, help="Fraction of root priors replaced by Dirichlet noise during self-play. Set to 0 to disable.")
     train_loop_parser.add_argument("--seed", type=int, default=0, help="Base seed for self-play and training.")
     train_loop_parser.add_argument("--adjudicate-max-plies", dest="adjudicate_max_plies", action="store_true", default=True, help="Use deterministic cutoff adjudication when self-play reaches --max-plies.")
     train_loop_parser.add_argument("--no-adjudicate-max-plies", dest="adjudicate_max_plies", action="store_false", help="Treat non-terminal max-ply games as draws.")
@@ -223,20 +339,96 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
     train_loop_parser.set_defaults(handler=_handle_train_loop)
 
-    for command_name in ("repair-piece", "run-match", "eval-tactics"):
+    train_loop_parser.add_argument("--piece-registry", type=Path, default=Path("data/pieces/registry.json"), help="Verified piece registry used when --use-verified-pieces is enabled.")
+    train_loop_parser.add_argument("--use-verified-pieces", action="store_true", help="Include latest verified repaired pieces from --piece-registry in randomized openings.")
+
+    for command_name in ("run-match", "eval-tactics"):
         placeholder_parser = subparsers.add_parser(command_name, help=f"{command_name} is planned but not implemented yet.")
         placeholder_parser.set_defaults(handler=_handle_placeholder)
 
     return parser
 
 
+def _add_llm_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--llm-provider",
+        choices=("anthropic", "openai"),
+        help="Live LLM provider. Defaults to PIXIE_LLM_PROVIDER or anthropic.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        help="Live LLM model id. Defaults to PIXIE_LLM_MODEL, claude-opus-4-6, or gpt-5.4.",
+    )
+    parser.add_argument(
+        "--llm-api-key-env",
+        help="Environment variable containing the provider API key.",
+    )
+    parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        help="Maximum output tokens for live LLM calls.",
+    )
+    parser.add_argument(
+        "--llm-timeout-seconds",
+        type=float,
+        help="HTTP timeout for live LLM calls.",
+    )
+    parser.add_argument(
+        "--llm-temperature",
+        type=float,
+        help="Sampling temperature for live LLM calls.",
+    )
+    parser.add_argument(
+        "--llm-effort",
+        choices=("none", "low", "medium", "high", "max", "xhigh"),
+        help="Reasoning/thinking effort for live LLM calls.",
+    )
+    parser.add_argument(
+        "--no-llm-thinking",
+        action="store_true",
+        help="Disable Claude adaptive thinking for live Anthropic calls.",
+    )
+
+
+def _build_llm_piece_provider(args: argparse.Namespace) -> FrontierLLMPieceProgramProvider:
+    config_kwargs = {
+        "provider": args.llm_provider,
+        "model": args.llm_model,
+        "api_key_env": args.llm_api_key_env,
+        "thinking": not args.no_llm_thinking,
+    }
+    if args.llm_max_tokens is not None:
+        config_kwargs["max_tokens"] = args.llm_max_tokens
+    if args.llm_timeout_seconds is not None:
+        config_kwargs["timeout_seconds"] = args.llm_timeout_seconds
+    if args.llm_temperature is not None:
+        config_kwargs["temperature"] = args.llm_temperature
+    if args.llm_effort is not None:
+        config_kwargs["effort"] = args.llm_effort
+    config = LLMConfig(**config_kwargs)
+    return FrontierLLMPieceProgramProvider(FrontierLLMClient(config))
+
+
 def _handle_compile_piece(args: argparse.Namespace) -> int:
     if args.text is not None:
-        try:
-            compile_piece_from_text(args.text)
-        except NotImplementedError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
+        provider = _build_llm_piece_provider(args)
+        response = provider.compile_piece(
+            CompileRequest(
+                description=args.text,
+                dsl_reference=default_dsl_reference(),
+            )
+        )
+        program = canonicalize_piece_program(response.candidate_program)
+        print(
+            canonical_json(
+                {
+                    "candidate_program": program,
+                    "explanation": response.explanation,
+                    "metadata": response.metadata,
+                },
+                indent=2 if args.pretty else None,
+            )
+        )
         return 0
 
     piece_class = compile_piece_file(args.file)
@@ -264,14 +456,134 @@ def _handle_verify_piece(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_repair_piece(args: argparse.Namespace) -> int:
+    if args.repair_attempts < 1:
+        raise ValueError("--repair-attempts must be at least 1")
+
+    current_program = load_piece_program(args.current_program)
+    before_state = GameState.from_dict(_load_json_object(args.before_state))
+    observed_state = GameState.from_dict(_load_json_object(args.observed_state))
+    move = Move.from_dict(_load_json_object(args.move))
+    mismatch = build_state_mismatch(
+        before_state=before_state,
+        move=move,
+        observed_state=observed_state,
+        current_program=current_program,
+    )
+    provider = (
+        JsonFileRepairProvider(args.provider_response)
+        if args.provider_response is not None
+        else _build_llm_piece_provider(args)
+    )
+    repair_result = repair_and_verify_piece(
+        mismatch,
+        description=args.description,
+        current_program=current_program,
+        provider=provider,
+    )
+
+    registry_record = None
+    if repair_result.accepted:
+        registry_record = append_verified_piece_version(
+            registry_path=args.registry,
+            out_dir=args.out_dir,
+            program=repair_result.patched_program,
+            description=args.description,
+            source="repair",
+            parent_digest=stable_digest(canonicalize_piece_program(current_program)),
+            verified_cases=repair_result.verified_cases,
+            repair_attempts=args.repair_attempts,
+            metadata={
+                "current_program": str(args.current_program),
+                "provider_response": (
+                    str(args.provider_response)
+                    if args.provider_response is not None
+                    else None
+                ),
+                "mismatch_diff": mismatch.diff.to_dict(),
+            },
+        )
+
+    print(
+        canonical_json(
+            {
+                "status": "accepted" if repair_result.accepted else "rejected",
+                "accepted": repair_result.accepted,
+                "piece_id": canonicalize_piece_program(current_program)["piece_id"],
+                "verification_errors": list(repair_result.verification_errors),
+                "verified_cases": repair_result.verified_cases,
+                "mismatch_diff": mismatch.diff.to_dict(),
+                "primary_diff_after_repair": repair_result.primary_diff_after_repair,
+                "registry_record": (
+                    registry_record.to_dict() if registry_record is not None else None
+                ),
+            },
+            indent=2,
+        )
+    )
+    return 0 if repair_result.accepted else 2
+
+
+def _handle_piece_curriculum(args: argparse.Namespace) -> int:
+    live_provider = None
+    if args.compile_response is None or (
+        args.repair_response is None and args.llm_repair
+    ):
+        live_provider = _build_llm_piece_provider(args)
+    compile_provider = (
+        JsonFileCompileProvider(args.compile_response)
+        if args.compile_response is not None
+        else live_provider
+    )
+    repair_provider = None
+    if args.repair_response is not None:
+        repair_provider = JsonFileRepairProvider(args.repair_response)
+    elif args.compile_response is None or args.llm_repair:
+        repair_provider = live_provider
+    if compile_provider is None:
+        raise ValueError("piece-curriculum requires --compile-response or live LLM config")
+    result = run_synthetic_piece_curriculum(
+        seed=args.seed,
+        recipe=args.recipe,
+        piece_id=args.piece_id,
+        compile_provider=compile_provider,
+        repair_provider=repair_provider,
+        registry_path=None if args.no_registry_write else str(args.registry),
+        out_dir=None if args.no_registry_write else str(args.out_dir),
+    )
+    if args.artifact_dir is not None:
+        _write_curriculum_artifacts(args.artifact_dir, result)
+    print(canonical_json(result.to_dict(), indent=2))
+    return 0 if result.accepted else 2
+
+
 def _handle_selfplay(args: argparse.Namespace) -> int:
     if args.games_out is None and args.examples_out is None:
         raise ValueError("selfplay requires --games-out, --examples-out, or both")
+    if args.use_verified_pieces and not args.standard_initial_state:
+        raise ValueError("--use-verified-pieces requires --standard-initial-state")
+    if args.use_verified_pieces and not args.randomize_handauthored_specials:
+        raise ValueError("--use-verified-pieces requires --randomize-handauthored-specials")
+
+    verified_records = (
+        _load_verified_registry_records(args.piece_registry)
+        if args.use_verified_pieces
+        else []
+    )
 
     if args.standard_initial_state:
         if args.randomize_handauthored_specials:
             opening_rng = random.Random(args.seed)
-            special_piece_classes = _load_piece_classes_from_directory(args.special_piece_dir)
+            handauthored_piece_classes = _load_piece_classes_from_directory(args.special_piece_dir)
+            verified_piece_classes = (
+                load_verified_piece_classes(args.piece_registry)
+                if args.use_verified_pieces
+                else []
+            )
+            special_piece_classes = _merge_piece_classes(
+                handauthored_piece_classes,
+                verified_piece_classes,
+            )
             initial_states = [
                 sample_standard_initial_state(
                     opening_rng,
@@ -305,6 +617,8 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
         final_temperature=args.final_temperature,
         temperature_drop_after_ply=args.temperature_drop_after_ply,
         c_puct=args.c_puct,
+        root_dirichlet_alpha=args.root_dirichlet_alpha,
+        root_exploration_fraction=args.root_exploration_fraction,
         seed=args.seed,
         adjudicate_max_plies=args.adjudicate_max_plies,
         adjudication_threshold=args.adjudication_threshold,
@@ -319,6 +633,11 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
             if args.quiet
             else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
         ),
+    )
+    _annotate_games_with_registry(
+        games,
+        registry_path=args.piece_registry,
+        verified_records=verified_records,
     )
     examples = flatten_selfplay_examples(games)
 
@@ -351,6 +670,12 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
                     if args.randomize_handauthored_specials
                     else None
                 ),
+                "used_verified_pieces": args.use_verified_pieces,
+                "piece_registry": (
+                    str(args.piece_registry) if args.use_verified_pieces else None
+                ),
+                "verified_piece_count": len(verified_records),
+                "verified_piece_digests": registry_piece_digest_metadata(verified_records),
                 "config": {
                     "simulations": config.simulations,
                     "max_plies": config.max_plies,
@@ -358,6 +683,8 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
                     "final_temperature": config.final_temperature,
                     "temperature_drop_after_ply": config.temperature_drop_after_ply,
                     "c_puct": config.c_puct,
+                    "root_dirichlet_alpha": config.root_dirichlet_alpha,
+                    "root_exploration_fraction": config.root_exploration_fraction,
                     "seed": config.seed,
                     "adjudicate_max_plies": config.adjudicate_max_plies,
                     "adjudication_threshold": config.adjudication_threshold,
@@ -511,6 +838,8 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         raise ValueError("--train-games must be at least 1")
     if args.val_games < 1:
         raise ValueError("--val-games must be at least 1")
+    if args.use_verified_pieces and not args.randomize_handauthored_specials:
+        raise ValueError("--use-verified-pieces requires randomized special-piece openings")
 
     data_dir = args.output_dir / "selfplay"
     checkpoint_dir = args.output_dir / "checkpoints"
@@ -519,10 +848,24 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    special_piece_classes = (
+    verified_records = (
+        _load_verified_registry_records(args.piece_registry)
+        if args.use_verified_pieces
+        else []
+    )
+    handauthored_piece_classes = (
         _load_piece_classes_from_directory(args.special_piece_dir)
         if args.randomize_handauthored_specials
         else ()
+    )
+    verified_piece_classes = (
+        load_verified_piece_classes(args.piece_registry)
+        if args.use_verified_pieces
+        else ()
+    )
+    special_piece_classes = _merge_piece_classes(
+        handauthored_piece_classes,
+        verified_piece_classes,
     )
     model = None
     optimizer_state_dict = None
@@ -555,6 +898,8 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             final_temperature=args.final_temperature,
             temperature_drop_after_ply=args.temperature_drop_after_ply,
             c_puct=args.c_puct,
+            root_dirichlet_alpha=args.root_dirichlet_alpha,
+            root_exploration_fraction=args.root_exploration_fraction,
             seed=train_seed,
             adjudicate_max_plies=args.adjudicate_max_plies,
             adjudication_threshold=args.adjudication_threshold,
@@ -576,6 +921,11 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 if args.quiet
                 else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
             ),
+        )
+        _annotate_games_with_registry(
+            train_games,
+            registry_path=args.piece_registry,
+            verified_records=verified_records,
         )
         train_examples = flatten_selfplay_examples(train_games)
         train_games_path = data_dir / f"cycle_{cycle_index:03d}_train_games.jsonl"
@@ -636,6 +986,8 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             final_temperature=args.final_temperature,
             temperature_drop_after_ply=args.temperature_drop_after_ply,
             c_puct=args.c_puct,
+            root_dirichlet_alpha=args.root_dirichlet_alpha,
+            root_exploration_fraction=args.root_exploration_fraction,
             seed=val_seed,
             adjudicate_max_plies=args.adjudicate_max_plies,
             adjudication_threshold=args.adjudication_threshold,
@@ -657,6 +1009,11 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 if args.quiet
                 else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
             ),
+        )
+        _annotate_games_with_registry(
+            val_games,
+            registry_path=args.piece_registry,
+            verified_records=verified_records,
         )
         val_examples = flatten_selfplay_examples(val_games)
         val_games_path = data_dir / f"cycle_{cycle_index:03d}_val_games.jsonl"
@@ -700,6 +1057,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "training_metrics": _training_metrics_dict(training_run.metrics),
             "train_eval_metrics": train_eval_metrics.to_dict(),
             "val_eval_metrics": val_eval_metrics.to_dict(),
+            "root_dirichlet_alpha": selfplay_config.root_dirichlet_alpha,
+            "root_exploration_fraction": selfplay_config.root_exploration_fraction,
+            "used_verified_pieces": args.use_verified_pieces,
+            "piece_registry": (
+                str(args.piece_registry) if args.use_verified_pieces else None
+            ),
+            "verified_piece_count": len(verified_records),
+            "verified_piece_digests": registry_piece_digest_metadata(verified_records),
         }
         cycle_summaries.append(cycle_summary)
         metrics_path = metrics_dir / f"cycle_{cycle_index:03d}.json"
@@ -750,6 +1115,14 @@ def _load_state_files(paths: list[Path]) -> list[GameState]:
     return states
 
 
+def _load_json_object(path: Path) -> dict[str, object]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path!s} must contain a JSON object")
+    return dict(payload)
+
+
 def _load_piece_classes_from_directory(directory: Path) -> list[PieceClass]:
     if not directory.exists():
         raise ValueError(f"Special-piece directory does not exist: {directory!s}")
@@ -761,6 +1134,67 @@ def _load_piece_classes_from_directory(directory: Path) -> list[PieceClass]:
     if not piece_files:
         raise ValueError(f"No piece files found in {directory!s}")
     return [compile_piece_file(path) for path in piece_files]
+
+
+def _load_verified_registry_records(registry_path: Path):
+    if not registry_path.exists():
+        raise ValueError(f"Piece registry does not exist: {registry_path!s}")
+    records = load_verified_piece_records(registry_path)
+    if not records:
+        raise ValueError(f"Piece registry has no verified records: {registry_path!s}")
+    return records
+
+
+def _merge_piece_classes(*groups) -> list[PieceClass]:
+    merged: dict[str, PieceClass] = {}
+    for group in groups:
+        for piece_class in group:
+            merged[piece_class.class_id] = piece_class
+    return [
+        merged[class_id]
+        for class_id in sorted(merged)
+    ]
+
+
+def _annotate_games_with_registry(
+    games,
+    *,
+    registry_path: Path,
+    verified_records,
+) -> None:
+    if not verified_records:
+        return
+    metadata = {
+        "piece_registry": str(registry_path),
+        "verified_piece_digests": registry_piece_digest_metadata(verified_records),
+    }
+    for game in games:
+        game.metadata.update(metadata)
+        game.replay_trace.metadata.update(metadata)
+
+
+def _write_curriculum_artifacts(artifact_dir: Path, result) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "teacher_program.json").write_text(
+        canonical_json(result.synthetic_piece.teacher_program, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "description.txt").write_text(
+        result.synthetic_piece.description,
+        encoding="utf-8",
+    )
+    (artifact_dir / "summary.json").write_text(
+        canonical_json(result.to_dict(), indent=2),
+        encoding="utf-8",
+    )
+    for index, probe_result in enumerate(result.probe_results, start=1):
+        mismatch = probe_result.mismatch
+        if mismatch is None:
+            continue
+        (artifact_dir / f"probe_{index:03d}_{probe_result.label}.json").write_text(
+            canonical_json(mismatch, indent=2),
+            encoding="utf-8",
+        )
 
 
 def _sample_loop_initial_states(

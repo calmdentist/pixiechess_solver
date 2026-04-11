@@ -1,0 +1,57 @@
+from pixie_solver.rules.mismatch import (
+    PieceDiff,
+    StateDiff,
+    StateMismatch,
+    build_state_mismatch,
+    behavioral_state_signature,
+    diff_states,
+)
+from pixie_solver.rules.providers import (
+    CompileRequest,
+    CompileResponse,
+    JsonFileCompileProvider,
+    JsonFileRepairProvider,
+    StaticCompileProvider,
+    RepairRequest,
+    RepairResponse,
+    StaticRepairProvider,
+)
+from pixie_solver.rules.registry import (
+    PieceRegistryRecord,
+    append_verified_piece_version,
+    load_piece_registry,
+    load_verified_piece_classes,
+    load_verified_piece_records,
+    registry_piece_digest_metadata,
+)
+from pixie_solver.rules.repair import (
+    RepairResult,
+    ReplayCase,
+    repair_and_verify_piece,
+)
+
+__all__ = [
+    "JsonFileRepairProvider",
+    "CompileRequest",
+    "CompileResponse",
+    "JsonFileCompileProvider",
+    "PieceDiff",
+    "PieceRegistryRecord",
+    "RepairRequest",
+    "RepairResponse",
+    "RepairResult",
+    "ReplayCase",
+    "StateDiff",
+    "StateMismatch",
+    "StaticCompileProvider",
+    "StaticRepairProvider",
+    "append_verified_piece_version",
+    "behavioral_state_signature",
+    "build_state_mismatch",
+    "diff_states",
+    "load_piece_registry",
+    "load_verified_piece_classes",
+    "load_verified_piece_records",
+    "registry_piece_digest_metadata",
+    "repair_and_verify_piece",
+]

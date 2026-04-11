@@ -20,9 +20,12 @@ The current foundation covers:
 - a minimal self-play training loop that runs on CPU, MPS, or CUDA,
 - a bootstrap path from search-only self-play into model-guided self-play,
 - deterministic search comparison utilities for search-only vs model-guided runs,
+- AlphaZero-style Dirichlet root noise for self-play exploration,
 - checkpoint save/load for model + optimizer state,
 - real `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` CLI commands,
 - a CLI boundary for compile and verification flows,
+- live Anthropic/OpenAI LLM providers for English-to-DSL compile and mismatch repair,
+- synthetic piece curriculum runs that can compile, repair, verify, and admit DSL programs,
 - importable interfaces for simulator, search, model, training, and evaluation work.
 
 ## Layout
@@ -53,9 +56,40 @@ trains or resumes the policy/value checkpoint, evaluates train and validation ex
 cycle metrics to confirm whether the model is learning instead of only fitting noise.
 Max-ply games are cutoff-adjudicated by default with a deterministic material/mobility/check
 heuristic, so clearly favorable non-terminal games still produce nonzero value targets.
+Self-play also mixes Dirichlet noise into root priors by default
+(`--root-dirichlet-alpha 0.3`, `--root-exploration-fraction 0.25`) so early
+checkpoints do not collapse into a narrow opening sample. Set
+`--root-exploration-fraction 0` for deterministic no-noise data generation.
 
 `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` emit progress logs to `stderr` during long runs.
 Use `--quiet` if you only want the final JSON summary on `stdout`.
+
+## Live LLM Providers
+
+Live English-to-DSL compilation and repair use `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+Anthropic is the default provider and uses `claude-opus-4-6` with adaptive thinking enabled.
+
+```bash
+export ANTHROPIC_API_KEY=...
+PYTHONPATH=src python3 -m pixie_solver compile-piece --text "A rook that can slide through friendly pieces." --pretty
+
+PYTHONPATH=src python3 -m pixie_solver piece-curriculum \
+  --seed 1 \
+  --recipe capture_sprint \
+  --llm-repair \
+  --artifact-dir runs/piece_curriculum/seed_1
+```
+
+Use OpenAI with:
+
+```bash
+export OPENAI_API_KEY=...
+PYTHONPATH=src python3 -m pixie_solver compile-piece \
+  --text "A pawn that gathers charge as its turn begins." \
+  --llm-provider openai \
+  --llm-model gpt-5.4 \
+  --pretty
+```
 
 ## Current Milestone
 

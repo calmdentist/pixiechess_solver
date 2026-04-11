@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 from pixie_solver.core import Color, GameState, Move, stable_move_id
 from pixie_solver.model.policy_value import PolicyValueModel
-from pixie_solver.search import HeuristicEvaluator, SearchResult, StateEvaluator, run_mcts
+from pixie_solver.search import (
+    DirichletRootNoise,
+    HeuristicEvaluator,
+    SearchResult,
+    StateEvaluator,
+    run_mcts,
+)
 from pixie_solver.simulator.engine import apply_move, result
 from pixie_solver.training.dataset import SelfPlayExample, SelfPlayGame
 from pixie_solver.utils import build_replay_trace
@@ -21,6 +27,8 @@ class SelfPlayConfig:
     final_temperature: float = 0.0
     temperature_drop_after_ply: int = 12
     c_puct: float = 1.5
+    root_dirichlet_alpha: float = 0.3
+    root_exploration_fraction: float = 0.25
     seed: int = 0
     adjudicate_max_plies: bool = True
     adjudication_threshold: float = 0.2
@@ -28,6 +36,10 @@ class SelfPlayConfig:
     def __post_init__(self) -> None:
         if self.max_plies < 0:
             raise ValueError("max_plies must be non-negative")
+        if self.root_dirichlet_alpha <= 0.0:
+            raise ValueError("root_dirichlet_alpha must be positive")
+        if self.root_exploration_fraction < 0.0 or self.root_exploration_fraction > 1.0:
+            raise ValueError("root_exploration_fraction must be in [0, 1]")
         if self.adjudication_threshold < 0.0 or self.adjudication_threshold > 1.0:
             raise ValueError("adjudication_threshold must be in [0, 1]")
 
@@ -35,6 +47,14 @@ class SelfPlayConfig:
         if ply < self.temperature_drop_after_ply:
             return self.opening_temperature
         return self.final_temperature
+
+    def root_noise_for_selfplay(self) -> DirichletRootNoise | None:
+        if self.root_exploration_fraction <= 0.0:
+            return None
+        return DirichletRootNoise(
+            alpha=self.root_dirichlet_alpha,
+            exploration_fraction=self.root_exploration_fraction,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +191,8 @@ def _play_single_game(
             policy_value_model=policy_value_model,
             evaluator=evaluator,
             c_puct=config.c_puct,
+            root_noise=config.root_noise_for_selfplay(),
+            rng=rng,
         )
         chosen_move, chosen_move_id = _select_move_for_selfplay(
             search_result=search_result,
@@ -244,6 +266,8 @@ def _play_single_game(
             "final_temperature": config.final_temperature,
             "temperature_drop_after_ply": config.temperature_drop_after_ply,
             "c_puct": config.c_puct,
+            "root_dirichlet_alpha": config.root_dirichlet_alpha,
+            "root_exploration_fraction": config.root_exploration_fraction,
             "adjudicate_max_plies": config.adjudicate_max_plies,
             "adjudication_threshold": config.adjudication_threshold,
             "cutoff_adjudication": (

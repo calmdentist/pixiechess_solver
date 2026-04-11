@@ -20,6 +20,7 @@ from pixie_solver.core import (
     PieceClass,
     PieceInstance,
     StateField,
+    stable_position_hash,
 )
 from pixie_solver.core.state import GameState
 from pixie_solver.dsl import compile_piece_file
@@ -362,6 +363,117 @@ class SimulatorTest(unittest.TestCase):
         self.assertTrue(is_terminal(state))
         self.assertEqual("draw", result(state))
 
+    def test_threefold_repetition_is_draw(self) -> None:
+        state = GameState(
+            piece_classes={
+                self.king.class_id: self.king,
+                self.knight.class_id: self.knight,
+            },
+            piece_instances={
+                "white_king": PieceInstance(
+                    instance_id="white_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.WHITE,
+                    square="e1",
+                ),
+                "white_knight": PieceInstance(
+                    instance_id="white_knight",
+                    piece_class_id=self.knight.class_id,
+                    color=Color.WHITE,
+                    square="b1",
+                ),
+                "black_king": PieceInstance(
+                    instance_id="black_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.BLACK,
+                    square="e8",
+                ),
+                "black_knight": PieceInstance(
+                    instance_id="black_knight",
+                    piece_class_id=self.knight.class_id,
+                    color=Color.BLACK,
+                    square="b8",
+                ),
+            },
+            side_to_move=Color.WHITE,
+        )
+        initial_position_hash = stable_position_hash(state)
+
+        for _ in range(2):
+            state = self._play_to(state, "white_knight", "c3")
+            state = self._play_to(state, "black_knight", "c6")
+            state = self._play_to(state, "white_knight", "b1")
+            state = self._play_to(state, "black_knight", "b8")
+
+        self.assertEqual(3, state.repetition_counts[initial_position_hash])
+        self.assertTrue(is_terminal(state))
+        self.assertEqual("draw", result(state))
+
+    def test_fifty_move_rule_is_draw(self) -> None:
+        state = GameState(
+            piece_classes={
+                self.king.class_id: self.king,
+                self.knight.class_id: self.knight,
+            },
+            piece_instances={
+                "white_king": PieceInstance(
+                    instance_id="white_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.WHITE,
+                    square="e1",
+                ),
+                "white_knight": PieceInstance(
+                    instance_id="white_knight",
+                    piece_class_id=self.knight.class_id,
+                    color=Color.WHITE,
+                    square="b1",
+                ),
+                "black_king": PieceInstance(
+                    instance_id="black_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.BLACK,
+                    square="e8",
+                ),
+            },
+            side_to_move=Color.WHITE,
+            halfmove_clock=100,
+        )
+
+        self.assertTrue(legal_moves(state))
+        self.assertEqual("draw", result(state))
+
+    def test_historical_repetition_does_not_draw_different_current_position(self) -> None:
+        state = GameState(
+            piece_classes={
+                self.king.class_id: self.king,
+                self.knight.class_id: self.knight,
+            },
+            piece_instances={
+                "white_king": PieceInstance(
+                    instance_id="white_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.WHITE,
+                    square="e1",
+                ),
+                "white_knight": PieceInstance(
+                    instance_id="white_knight",
+                    piece_class_id=self.knight.class_id,
+                    color=Color.WHITE,
+                    square="b1",
+                ),
+                "black_king": PieceInstance(
+                    instance_id="black_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.BLACK,
+                    square="e8",
+                ),
+            },
+            side_to_move=Color.WHITE,
+            repetition_counts={"some_other_position": 3},
+        )
+
+        self.assertIsNone(result(state))
+
     def test_kingside_castle_is_generated_and_applied(self) -> None:
         state = GameState(
             piece_classes={
@@ -609,6 +721,15 @@ class SimulatorTest(unittest.TestCase):
 
         self.assertEqual(trace.final_state_hash, replayed_final_state.state_hash())
         self.assertEqual(2, replayed_final_state.piece_instances["black_counter"].state["charges"])
+
+    def _play_to(self, state: GameState, piece_id: str, to_square: str) -> GameState:
+        move = next(
+            candidate
+            for candidate in legal_moves(state)
+            if candidate.piece_id == piece_id and candidate.to_square == to_square
+        )
+        next_state, _ = apply_move(state, move)
+        return next_state
 
 
 if __name__ == "__main__":

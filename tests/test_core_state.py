@@ -21,6 +21,7 @@ from pixie_solver.core import (
     PieceClass,
     PieceInstance,
     StateField,
+    stable_position_hash,
     stable_state_hash,
 )
 
@@ -75,6 +76,46 @@ class GameStateTest(unittest.TestCase):
         self.assertEqual(stable_state_hash(state), stable_state_hash(round_tripped))
         self.assertEqual("white_rook_1", state.occupancy()["a1"])
         self.assertEqual("h8", state.piece_on("h8").square)
+
+    def test_position_hash_ignores_clocks_and_repetition_metadata(self) -> None:
+        base_state = GameState(
+            piece_classes={
+                self.rook_class.class_id: self.rook_class,
+                self.king_class.class_id: self.king_class,
+            },
+            piece_instances={
+                "white_rook_1": PieceInstance(
+                    instance_id="white_rook_1",
+                    piece_class_id="phasing_rook",
+                    color=Color.WHITE,
+                    square="a1",
+                ),
+                "black_king_1": PieceInstance(
+                    instance_id="black_king_1",
+                    piece_class_id="baseline_king",
+                    color=Color.BLACK,
+                    square="h8",
+                ),
+            },
+            side_to_move=Color.WHITE,
+            halfmove_clock=4,
+            fullmove_number=3,
+            repetition_counts={"old_position": 2},
+            metadata={"label": "base"},
+        )
+        same_position = GameState(
+            piece_classes=base_state.piece_classes,
+            piece_instances=base_state.piece_instances,
+            side_to_move=base_state.side_to_move,
+            halfmove_clock=99,
+            fullmove_number=50,
+            repetition_counts={"different": 9},
+            pending_events=(Event(event_type="turn_start"),),
+            metadata={"label": "same-position"},
+        )
+
+        self.assertNotEqual(stable_state_hash(base_state), stable_state_hash(same_position))
+        self.assertEqual(stable_position_hash(base_state), stable_position_hash(same_position))
 
     def test_duplicate_occupancy_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

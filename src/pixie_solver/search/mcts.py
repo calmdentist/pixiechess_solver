@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -17,6 +18,18 @@ from pixie_solver.simulator.transition import other_color
 from pixie_solver.utils.serialization import JsonValue
 
 DEFAULT_SIMULATIONS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class DirichletRootNoise:
+    alpha: float = 0.3
+    exploration_fraction: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.alpha <= 0.0:
+            raise ValueError("Dirichlet alpha must be positive")
+        if self.exploration_fraction < 0.0 or self.exploration_fraction > 1.0:
+            raise ValueError("root exploration fraction must be in [0, 1]")
 
 
 @dataclass(slots=True)
@@ -80,6 +93,8 @@ def run_mcts(
     policy_value_model: PolicyValueModel | None = None,
     evaluator: StateEvaluator | None = None,
     c_puct: float = 1.5,
+    root_noise: DirichletRootNoise | None = None,
+    rng: random.Random | None = None,
 ) -> SearchResult:
     if simulations < 1:
         raise ValueError("simulations must be at least 1")
@@ -93,7 +108,29 @@ def run_mcts(
         "model_inference_calls": 0,
         "applied_moves": 0,
     }
-    for _ in range(simulations):
+    noise_metadata: dict[str, JsonValue] = {
+        "root_noise_applied": False,
+        "root_dirichlet_alpha": None,
+        "root_exploration_fraction": 0.0,
+    }
+    remaining_simulations = simulations
+    if root_noise is not None:
+        value = _expand_node(
+            node=root,
+            policy_value_model=policy_value_model,
+            evaluator=evaluator_impl,
+            diagnostics=diagnostics,
+        )
+        root.visit_count += 1
+        root.value_sum += value
+        remaining_simulations -= 1
+        noise_metadata = _apply_root_dirichlet_noise(
+            root=root,
+            noise=root_noise,
+            rng=rng if rng is not None else random.Random(),
+        )
+
+    for _ in range(remaining_simulations):
         _simulate(
             node=root,
             policy_value_model=policy_value_model,
@@ -135,6 +172,7 @@ def run_mcts(
             "evaluator": type(evaluator_impl).__name__,
             "used_model": policy_value_model is not None,
             "c_puct": c_puct,
+            **noise_metadata,
             **diagnostics,
         },
     )
@@ -319,6 +357,64 @@ def _priors_for_moves(
         move_id: exp_value / total
         for move_id, exp_value in zip(move_ids, exp_logits, strict=True)
     }
+
+
+def _apply_root_dirichlet_noise(
+    *,
+    root: SearchNode,
+    noise: DirichletRootNoise,
+    rng: random.Random,
+) -> dict[str, JsonValue]:
+    if not root.children_by_move_id or noise.exploration_fraction <= 0.0:
+        return {
+            "root_noise_applied": False,
+            "root_dirichlet_alpha": noise.alpha,
+            "root_exploration_fraction": noise.exploration_fraction,
+        }
+
+    move_ids = tuple(sorted(root.children_by_move_id))
+    samples = _sample_dirichlet(
+        count=len(move_ids),
+        alpha=noise.alpha,
+        rng=rng,
+    )
+    sample_by_move_id = {
+        move_id: sample
+        for move_id, sample in zip(move_ids, samples, strict=True)
+    }
+    mixed_priors: dict[str, float] = {}
+    for move_id in move_ids:
+        edge = root.children_by_move_id[move_id]
+        mixed_prior = (
+            (1.0 - noise.exploration_fraction) * edge.prior
+            + noise.exploration_fraction * sample_by_move_id[move_id]
+        )
+        edge.prior = mixed_prior
+        mixed_priors[move_id] = mixed_prior
+
+    return {
+        "root_noise_applied": True,
+        "root_dirichlet_alpha": noise.alpha,
+        "root_exploration_fraction": noise.exploration_fraction,
+        "root_noise": dict(sorted(sample_by_move_id.items())),
+        "root_priors_after_noise": dict(sorted(mixed_priors.items())),
+    }
+
+
+def _sample_dirichlet(
+    *,
+    count: int,
+    alpha: float,
+    rng: random.Random,
+) -> tuple[float, ...]:
+    if count < 1:
+        return ()
+    samples = [rng.gammavariate(alpha, 1.0) for _ in range(count)]
+    total = sum(samples)
+    if total <= 0.0:
+        uniform = 1.0 / count
+        return tuple(uniform for _ in samples)
+    return tuple(sample / total for sample in samples)
 
 
 def _outcome_value(outcome: str, color: Color) -> float:

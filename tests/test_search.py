@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import sys
 import unittest
 from pathlib import Path
@@ -14,7 +15,7 @@ from pixie_solver.core import BasePieceType, Color, Modifier, Move, PieceClass, 
 from pixie_solver.core import stable_move_id
 from pixie_solver.core.state import GameState
 from pixie_solver.model import PolicyValueModel, PolicyValueOutput
-from pixie_solver.search import run_mcts
+from pixie_solver.search import DirichletRootNoise, run_mcts
 from pixie_solver.simulator.movegen import legal_moves
 
 
@@ -207,6 +208,58 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(
             {stable_move_id(move) for move in result.legal_moves},
             set(result.visit_distribution),
+        )
+
+    def test_root_dirichlet_noise_mixes_root_priors_deterministically(self) -> None:
+        state = GameState(
+            piece_classes={
+                self.king.class_id: self.king,
+                self.rook.class_id: self.rook,
+            },
+            piece_instances={
+                "white_king": PieceInstance(
+                    instance_id="white_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.WHITE,
+                    square="e1",
+                ),
+                "white_rook": PieceInstance(
+                    instance_id="white_rook",
+                    piece_class_id=self.rook.class_id,
+                    color=Color.WHITE,
+                    square="a1",
+                ),
+                "black_king": PieceInstance(
+                    instance_id="black_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.BLACK,
+                    square="e8",
+                ),
+            },
+            side_to_move=Color.WHITE,
+        )
+
+        first = run_mcts(
+            state,
+            simulations=1,
+            root_noise=DirichletRootNoise(alpha=0.3, exploration_fraction=1.0),
+            rng=random.Random(123),
+        )
+        second = run_mcts(
+            state,
+            simulations=1,
+            root_noise=DirichletRootNoise(alpha=0.3, exploration_fraction=1.0),
+            rng=random.Random(123),
+        )
+        without_noise = run_mcts(state, simulations=1)
+
+        self.assertTrue(first.metadata["root_noise_applied"])
+        self.assertEqual(first.visit_distribution, second.visit_distribution)
+        self.assertNotEqual(without_noise.visit_distribution, first.visit_distribution)
+        self.assertAlmostEqual(1.0, sum(first.metadata["root_noise"].values()))
+        self.assertEqual(
+            first.metadata["root_noise"],
+            first.metadata["root_priors_after_noise"],
         )
 
 

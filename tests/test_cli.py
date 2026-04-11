@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import importlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,12 +20,21 @@ if str(SRC) not in sys.path:
 
 from pixie_solver.core import BasePieceType, Color, Modifier, PieceClass, PieceInstance
 from pixie_solver.core.state import GameState
+from pixie_solver.curriculum import generate_teacher_piece
+from pixie_solver.dsl import load_piece_program
+from pixie_solver.rules import StaticCompileProvider, append_verified_piece_version
+from pixie_solver.rules.mismatch import replace_piece_program
+from pixie_solver.simulator.engine import apply_move
+from pixie_solver.simulator.movegen import legal_moves
 from pixie_solver.training import (
     SelfPlayConfig,
     generate_selfplay_games,
     load_training_checkpoint,
     write_selfplay_examples_jsonl,
 )
+from pixie_solver.utils import canonical_json
+
+cli_main = importlib.import_module("pixie_solver.cli.main")
 
 
 class CLITest(unittest.TestCase):
@@ -100,6 +113,187 @@ class CLITest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual("ok", payload["status"])
         self.assertEqual("war_automaton", payload["piece_id"])
+
+    def test_repair_piece_command_writes_registry_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            current_program = load_piece_program(
+                ROOT / "data/pieces/handauthored/war_automaton.json"
+            )
+            patched_program = _war_automaton_with_forward_offset(2)
+            before_state, move, observed_state = _repair_fixture_states(
+                current_program,
+                patched_program,
+            )
+            current_path = temp_path / "current.json"
+            patched_response_path = temp_path / "provider_response.json"
+            before_path = temp_path / "before.json"
+            move_path = temp_path / "move.json"
+            observed_path = temp_path / "observed.json"
+            registry_path = temp_path / "registry.json"
+            repaired_dir = temp_path / "repaired"
+            current_path.write_text(canonical_json(current_program, indent=2), encoding="utf-8")
+            patched_response_path.write_text(
+                canonical_json({"patched_program": patched_program}, indent=2),
+                encoding="utf-8",
+            )
+            before_path.write_text(canonical_json(before_state.to_dict(), indent=2), encoding="utf-8")
+            move_path.write_text(canonical_json(move.to_dict(), indent=2), encoding="utf-8")
+            observed_path.write_text(canonical_json(observed_state.to_dict(), indent=2), encoding="utf-8")
+
+            result = self._run(
+                "repair-piece",
+                "--description",
+                "A pawn that surges forward after a capture.",
+                "--current-program",
+                str(current_path),
+                "--before-state",
+                str(before_path),
+                "--move",
+                str(move_path),
+                "--observed-state",
+                str(observed_path),
+                "--provider-response",
+                str(patched_response_path),
+                "--registry",
+                str(registry_path),
+                "--out-dir",
+                str(repaired_dir),
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("accepted", payload["status"])
+            self.assertTrue(payload["accepted"])
+            self.assertEqual(1, payload["verified_cases"])
+            self.assertTrue(registry_path.exists())
+            self.assertTrue(Path(payload["registry_record"]["dsl_path"]).exists())
+
+    def test_selfplay_can_sample_verified_registry_pieces(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            registry_path = temp_path / "registry.json"
+            out_dir = temp_path / "repaired"
+            games_path = temp_path / "games.jsonl"
+            patched_program = _war_automaton_with_forward_offset(2)
+            record = append_verified_piece_version(
+                registry_path=registry_path,
+                out_dir=out_dir,
+                program=patched_program,
+                description="Verified repaired automaton.",
+                source="test",
+                verified_cases=1,
+            )
+
+            result = self._run(
+                "selfplay",
+                "--standard-initial-state",
+                "--randomize-handauthored-specials",
+                "--use-verified-pieces",
+                "--piece-registry",
+                str(registry_path),
+                "--special-piece-inclusion-probability",
+                "1.0",
+                "--games",
+                "1",
+                "--games-out",
+                str(games_path),
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--opening-temperature",
+                "0",
+                "--final-temperature",
+                "0",
+                "--temperature-drop-after-ply",
+                "0",
+                "--seed",
+                "41",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["used_verified_pieces"])
+            self.assertEqual(1, payload["verified_piece_count"])
+            self.assertEqual(record.dsl_digest, payload["verified_piece_digests"]["war_automaton"]["dsl_digest"])
+            game_payload = json.loads(games_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertIn("piece_registry", game_payload["replay_trace"]["metadata"])
+
+    def test_piece_curriculum_command_repairs_and_writes_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            teacher = generate_teacher_piece(seed=1, recipe="capture_sprint")
+            candidate = _program_with_forward_offset(teacher.teacher_program, offset=1)
+            compile_response_path = temp_path / "compile_response.json"
+            repair_response_path = temp_path / "repair_response.json"
+            registry_path = temp_path / "registry.json"
+            repaired_dir = temp_path / "repaired"
+            artifact_dir = temp_path / "artifacts"
+            compile_response_path.write_text(
+                canonical_json({"candidate_program": candidate}, indent=2),
+                encoding="utf-8",
+            )
+            repair_response_path.write_text(
+                canonical_json({"patched_program": teacher.teacher_program}, indent=2),
+                encoding="utf-8",
+            )
+
+            result = self._run(
+                "piece-curriculum",
+                "--seed",
+                "1",
+                "--recipe",
+                "capture_sprint",
+                "--compile-response",
+                str(compile_response_path),
+                "--repair-response",
+                str(repair_response_path),
+                "--registry",
+                str(registry_path),
+                "--out-dir",
+                str(repaired_dir),
+                "--artifact-dir",
+                str(artifact_dir),
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["accepted"])
+            self.assertEqual(1, payload["metadata"]["repairs"])
+            self.assertEqual("synthetic_capture_sprint_1", payload["registry_record"]["piece_id"])
+            self.assertTrue(registry_path.exists())
+            self.assertTrue((artifact_dir / "teacher_program.json").exists())
+            self.assertTrue((artifact_dir / "summary.json").exists())
+
+    def test_piece_curriculum_can_use_live_compile_provider(self) -> None:
+        teacher = generate_teacher_piece(seed=1, recipe="capture_sprint")
+        parser = cli_main.build_parser()
+        args = parser.parse_args(
+            [
+                "piece-curriculum",
+                "--seed",
+                "1",
+                "--recipe",
+                "capture_sprint",
+                "--no-registry-write",
+            ]
+        )
+        output = io.StringIO()
+
+        with patch.object(
+            cli_main,
+            "_build_llm_piece_provider",
+            return_value=StaticCompileProvider(teacher.teacher_program),
+        ):
+            with contextlib.redirect_stdout(output):
+                returncode = args.handler(args)
+
+        self.assertEqual(0, returncode)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(payload["accepted"])
+        self.assertEqual("synthetic_capture_sprint_1", payload["synthetic_piece"]["piece_id"])
 
     def test_selfplay_command_writes_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -355,6 +549,70 @@ class CLITest(unittest.TestCase):
             self.assertGreater(cycle["val_examples"], 0)
             self.assertIn("average_policy_cross_entropy", cycle["train_eval_metrics"])
             self.assertIn("average_policy_cross_entropy", cycle["val_eval_metrics"])
+
+def _war_automaton_with_forward_offset(offset: int) -> dict[str, object]:
+    program = load_piece_program(ROOT / "data/pieces/handauthored/war_automaton.json")
+    hook = program["hooks"][0]
+    hook["conditions"][1]["args"]["square"]["offset"] = [0, offset]
+    hook["effects"][0]["args"]["to"]["offset"] = [0, offset]
+    return program
+
+
+def _program_with_forward_offset(program: dict[str, object], *, offset: int) -> dict[str, object]:
+    from copy import deepcopy
+
+    candidate = deepcopy(program)
+    hook = candidate["hooks"][0]
+    hook["conditions"][1]["args"]["square"]["offset"] = [0, offset]
+    hook["effects"][0]["args"]["to"]["offset"] = [0, offset]
+    return candidate
+
+
+def _repair_fixture_states(
+    current_program: dict[str, object],
+    patched_program: dict[str, object],
+):
+    from pixie_solver.dsl import compile_piece_program
+
+    phasing_rook = compile_piece_program(
+        load_piece_program(ROOT / "data/pieces/handauthored/phasing_rook.json")
+    )
+    current_war_automaton = compile_piece_program(current_program)
+    before_state = GameState(
+        piece_classes={
+            phasing_rook.class_id: phasing_rook,
+            current_war_automaton.class_id: current_war_automaton,
+        },
+        piece_instances={
+            "white_rook": PieceInstance(
+                instance_id="white_rook",
+                piece_class_id=phasing_rook.class_id,
+                color=Color.WHITE,
+                square="h1",
+            ),
+            "white_war_auto": PieceInstance(
+                instance_id="white_war_auto",
+                piece_class_id=current_war_automaton.class_id,
+                color=Color.WHITE,
+                square="a2",
+            ),
+            "black_target": PieceInstance(
+                instance_id="black_target",
+                piece_class_id=current_war_automaton.class_id,
+                color=Color.BLACK,
+                square="h3",
+            ),
+        },
+        side_to_move=Color.WHITE,
+    )
+    move = next(
+        move
+        for move in legal_moves(before_state)
+        if move.piece_id == "white_rook" and move.to_square == "h3"
+    )
+    teacher_before = replace_piece_program(before_state, patched_program)
+    observed_state, _ = apply_move(teacher_before, move)
+    return before_state, move, observed_state
 
 
 if __name__ == "__main__":
