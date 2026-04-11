@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PixieChess Viewer</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="board-zone" aria-label="PixieChess board">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="runLabel">waiting</p>
+            <h1 id="positionTitle">PixieChess Viewer</h1>
+          </div>
+          <div class="status-strip" aria-label="Current game status">
+            <span id="sideToMove">side: -</span>
+            <span id="plyLabel">ply: -</span>
+            <span id="outcomeLabel">outcome: -</span>
+          </div>
+        </header>
+
+        <div class="board-wrap">
+          <div class="rank-files files-top" id="filesTop" aria-hidden="true"></div>
+          <div class="board-row">
+            <div class="rank-files ranks-left" id="ranksLeft" aria-hidden="true"></div>
+            <div class="board" id="board" role="grid" aria-label="Chess board"></div>
+            <div class="rank-files ranks-right" id="ranksRight" aria-hidden="true"></div>
+          </div>
+          <div class="rank-files files-bottom" id="filesBottom" aria-hidden="true"></div>
+        </div>
+
+        <div class="controls" aria-label="Replay controls">
+          <button id="stepBack" type="button">Back</button>
+          <button id="playPause" type="button">Play</button>
+          <button id="stepForward" type="button">Forward</button>
+          <button id="jumpLive" type="button">Live</button>
+          <button id="flipBoard" type="button">Flip</button>
+          <label class="speed-control">
+            Speed
+            <input id="speedRange" type="range" min="150" max="1600" step="50" value="700">
+          </label>
+        </div>
+      </section>
+
+      <aside class="side-panel" aria-label="Game details">
+        <section class="panel-section">
+          <h2>Games</h2>
+          <div class="game-list" id="gameList"></div>
+        </section>
+
+        <section class="panel-section">
+          <h2>Search</h2>
+          <div class="metric-row">
+            <span>root value</span>
+            <strong id="rootValue">-</strong>
+          </div>
+          <div class="metric-row">
+            <span>legal moves</span>
+            <strong id="legalMoves">-</strong>
+          </div>
+          <ol class="search-list" id="searchList"></ol>
+        </section>
+
+        <section class="panel-section">
+          <h2>Moves</h2>
+          <ol class="move-list" id="moveList"></ol>
+        </section>
+      </aside>
+
+      <section class="bottom-panel" aria-label="Events and activity">
+        <div class="panel-section">
+          <h2>Events</h2>
+          <ol class="event-list" id="eventList"></ol>
+        </div>
+        <div class="panel-section">
+          <h2>Activity</h2>
+          <ol class="activity-list" id="activityList"></ol>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
