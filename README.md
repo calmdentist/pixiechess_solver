@@ -23,6 +23,7 @@ The current foundation covers:
 - AlphaZero-style Dirichlet root noise for self-play exploration,
 - checkpoint save/load for model + optimizer state,
 - real `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` CLI commands,
+- a local browser viewer for live self-play/training games and completed replay files,
 - a CLI boundary for compile and verification flows,
 - live Anthropic/OpenAI LLM providers for English-to-DSL compile and mismatch repair,
 - synthetic piece curriculum runs that can compile, repair, verify, and admit DSL programs,
@@ -44,9 +45,11 @@ python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m pixie_solver compile-piece --file data/pieces/handauthored/phasing_rook.json --pretty
 PYTHONPATH=src python3 -m pixie_solver verify-piece --file data/pieces/handauthored/war_automaton.json
 PYTHONPATH=src python3 -m pixie_solver selfplay --standard-initial-state --randomize-handauthored-specials --examples-out data/selfplay/examples.jsonl --games 4
+PYTHONPATH=src python3 -m pixie_solver selfplay --standard-initial-state --randomize-handauthored-specials --games 1 --viewer --viewer-keep-open
 PYTHONPATH=src python3 -m pixie_solver train --examples data/selfplay/examples.jsonl --checkpoint-out checkpoints/model.pt --device mps
 PYTHONPATH=src python3 -m pixie_solver eval-model --checkpoint checkpoints/model.pt --examples data/selfplay/examples.jsonl --device mps
 PYTHONPATH=src python3 -m pixie_solver train-loop --output-dir runs/local_smoke --cycles 2 --train-games 20 --val-games 6 --device mps
+PYTHONPATH=src python3 -m pixie_solver view-replay --games runs/local_smoke/selfplay/cycle_001_train_games.jsonl --viewer-open-browser
 ```
 
 `pixie train-loop` is the ergonomic local learning check: each cycle generates fresh self-play,
@@ -63,6 +66,12 @@ checkpoints do not collapse into a narrow opening sample. Set
 
 `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` emit progress logs to `stderr` during long runs.
 Use `--quiet` if you only want the final JSON summary on `stdout`.
+
+Add `--viewer` to `pixie selfplay` or `pixie train-loop` to start a local browser board at
+`127.0.0.1` and stream games as they are generated. The viewer renders magical pieces as their
+base chess piece with a letter badge, for example `P` for Phasing Rook, `S` for Sumo Rook, and
+`W` for War Automaton. Use `--viewer-open-browser` to launch the browser automatically, and
+`--viewer-keep-open` when you want the process to keep serving the board after a short run ends.
 
 ## Live LLM Providers
 

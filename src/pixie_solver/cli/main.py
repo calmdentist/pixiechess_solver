@@ -5,8 +5,18 @@ import json
 import random
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import fields
 from pathlib import Path
 
+from pixie_solver.gui import (
+    ViewerServer,
+    replay_payload_from_games,
+    selfplay_trace_event_to_frame,
+    viewer_status_frame,
+    wait_for_viewer_shutdown,
+)
+from pixie_solver.gui.view_model import training_progress_frame
 from pixie_solver.core.hash import stable_digest
 
 from pixie_solver.core import (
@@ -46,11 +56,12 @@ from pixie_solver.training import (
     load_training_checkpoint,
     save_training_checkpoint,
     read_selfplay_examples_jsonl,
+    read_selfplay_games_jsonl,
     write_selfplay_examples_jsonl,
     write_selfplay_games_jsonl,
     train_from_replays,
 )
-from pixie_solver.utils.serialization import canonical_json
+from pixie_solver.utils.serialization import JsonValue, canonical_json
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -240,7 +251,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress logs on stderr and only print the final JSON summary.",
     )
+    _add_viewer_args(selfplay_parser)
     selfplay_parser.set_defaults(handler=_handle_selfplay)
+
+    view_replay_parser = subparsers.add_parser(
+        "view-replay",
+        help="Open a local browser viewer for self-play game JSONL replays.",
+    )
+    view_replay_parser.add_argument(
+        "--games",
+        type=Path,
+        required=True,
+        help="SelfPlayGame JSONL file produced by pixie selfplay or train-loop.",
+    )
+    _add_viewer_args(view_replay_parser, include_enable_flag=False)
+    view_replay_parser.set_defaults(handler=_handle_view_replay)
 
     train_parser = subparsers.add_parser("train", help="Train or resume the policy/value model from self-play examples.")
     train_parser.add_argument("--examples", type=Path, required=True, help="Input JSONL path of SelfPlayExample rows.")
@@ -337,6 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--log-every-batches", type=int, default=10, help="Training progress frequency.")
     train_loop_parser.add_argument("--log-every-examples", type=int, default=25, help="Evaluation progress frequency.")
     train_loop_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
+    _add_viewer_args(train_loop_parser)
     train_loop_parser.set_defaults(handler=_handle_train_loop)
 
     train_loop_parser.add_argument("--piece-registry", type=Path, default=Path("data/pieces/registry.json"), help="Verified piece registry used when --use-verified-pieces is enabled.")
@@ -387,6 +413,40 @@ def _add_llm_args(parser: argparse.ArgumentParser) -> None:
         "--no-llm-thinking",
         action="store_true",
         help="Disable Claude adaptive thinking for live Anthropic calls.",
+    )
+
+
+def _add_viewer_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_enable_flag: bool = True,
+) -> None:
+    if include_enable_flag:
+        parser.add_argument(
+            "--viewer",
+            action="store_true",
+            help="Start a local browser viewer for live game updates.",
+        )
+    parser.add_argument(
+        "--viewer-host",
+        default="127.0.0.1",
+        help="Host for the local viewer server.",
+    )
+    parser.add_argument(
+        "--viewer-port",
+        type=int,
+        default=0,
+        help="Port for the local viewer server. Use 0 to choose a free port.",
+    )
+    parser.add_argument(
+        "--viewer-open-browser",
+        action="store_true",
+        help="Open the viewer URL in the default browser.",
+    )
+    parser.add_argument(
+        "--viewer-keep-open",
+        action="store_true",
+        help="Keep the viewer server running after the command completes.",
     )
 
 
@@ -558,8 +618,8 @@ def _handle_piece_curriculum(args: argparse.Namespace) -> int:
 
 
 def _handle_selfplay(args: argparse.Namespace) -> int:
-    if args.games_out is None and args.examples_out is None:
-        raise ValueError("selfplay requires --games-out, --examples-out, or both")
+    if args.games_out is None and args.examples_out is None and not args.viewer:
+        raise ValueError("selfplay requires --games-out, --examples-out, --viewer, or both")
     if args.use_verified_pieces and not args.standard_initial_state:
         raise ValueError("--use-verified-pieces requires --standard-initial-state")
     if args.use_verified_pieces and not args.randomize_handauthored_specials:
@@ -623,77 +683,119 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
         adjudicate_max_plies=args.adjudicate_max_plies,
         adjudication_threshold=args.adjudication_threshold,
     )
-    games = generate_selfplay_games(
-        initial_states,
-        games=args.games,
-        config=config,
-        policy_value_model=model,
-        progress_callback=(
-            None
-            if args.quiet
-            else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
-        ),
-    )
-    _annotate_games_with_registry(
-        games,
-        registry_path=args.piece_registry,
-        verified_records=verified_records,
-    )
-    examples = flatten_selfplay_examples(games)
+    viewer = _start_live_viewer(args, enabled=args.viewer)
+    try:
+        games = generate_selfplay_games(
+            initial_states,
+            games=args.games,
+            config=config,
+            policy_value_model=model,
+            progress_callback=(
+                None
+                if args.quiet
+                else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
+            ),
+            trace_callback=_build_selfplay_viewer_trace_callback(
+                viewer,
+                cycle=None,
+                phase="selfplay",
+            ),
+        )
+        _annotate_games_with_registry(
+            games,
+            registry_path=args.piece_registry,
+            verified_records=verified_records,
+        )
+        examples = flatten_selfplay_examples(games)
 
-    if args.games_out is not None:
-        write_selfplay_games_jsonl(args.games_out, games)
-    if args.examples_out is not None:
-        write_selfplay_examples_jsonl(args.examples_out, examples)
+        if args.games_out is not None:
+            write_selfplay_games_jsonl(args.games_out, games)
+        if args.examples_out is not None:
+            write_selfplay_examples_jsonl(args.examples_out, examples)
 
+        print(
+            canonical_json(
+                {
+                    "status": "ok",
+                    "games_generated": len(games),
+                    "examples_generated": len(examples),
+                    "used_model": args.checkpoint is not None,
+                    "games_out": str(args.games_out) if args.games_out is not None else None,
+                    "examples_out": (
+                        str(args.examples_out) if args.examples_out is not None else None
+                    ),
+                    "outcomes": _outcome_counts(games),
+                    "seed_state_count": len(initial_states),
+                    "randomized_special_pieces": args.randomize_handauthored_specials,
+                    "special_piece_dir": (
+                        str(args.special_piece_dir)
+                        if args.randomize_handauthored_specials
+                        else None
+                    ),
+                    "special_piece_inclusion_probability": (
+                        args.special_piece_inclusion_probability
+                        if args.randomize_handauthored_specials
+                        else None
+                    ),
+                    "used_verified_pieces": args.use_verified_pieces,
+                    "piece_registry": (
+                        str(args.piece_registry) if args.use_verified_pieces else None
+                    ),
+                    "verified_piece_count": len(verified_records),
+                    "verified_piece_digests": registry_piece_digest_metadata(verified_records),
+                    "viewer_url": viewer.url if viewer is not None else None,
+                    "config": {
+                        "simulations": config.simulations,
+                        "max_plies": config.max_plies,
+                        "opening_temperature": config.opening_temperature,
+                        "final_temperature": config.final_temperature,
+                        "temperature_drop_after_ply": config.temperature_drop_after_ply,
+                        "c_puct": config.c_puct,
+                        "root_dirichlet_alpha": config.root_dirichlet_alpha,
+                        "root_exploration_fraction": config.root_exploration_fraction,
+                        "seed": config.seed,
+                        "adjudicate_max_plies": config.adjudicate_max_plies,
+                        "adjudication_threshold": config.adjudication_threshold,
+                    },
+                    **checkpoint_metadata,
+                },
+                indent=2,
+            )
+        )
+        _finish_live_viewer(args, viewer)
+        return 0
+    except BaseException:
+        if viewer is not None:
+            viewer.stop()
+        raise
+
+
+def _handle_view_replay(args: argparse.Namespace) -> int:
+    games = read_selfplay_games_jsonl(args.games)
+    payload = replay_payload_from_games(games, source=str(args.games))
+    viewer = ViewerServer(
+        host=args.viewer_host,
+        port=args.viewer_port,
+        replay_payload=payload,
+        open_browser=args.viewer_open_browser,
+    )
+    url = viewer.start()
+    _stderr_print(f"pixie viewer: {url}")
     print(
         canonical_json(
             {
                 "status": "ok",
-                "games_generated": len(games),
-                "examples_generated": len(examples),
-                "used_model": args.checkpoint is not None,
-                "games_out": str(args.games_out) if args.games_out is not None else None,
-                "examples_out": (
-                    str(args.examples_out) if args.examples_out is not None else None
-                ),
-                "outcomes": _outcome_counts(games),
-                "seed_state_count": len(initial_states),
-                "randomized_special_pieces": args.randomize_handauthored_specials,
-                "special_piece_dir": (
-                    str(args.special_piece_dir)
-                    if args.randomize_handauthored_specials
-                    else None
-                ),
-                "special_piece_inclusion_probability": (
-                    args.special_piece_inclusion_probability
-                    if args.randomize_handauthored_specials
-                    else None
-                ),
-                "used_verified_pieces": args.use_verified_pieces,
-                "piece_registry": (
-                    str(args.piece_registry) if args.use_verified_pieces else None
-                ),
-                "verified_piece_count": len(verified_records),
-                "verified_piece_digests": registry_piece_digest_metadata(verified_records),
-                "config": {
-                    "simulations": config.simulations,
-                    "max_plies": config.max_plies,
-                    "opening_temperature": config.opening_temperature,
-                    "final_temperature": config.final_temperature,
-                    "temperature_drop_after_ply": config.temperature_drop_after_ply,
-                    "c_puct": config.c_puct,
-                    "root_dirichlet_alpha": config.root_dirichlet_alpha,
-                    "root_exploration_fraction": config.root_exploration_fraction,
-                    "seed": config.seed,
-                    "adjudicate_max_plies": config.adjudicate_max_plies,
-                    "adjudication_threshold": config.adjudication_threshold,
-                },
-                **checkpoint_metadata,
+                "viewer_url": url,
+                "games_loaded": len(games),
+                "games_path": str(args.games),
             },
             indent=2,
         )
     )
+    try:
+        wait_for_viewer_shutdown(url)
+    finally:
+        viewer.stop()
     return 0
 
 
@@ -884,6 +986,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         model_config = checkpoint.model_config
         previous_checkpoint_path = args.resume_checkpoint
 
+    viewer = _start_live_viewer(args, enabled=args.viewer)
     cycle_summaries: list[dict[str, object]] = []
     for cycle_index in range(1, args.cycles + 1):
         if not args.quiet:
@@ -921,11 +1024,21 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 if args.quiet
                 else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
             ),
+            trace_callback=_build_selfplay_viewer_trace_callback(
+                viewer,
+                cycle=cycle_index,
+                phase="train_selfplay",
+            ),
         )
         _annotate_games_with_registry(
             train_games,
             registry_path=args.piece_registry,
             verified_records=verified_records,
+        )
+        _annotate_games_with_viewer_phase(
+            train_games,
+            cycle=cycle_index,
+            phase="train_selfplay",
         )
         train_examples = flatten_selfplay_examples(train_games)
         train_games_path = data_dir / f"cycle_{cycle_index:03d}_train_games.jsonl"
@@ -950,12 +1063,19 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             model=model,
             optimizer_state_dict=optimizer_state_dict,
             config=training_config,
-            progress_callback=(
-                None
-                if args.quiet
-                else _build_training_progress_logger(
-                    log_every_batches=args.log_every_batches
-                )
+            progress_callback=_compose_progress_callbacks(
+                (
+                    None
+                    if args.quiet
+                    else _build_training_progress_logger(
+                        log_every_batches=args.log_every_batches
+                    )
+                ),
+                _build_training_viewer_progress_callback(
+                    viewer,
+                    cycle=cycle_index,
+                    phase="training",
+                ),
             ),
         )
         model = training_run.model
@@ -1009,11 +1129,21 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 if args.quiet
                 else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
             ),
+            trace_callback=_build_selfplay_viewer_trace_callback(
+                viewer,
+                cycle=cycle_index,
+                phase="val_selfplay",
+            ),
         )
         _annotate_games_with_registry(
             val_games,
             registry_path=args.piece_registry,
             verified_records=verified_records,
+        )
+        _annotate_games_with_viewer_phase(
+            val_games,
+            cycle=cycle_index,
+            phase="val_selfplay",
         )
         val_examples = flatten_selfplay_examples(val_games)
         val_games_path = data_dir / f"cycle_{cycle_index:03d}_val_games.jsonl"
@@ -1024,23 +1154,37 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         train_eval_metrics = evaluate_policy_value_model(
             model=model,
             examples=train_examples,
-            progress_callback=(
-                None
-                if args.quiet
-                else _build_model_eval_progress_logger(
-                    log_every_examples=args.log_every_examples
-                )
+            progress_callback=_compose_progress_callbacks(
+                (
+                    None
+                    if args.quiet
+                    else _build_model_eval_progress_logger(
+                        log_every_examples=args.log_every_examples
+                    )
+                ),
+                _build_eval_viewer_progress_callback(
+                    viewer,
+                    cycle=cycle_index,
+                    phase="train_eval",
+                ),
             ),
         )
         val_eval_metrics = evaluate_policy_value_model(
             model=model,
             examples=val_examples,
-            progress_callback=(
-                None
-                if args.quiet
-                else _build_model_eval_progress_logger(
-                    log_every_examples=args.log_every_examples
-                )
+            progress_callback=_compose_progress_callbacks(
+                (
+                    None
+                    if args.quiet
+                    else _build_model_eval_progress_logger(
+                        log_every_examples=args.log_every_examples
+                    )
+                ),
+                _build_eval_viewer_progress_callback(
+                    viewer,
+                    cycle=cycle_index,
+                    phase="val_eval",
+                ),
             ),
         )
         cycle_summary = {
@@ -1065,6 +1209,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             ),
             "verified_piece_count": len(verified_records),
             "verified_piece_digests": registry_piece_digest_metadata(verified_records),
+            "viewer_url": viewer.url if viewer is not None else None,
         }
         cycle_summaries.append(cycle_summary)
         metrics_path = metrics_dir / f"cycle_{cycle_index:03d}.json"
@@ -1084,12 +1229,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         "output_dir": str(args.output_dir),
         "cycles": cycle_summaries,
         "latest_checkpoint": cycle_summaries[-1]["checkpoint"],
+        "viewer_url": viewer.url if viewer is not None else None,
     }
     (args.output_dir / "summary.json").write_text(
         canonical_json(summary, indent=2),
         encoding="utf-8",
     )
     print(canonical_json(summary, indent=2))
+    _finish_live_viewer(args, viewer)
     return 0
 
 
@@ -1173,6 +1320,21 @@ def _annotate_games_with_registry(
         game.replay_trace.metadata.update(metadata)
 
 
+def _annotate_games_with_viewer_phase(
+    games,
+    *,
+    cycle: int,
+    phase: str,
+) -> None:
+    metadata = {
+        "cycle": cycle,
+        "phase": phase,
+    }
+    for game in games:
+        game.metadata.update(metadata)
+        game.replay_trace.metadata.update(metadata)
+
+
 def _write_curriculum_artifacts(artifact_dir: Path, result) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "teacher_program.json").write_text(
@@ -1250,6 +1412,131 @@ def _validate_resume_flags(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"--{field_name.replace('_', '-')} cannot be used with --resume-checkpoint"
             )
+
+
+def _start_live_viewer(
+    args: argparse.Namespace,
+    *,
+    enabled: bool,
+) -> ViewerServer | None:
+    if not enabled:
+        return None
+    viewer = ViewerServer(
+        host=args.viewer_host,
+        port=args.viewer_port,
+        open_browser=args.viewer_open_browser,
+    )
+    url = viewer.start()
+    _stderr_print(f"pixie viewer: {url}")
+    viewer.publish(
+        viewer_status_frame(
+            "viewer_started",
+            command=str(getattr(args, "command", "")),
+        )
+    )
+    return viewer
+
+
+def _finish_live_viewer(
+    args: argparse.Namespace,
+    viewer: ViewerServer | None,
+) -> None:
+    if viewer is None:
+        return
+    try:
+        viewer.publish(viewer_status_frame("run_completed"))
+        if args.viewer_keep_open:
+            wait_for_viewer_shutdown(viewer.url)
+    finally:
+        viewer.stop()
+
+
+def _build_selfplay_viewer_trace_callback(
+    viewer: ViewerServer | None,
+    *,
+    cycle: int | None,
+    phase: str,
+):
+    if viewer is None:
+        return None
+
+    def callback(event) -> None:
+        viewer.publish(
+            selfplay_trace_event_to_frame(
+                event,
+                cycle=cycle,
+                phase=phase,
+            )
+        )
+
+    return callback
+
+
+def _compose_progress_callbacks(*callbacks):
+    active_callbacks = [callback for callback in callbacks if callback is not None]
+    if not active_callbacks:
+        return None
+
+    def callback(progress) -> None:
+        for active_callback in active_callbacks:
+            active_callback(progress)
+
+    return callback
+
+
+def _build_training_viewer_progress_callback(
+    viewer: ViewerServer | None,
+    *,
+    cycle: int,
+    phase: str,
+) -> Callable[[TrainingProgress], None] | None:
+    if viewer is None:
+        return None
+
+    def callback(progress: TrainingProgress) -> None:
+        viewer.publish(
+            training_progress_frame(
+                event=progress.event,
+                cycle=cycle,
+                phase=phase,
+                metadata=_progress_metadata(progress),
+            )
+        )
+
+    return callback
+
+
+def _build_eval_viewer_progress_callback(
+    viewer: ViewerServer | None,
+    *,
+    cycle: int,
+    phase: str,
+) -> Callable[[ModelEvalProgress], None] | None:
+    if viewer is None:
+        return None
+
+    def callback(progress: ModelEvalProgress) -> None:
+        viewer.publish(
+            training_progress_frame(
+                event=progress.event,
+                cycle=cycle,
+                phase=phase,
+                metadata=_progress_metadata(progress),
+            )
+        )
+
+    return callback
+
+
+def _progress_metadata(progress) -> dict[str, JsonValue]:
+    metadata: dict[str, JsonValue] = {}
+    for field_spec in fields(progress):
+        value = getattr(progress, field_spec.name)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            metadata[field_spec.name] = value
+        else:
+            metadata[field_spec.name] = str(value)
+    return metadata
 
 
 def _build_selfplay_progress_logger(

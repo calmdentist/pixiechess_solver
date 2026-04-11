@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from pixie_solver.core import Color, GameState, Move, stable_move_id
+from pixie_solver.core import Color, GameState, Move, StateDelta, stable_move_id
 from pixie_solver.model.policy_value import PolicyValueModel
 from pixie_solver.search import (
     DirichletRootNoise,
@@ -72,6 +72,24 @@ class SelfPlayProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class SelfPlayTraceEvent:
+    event: str
+    game_index: int
+    games_total: int
+    ply: int | None = None
+    before_state: GameState | None = None
+    after_state: GameState | None = None
+    move: Move | None = None
+    selected_move_id: str | None = None
+    delta: StateDelta | None = None
+    search_result: SearchResult | None = None
+    outcome: str | None = None
+    termination_reason: str | None = None
+    used_model: bool = False
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class CutoffAdjudication:
     outcome: str
     score: float
@@ -95,6 +113,7 @@ def generate_selfplay_games(
     policy_value_model: PolicyValueModel | None = None,
     evaluator: StateEvaluator | None = None,
     progress_callback: Callable[[SelfPlayProgress], None] | None = None,
+    trace_callback: Callable[[SelfPlayTraceEvent], None] | None = None,
 ) -> list[SelfPlayGame]:
     if games < 1:
         raise ValueError("games must be at least 1")
@@ -116,6 +135,7 @@ def generate_selfplay_games(
                 policy_value_model=policy_value_model,
                 evaluator=evaluator,
                 progress_callback=progress_callback,
+                trace_callback=trace_callback,
             )
         )
     return generated_games
@@ -162,6 +182,7 @@ def _play_single_game(
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator | None,
     progress_callback: Callable[[SelfPlayProgress], None] | None,
+    trace_callback: Callable[[SelfPlayTraceEvent], None] | None,
 ) -> SelfPlayGame:
     state = initial_state
     examples: list[SelfPlayExample] = []
@@ -175,6 +196,17 @@ def _play_single_game(
                 event="game_started",
                 game_index=game_index,
                 games_total=games_total,
+                used_model=policy_value_model is not None,
+            )
+        )
+    if trace_callback is not None:
+        trace_callback(
+            SelfPlayTraceEvent(
+                event="game_started",
+                game_index=game_index,
+                games_total=games_total,
+                ply=0,
+                after_state=state,
                 used_model=policy_value_model is not None,
             )
         )
@@ -233,7 +265,28 @@ def _play_single_game(
             )
         )
         moves.append(chosen_move)
-        state, _ = apply_move(state, chosen_move)
+        before_state = state
+        state, delta = apply_move(before_state, chosen_move)
+        if trace_callback is not None:
+            trace_callback(
+                SelfPlayTraceEvent(
+                    event="ply_completed",
+                    game_index=game_index,
+                    games_total=games_total,
+                    ply=ply + 1,
+                    before_state=before_state,
+                    after_state=state,
+                    move=chosen_move,
+                    selected_move_id=chosen_move_id,
+                    delta=delta,
+                    search_result=search_result,
+                    used_model=policy_value_model is not None,
+                    metadata={
+                        "temperature": config.temperature_for_ply(ply),
+                        "legal_move_count": len(search_result.legal_moves),
+                    },
+                )
+            )
     else:
         game_result = result(state)
 
@@ -290,6 +343,25 @@ def _play_single_game(
             ),
         },
     )
+    if trace_callback is not None:
+        trace_callback(
+            SelfPlayTraceEvent(
+                event="game_completed",
+                game_index=game_index,
+                games_total=games_total,
+                ply=len(moves),
+                after_state=state,
+                outcome=outcome,
+                termination_reason=termination_reason,
+                used_model=policy_value_model is not None,
+                metadata={
+                    "plies_played": len(moves),
+                    "cutoff_adjudication": (
+                        adjudication.to_dict() if adjudication is not None else None
+                    ),
+                },
+            )
+        )
     if progress_callback is not None:
         progress_callback(
             SelfPlayProgress(
