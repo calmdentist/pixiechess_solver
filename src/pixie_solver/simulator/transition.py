@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pixie_solver.core.event import Event, StateDelta
+from pixie_solver.core.hash import stable_position_hash
 from pixie_solver.core.move import Move
 from pixie_solver.core.piece import BasePieceType, Color, PieceInstance
 from pixie_solver.core.state import GameState
@@ -190,6 +191,10 @@ def apply_move_unchecked(state: GameState, move: Move) -> tuple[GameState, State
             ),
         ),
     )
+    final_state = _with_repetition_counts(
+        final_state,
+        _next_repetition_counts(state, final_state),
+    )
 
     assert_state_invariants(final_state)
     after_state_hash = final_state.state_hash()
@@ -292,6 +297,35 @@ def _next_halfmove_clock(
     if was_capture or piece_class.base_piece_type == BasePieceType.PAWN:
         return 0
     return state.halfmove_clock + 1
+
+
+def _next_repetition_counts(
+    before_state: GameState,
+    after_state: GameState,
+) -> dict[str, int]:
+    counts = dict(before_state.repetition_counts)
+    counts.setdefault(stable_position_hash(before_state), 1)
+    after_position_hash = stable_position_hash(after_state)
+    counts[after_position_hash] = counts.get(after_position_hash, 0) + 1
+    return counts
+
+
+def _with_repetition_counts(
+    state: GameState,
+    repetition_counts: dict[str, int],
+) -> GameState:
+    return GameState(
+        piece_classes=state.piece_classes,
+        piece_instances=state.piece_instances,
+        side_to_move=state.side_to_move,
+        castling_rights=state.castling_rights,
+        en_passant_square=state.en_passant_square,
+        halfmove_clock=state.halfmove_clock,
+        fullmove_number=state.fullmove_number,
+        repetition_counts=repetition_counts,
+        pending_events=state.pending_events,
+        metadata=state.metadata,
+    )
 
 
 def _next_fullmove_number(state: GameState) -> int:

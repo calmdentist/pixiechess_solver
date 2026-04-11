@@ -123,6 +123,32 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual("white", result(final_state))
         self.assertEqual(game.final_state_hash, final_state.state_hash())
 
+    def test_selfplay_records_root_noise_metadata(self) -> None:
+        game = generate_selfplay_games([self.initial_state], games=1, config=self.config)[0]
+
+        example = game.examples[0]
+        self.assertTrue(example.metadata["root_noise_applied"])
+        self.assertEqual(0.3, example.metadata["root_dirichlet_alpha"])
+        self.assertEqual(0.25, example.metadata["root_exploration_fraction"])
+        self.assertEqual(0.3, game.replay_trace.metadata["root_dirichlet_alpha"])
+        self.assertEqual(0.25, game.replay_trace.metadata["root_exploration_fraction"])
+
+    def test_selfplay_can_disable_root_noise(self) -> None:
+        config = SelfPlayConfig(
+            simulations=4,
+            max_plies=1,
+            opening_temperature=0.0,
+            final_temperature=0.0,
+            temperature_drop_after_ply=0,
+            seed=17,
+            root_exploration_fraction=0.0,
+        )
+
+        game = generate_selfplay_games([self.initial_state], games=1, config=config)[0]
+
+        self.assertFalse(game.examples[0].metadata["root_noise_applied"])
+        self.assertEqual(0.0, game.examples[0].metadata["root_exploration_fraction"])
+
     def test_selfplay_jsonl_round_trip(self) -> None:
         games = generate_selfplay_games([self.initial_state], games=2, config=self.config)
         examples = flatten_selfplay_examples(games)

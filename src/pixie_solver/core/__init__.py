@@ -1,5 +1,5 @@
 from pixie_solver.core.event import Event, StateDelta
-from pixie_solver.core.hash import stable_digest, stable_state_hash
+from pixie_solver.core.hash import stable_digest, stable_position_hash, stable_state_hash
 from pixie_solver.core.move import Move, stable_move_id
 from pixie_solver.core.piece import (
     BasePieceType,
@@ -35,6 +35,7 @@ __all__ = [
     "StateField",
     "sample_standard_initial_state",
     "stable_digest",
+    "stable_position_hash",
     "standard_initial_state",
     "standard_piece_classes",
     "stable_move_id",
