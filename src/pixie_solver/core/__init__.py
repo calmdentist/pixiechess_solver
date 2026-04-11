@@ -13,6 +13,11 @@ from pixie_solver.core.piece import (
     StateField,
 )
 from pixie_solver.core.state import GameState
+from pixie_solver.core.setup import (
+    sample_standard_initial_state,
+    standard_initial_state,
+    standard_piece_classes,
+)
 
 __all__ = [
     "BasePieceType",
@@ -28,7 +33,10 @@ __all__ = [
     "PieceInstance",
     "StateDelta",
     "StateField",
+    "sample_standard_initial_state",
     "stable_digest",
+    "standard_initial_state",
+    "standard_piece_classes",
     "stable_move_id",
     "stable_state_hash",
 ]

@@ -86,12 +86,20 @@ def run_mcts(
 
     evaluator_impl = HeuristicEvaluator() if evaluator is None else evaluator
     root = SearchNode.from_state(state)
+    diagnostics = {
+        "expanded_nodes": 0,
+        "terminal_expansions": 0,
+        "heuristic_evaluations": 0,
+        "model_inference_calls": 0,
+        "applied_moves": 0,
+    }
     for _ in range(simulations):
         _simulate(
             node=root,
             policy_value_model=policy_value_model,
             evaluator=evaluator_impl,
             c_puct=c_puct,
+            diagnostics=diagnostics,
         )
 
     visit_counts = {
@@ -127,6 +135,7 @@ def run_mcts(
             "evaluator": type(evaluator_impl).__name__,
             "used_model": policy_value_model is not None,
             "c_puct": c_puct,
+            **diagnostics,
         },
     )
 
@@ -137,6 +146,7 @@ def _simulate(
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator,
     c_puct: float,
+    diagnostics: dict[str, int],
 ) -> float:
     if node.is_terminal:
         value = 0.0 if node.terminal_value is None else node.terminal_value
@@ -149,6 +159,7 @@ def _simulate(
             node=node,
             policy_value_model=policy_value_model,
             evaluator=evaluator,
+            diagnostics=diagnostics,
         )
         node.visit_count += 1
         node.value_sum += value
@@ -156,6 +167,7 @@ def _simulate(
 
     edge = _select_child(node=node, c_puct=c_puct)
     if edge is None:
+        diagnostics["heuristic_evaluations"] += 1
         value = evaluator.evaluate(node.state)
         node.visit_count += 1
         node.value_sum += value
@@ -163,6 +175,7 @@ def _simulate(
 
     child = edge.child
     if child is None:
+        diagnostics["applied_moves"] += 1
         child_state, delta = apply_move(node.state, edge.move)
         child = SearchNode.from_state(child_state)
         edge.child = child
@@ -174,6 +187,7 @@ def _simulate(
         policy_value_model=policy_value_model,
         evaluator=evaluator,
         c_puct=c_puct,
+        diagnostics=diagnostics,
     )
     value = -child_value
     edge.visit_count += 1
@@ -188,9 +202,12 @@ def _expand_node(
     node: SearchNode,
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator,
+    diagnostics: dict[str, int],
 ) -> float:
+    diagnostics["expanded_nodes"] += 1
     terminal = result(node.state)
     if terminal is not None:
+        diagnostics["terminal_expansions"] += 1
         node.is_terminal = True
         node.terminal_value = _outcome_value(terminal, node.to_play)
         node.is_expanded = True
@@ -209,6 +226,7 @@ def _expand_node(
 
     policy_logits: dict[str, float] = {}
     if policy_value_model is not None:
+        diagnostics["model_inference_calls"] += 1
         model_output = policy_value_model.infer(node.state, moves)
         policy_logits = {
             str(move_id): float(logit)
@@ -217,6 +235,7 @@ def _expand_node(
         }
         value = _clamp_value(model_output.value)
     else:
+        diagnostics["heuristic_evaluations"] += 1
         value = _clamp_value(evaluator.evaluate(node.state))
     node.policy_logits = dict(sorted(policy_logits.items()))
 
