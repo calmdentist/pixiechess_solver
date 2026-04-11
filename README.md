@@ -24,6 +24,7 @@ The current foundation covers:
 - checkpoint save/load for model + optimizer state,
 - real `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` CLI commands,
 - a local browser viewer for live self-play/training games and completed replay files,
+- a read-only training-run analyzer for monitoring train-loop artifacts,
 - a CLI boundary for compile and verification flows,
 - live Anthropic/OpenAI LLM providers for English-to-DSL compile and mismatch repair,
 - synthetic piece curriculum runs that can compile, repair, verify, and admit DSL programs,
@@ -50,6 +51,7 @@ PYTHONPATH=src python3 -m pixie_solver train --examples data/selfplay/examples.j
 PYTHONPATH=src python3 -m pixie_solver eval-model --checkpoint checkpoints/model.pt --examples data/selfplay/examples.jsonl --device mps
 PYTHONPATH=src python3 -m pixie_solver train-loop --output-dir runs/local_smoke --cycles 2 --train-games 20 --val-games 6 --device mps
 PYTHONPATH=src python3 -m pixie_solver view-replay --games runs/local_smoke/selfplay/cycle_001_train_games.jsonl --viewer-open-browser
+python3 scripts/analyze_training_run.py runs/local_smoke
 ```
 
 `pixie train-loop` is the ergonomic local learning check: each cycle generates fresh self-play,
@@ -100,16 +102,47 @@ PYTHONPATH=src python3 -m pixie_solver compile-piece \
   --pretty
 ```
 
-## Current Milestone
+## Handoff Snapshot
 
 This repo is in early M5:
 
-- repository skeleton and core interfaces are in place,
-- DSL compilation works for hand-authored starter pieces,
-- the simulator covers orthodox movement plus the minimal v1 magical modifiers/effects,
-- deterministic replay is available for move/event verification,
-- search-only MCTS and deterministic self-play are available,
-- the policy/value model and minimal training loop are now implemented,
-- model-guided bootstrap/evaluation utilities are now implemented,
-- checkpointing and training/self-play CLI workflows are now implemented,
-- tactical regression harness and broader match evaluation are still ahead.
+- The DSL/simulator foundation is in place: hand-authored magical pieces compile through
+  the minimal DSL, orthodox movement and v1 magical modifiers/effects execute
+  deterministically, replay traces are available, threefold/fifty-move draws are handled,
+  and randomized standard openings can include hand-authored special pieces.
+- The search/training foundation is in place: MCTS can run search-only or model-guided,
+  self-play uses root Dirichlet noise, max-ply games use cutoff adjudication for value
+  targets, and the small PyTorch policy/value model can train on CPU, MPS, or CUDA.
+- The operational loop is in place: `pixie selfplay`, `pixie train`, `pixie eval-model`,
+  and `pixie train-loop` generate artifacts, checkpoints, metrics, and progress logs;
+  `scripts/analyze_training_run.py` summarizes run health without touching an active process.
+- The LLM/rules pipeline is in place: Anthropic/OpenAI providers can compile English
+  descriptions into DSL candidates, mismatch repair can patch programs, and the synthetic
+  piece curriculum can admit verified programs into a registry.
+- The current model has only been validated as a learning smoke test. Policy loss/top-1
+  metrics show it can imitate MCTS targets, and cutoff adjudication gives nonzero value
+  targets, but there is not yet evidence that newer checkpoints beat older checkpoints.
+
+## Next High-Leverage Improvements
+
+1. Add a checkpoint arena and promotion gate. Run latest-vs-previous checkpoint matches
+   from fixed seeds, report win/draw/loss rates with confidence intervals, and only
+   promote checkpoints that beat the current best. This is the most important missing
+   proof that training improves play rather than only fitting generated targets.
+2. Add a persistent replay buffer. Train on a rolling mix of old self-play, fresh
+   self-play, validation holdouts, and eventually curriculum-generated positions instead
+   of one cycle's examples at a time. Keep a fixed validation slice so cycle-to-cycle
+   metrics are comparable.
+3. Improve self-play throughput. The current loop is correct but slow because model-guided
+   MCTS performs many small inference calls. Profile CPU/MPS behavior, batch model
+   inference where possible, and add parallel self-play workers before scaling games.
+4. Tighten self-play quality controls. Keep tuning root noise, temperatures, adjudication
+   thresholds, repetition/draw handling, and opening randomization so games stay diverse
+   and produce useful value targets.
+5. Expand rules/curriculum coverage. Add more synthetic teacher recipes, golden repair
+   fixtures, registry version metadata, and adversarial DSL cases that stress hooks,
+   counters, pushes, phasing, and delayed effects.
+6. Scale the model only after the arena exists. The current architecture is the right
+   shape for PixieChess because legality stays in the simulator and the net scores legal
+   candidates from board + DSL features, but bigger networks are not worth it until the
+   evaluation loop can prove strength gains.
