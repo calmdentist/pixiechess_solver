@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 import time
 from collections.abc import Callable
@@ -31,7 +32,15 @@ from pixie_solver.dsl.canonicalize import canonicalize_piece_program
 from pixie_solver.dsl.compiler import compile_piece_file
 from pixie_solver.dsl.parser import load_piece_program
 from pixie_solver.dsl.validator import PieceValidationError, validate_piece_program
-from pixie_solver.eval import ModelEvalProgress, evaluate_policy_value_model
+from pixie_solver.eval import (
+    ArenaConfig,
+    ArenaProgress,
+    decide_promotion,
+    run_checkpoint_arena_from_paths,
+    ModelEvalProgress,
+    evaluate_policy_value_model,
+    write_arena_games_jsonl,
+)
 from pixie_solver.llm import FrontierLLMClient, FrontierLLMPieceProgramProvider, LLMConfig
 from pixie_solver.model import PolicyValueConfig
 from pixie_solver.rules import (
@@ -320,6 +329,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_model_parser.set_defaults(handler=_handle_eval_model)
 
+    arena_parser = subparsers.add_parser(
+        "arena",
+        help="Evaluate a candidate checkpoint against a baseline checkpoint.",
+    )
+    arena_parser.add_argument("--candidate", type=Path, required=True, help="Candidate checkpoint to evaluate.")
+    arena_parser.add_argument("--baseline", type=Path, required=True, help="Baseline/champion checkpoint to compare against.")
+    arena_parser.add_argument("--output", type=Path, help="Optional JSON output path for the arena summary.")
+    arena_parser.add_argument("--games-out", type=Path, help="Optional JSONL output path for per-game arena records.")
+    arena_parser.add_argument("--state-file", type=Path, action="append", help="Optional JSON GameState seed file. Defaults to sampled standard openings.")
+    arena_parser.add_argument("--games", type=int, default=2, help="Arena games to play.")
+    arena_parser.add_argument("--simulations", type=int, default=16, help="MCTS simulations per arena move.")
+    arena_parser.add_argument("--max-plies", type=int, default=80, help="Maximum plies per arena game.")
+    arena_parser.add_argument("--c-puct", type=float, default=1.5, help="PUCT exploration constant.")
+    arena_parser.add_argument("--seed", type=int, default=0, help="Deterministic arena seed.")
+    arena_parser.add_argument("--device", help="Device to load checkpoints onto, e.g. cpu, mps, cuda.")
+    arena_parser.add_argument("--promotion-threshold", type=float, default=0.55, help="Candidate score-rate threshold used for the reported promotion decision.")
+    arena_parser.add_argument("--randomize-handauthored-specials", action="store_true", default=False, help="Randomize hand-authored special pieces in default standard openings.")
+    arena_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard openings when --state-file is omitted.")
+    arena_parser.add_argument("--special-piece-dir", type=Path, default=Path("data/pieces/handauthored"), help="Directory of hand-authored piece JSON/YAML files.")
+    arena_parser.add_argument("--special-piece-inclusion-probability", type=float, default=0.5, help="Special-piece inclusion probability for sampled arena openings.")
+    arena_parser.add_argument("--adjudicate-max-plies", dest="adjudicate_max_plies", action="store_true", default=True, help="Use deterministic cutoff adjudication when arena games reach --max-plies.")
+    arena_parser.add_argument("--no-adjudicate-max-plies", dest="adjudicate_max_plies", action="store_false", help="Treat non-terminal max-ply arena games as draws.")
+    arena_parser.add_argument("--adjudication-threshold", type=float, default=0.2, help="White-perspective heuristic cutoff threshold in [0, 1].")
+    arena_parser.add_argument("--log-every-games", type=int, default=1, help="Emit an arena progress line every N completed games.")
+    arena_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
+    arena_parser.set_defaults(handler=_handle_arena)
+
     train_loop_parser = subparsers.add_parser(
         "train-loop",
         help="Run self-play, training, and train/validation evaluation for multiple cycles.",
@@ -353,6 +389,13 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout for a fresh run.")
     train_loop_parser.add_argument("--feedforward-multiplier", type=int, default=2, help="Feedforward hidden-size multiplier for a fresh run.")
     train_loop_parser.add_argument("--resume-checkpoint", type=Path, help="Optional checkpoint to resume the loop from.")
+    train_loop_parser.add_argument("--promotion-gate", action="store_true", help="Run checkpoint arena after each cycle and keep a best/champion checkpoint.")
+    train_loop_parser.add_argument("--best-checkpoint", type=Path, help="Optional existing champion checkpoint for --promotion-gate.")
+    train_loop_parser.add_argument("--best-checkpoint-out", type=Path, help="Output path for the promoted champion checkpoint. Defaults to output-dir/checkpoints/best.pt.")
+    train_loop_parser.add_argument("--arena-games", type=int, default=2, help="Promotion-gate arena games per cycle.")
+    train_loop_parser.add_argument("--arena-simulations", type=int, default=8, help="Promotion-gate MCTS simulations per move.")
+    train_loop_parser.add_argument("--arena-max-plies", type=int, default=80, help="Promotion-gate maximum plies per game.")
+    train_loop_parser.add_argument("--promotion-score-threshold", type=float, default=0.55, help="Candidate arena score-rate threshold for promotion.")
     train_loop_parser.add_argument("--no-guided-selfplay", action="store_true", help="Always generate self-play with search-only MCTS instead of the latest model.")
     train_loop_parser.add_argument("--randomize-handauthored-specials", action="store_true", default=True, help="Randomize hand-authored special pieces in standard openings.")
     train_loop_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard openings.")
@@ -933,6 +976,52 @@ def _handle_eval_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_arena(args: argparse.Namespace) -> int:
+    initial_states = _load_arena_initial_states(args)
+    config = ArenaConfig(
+        games=args.games,
+        simulations=args.simulations,
+        max_plies=args.max_plies,
+        c_puct=args.c_puct,
+        seed=args.seed,
+        alternate_colors=True,
+        adjudicate_max_plies=args.adjudicate_max_plies,
+        adjudication_threshold=args.adjudication_threshold,
+    )
+    summary = run_checkpoint_arena_from_paths(
+        candidate_checkpoint=args.candidate,
+        baseline_checkpoint=args.baseline,
+        initial_states=initial_states,
+        config=config,
+        device=args.device,
+        progress_callback=(
+            None
+            if args.quiet
+            else _build_arena_progress_logger(log_every_games=args.log_every_games)
+        ),
+    )
+    decision = decide_promotion(
+        candidate_checkpoint=args.candidate,
+        champion_checkpoint=args.baseline,
+        threshold=args.promotion_threshold,
+        arena_summary=summary,
+    )
+    payload = {
+        "status": "ok",
+        "candidate": str(args.candidate),
+        "baseline": str(args.baseline),
+        "promotion_decision": decision.to_dict(),
+        "arena_summary": summary.to_dict(),
+    }
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(canonical_json(payload, indent=2), encoding="utf-8")
+    if args.games_out is not None:
+        write_arena_games_jsonl(args.games_out, summary.games)
+    print(canonical_json(payload, indent=2))
+    return 0
+
+
 def _handle_train_loop(args: argparse.Namespace) -> int:
     if args.cycles < 1:
         raise ValueError("--cycles must be at least 1")
@@ -942,13 +1031,27 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         raise ValueError("--val-games must be at least 1")
     if args.use_verified_pieces and not args.randomize_handauthored_specials:
         raise ValueError("--use-verified-pieces requires randomized special-piece openings")
+    if args.best_checkpoint is not None and not args.promotion_gate:
+        raise ValueError("--best-checkpoint requires --promotion-gate")
+    if args.best_checkpoint_out is not None and not args.promotion_gate:
+        raise ValueError("--best-checkpoint-out requires --promotion-gate")
+    if args.promotion_gate:
+        if args.arena_games < 1:
+            raise ValueError("--arena-games must be at least 1")
+        if args.arena_simulations < 1:
+            raise ValueError("--arena-simulations must be at least 1")
+        if args.promotion_score_threshold < 0.0 or args.promotion_score_threshold > 1.0:
+            raise ValueError("--promotion-score-threshold must be in [0, 1]")
 
     data_dir = args.output_dir / "selfplay"
     checkpoint_dir = args.output_dir / "checkpoints"
     metrics_dir = args.output_dir / "metrics"
+    arena_dir = args.output_dir / "arena"
     data_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    if args.promotion_gate:
+        arena_dir.mkdir(parents=True, exist_ok=True)
 
     verified_records = (
         _load_verified_registry_records(args.piece_registry)
@@ -985,6 +1088,31 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         optimizer_state_dict = checkpoint.optimizer_state_dict
         model_config = checkpoint.model_config
         previous_checkpoint_path = args.resume_checkpoint
+    best_checkpoint_out = (
+        args.best_checkpoint_out
+        if args.best_checkpoint_out is not None
+        else checkpoint_dir / "best.pt"
+    )
+    champion_checkpoint_path: Path | None = None
+    if args.promotion_gate:
+        initial_champion_path = None
+        if args.best_checkpoint is not None:
+            initial_champion_path = args.best_checkpoint
+        elif best_checkpoint_out.exists():
+            initial_champion_path = best_checkpoint_out
+        elif args.resume_checkpoint is not None:
+            initial_champion_path = args.resume_checkpoint
+        if initial_champion_path is not None:
+            _copy_checkpoint_if_needed(initial_champion_path, best_checkpoint_out)
+            champion_checkpoint_path = best_checkpoint_out
+            champion_checkpoint = load_training_checkpoint(
+                champion_checkpoint_path,
+                device=args.device,
+            )
+            model = champion_checkpoint.model
+            optimizer_state_dict = champion_checkpoint.optimizer_state_dict
+            model_config = champion_checkpoint.model_config
+            previous_checkpoint_path = champion_checkpoint_path
 
     viewer = _start_live_viewer(args, enabled=args.viewer)
     cycle_summaries: list[dict[str, object]] = []
@@ -1097,7 +1225,6 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 ),
             },
         )
-        previous_checkpoint_path = checkpoint_path
 
         val_config = SelfPlayConfig(
             simulations=args.simulations,
@@ -1187,9 +1314,118 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 ),
             ),
         )
+        arena_summary = None
+        promotion_decision = None
+        arena_summary_path = None
+        arena_games_path = None
+        candidate_checkpoint_path = checkpoint_path
+        active_checkpoint_path = checkpoint_path
+        if args.promotion_gate:
+            if champion_checkpoint_path is None:
+                _copy_checkpoint_if_needed(candidate_checkpoint_path, best_checkpoint_out)
+                champion_checkpoint_path = best_checkpoint_out
+                active_checkpoint_path = champion_checkpoint_path
+                promotion_decision = decide_promotion(
+                    candidate_checkpoint=candidate_checkpoint_path,
+                    champion_checkpoint=None,
+                    threshold=args.promotion_score_threshold,
+                )
+            else:
+                arena_seed = args.seed + cycle_index * 1000 + 555
+                arena_config = ArenaConfig(
+                    games=args.arena_games,
+                    simulations=args.arena_simulations,
+                    max_plies=args.arena_max_plies,
+                    c_puct=args.c_puct,
+                    seed=arena_seed,
+                    alternate_colors=True,
+                    adjudicate_max_plies=args.adjudicate_max_plies,
+                    adjudication_threshold=args.adjudication_threshold,
+                )
+                arena_states = _sample_loop_initial_states(
+                    games=args.arena_games,
+                    seed=arena_seed,
+                    randomize_specials=args.randomize_handauthored_specials,
+                    special_piece_classes=special_piece_classes,
+                    inclusion_probability=args.special_piece_inclusion_probability,
+                )
+                arena_summary = run_checkpoint_arena_from_paths(
+                    candidate_checkpoint=candidate_checkpoint_path,
+                    baseline_checkpoint=champion_checkpoint_path,
+                    initial_states=arena_states,
+                    config=arena_config,
+                    device=args.device,
+                    progress_callback=(
+                        None
+                        if args.quiet
+                        else _build_arena_progress_logger(log_every_games=1)
+                    ),
+                )
+                arena_summary_path = arena_dir / f"cycle_{cycle_index:03d}_summary.json"
+                arena_games_path = arena_dir / f"cycle_{cycle_index:03d}_games.jsonl"
+                arena_summary_path.write_text(
+                    canonical_json(arena_summary.to_dict(), indent=2),
+                    encoding="utf-8",
+                )
+                write_arena_games_jsonl(arena_games_path, arena_summary.games)
+                promotion_decision = decide_promotion(
+                    candidate_checkpoint=candidate_checkpoint_path,
+                    champion_checkpoint=champion_checkpoint_path,
+                    threshold=args.promotion_score_threshold,
+                    arena_summary=arena_summary,
+                )
+                if promotion_decision.promoted:
+                    _copy_checkpoint_if_needed(candidate_checkpoint_path, best_checkpoint_out)
+                    champion_checkpoint_path = best_checkpoint_out
+                    active_checkpoint_path = champion_checkpoint_path
+                else:
+                    active_checkpoint_path = champion_checkpoint_path
+                    champion_checkpoint = load_training_checkpoint(
+                        champion_checkpoint_path,
+                        device=args.device,
+                    )
+                    model = champion_checkpoint.model
+                    optimizer_state_dict = champion_checkpoint.optimizer_state_dict
+                    model_config = champion_checkpoint.model_config
+            previous_checkpoint_path = active_checkpoint_path
+            if not args.quiet and promotion_decision is not None:
+                _stderr_print(
+                    "cycle "
+                    f"{cycle_index} promotion: "
+                    f"promoted={promotion_decision.promoted} "
+                    f"reason={promotion_decision.reason} "
+                    f"best={promotion_decision.selected_checkpoint}"
+                )
+        else:
+            previous_checkpoint_path = checkpoint_path
         cycle_summary = {
             "cycle": cycle_index,
             "checkpoint": str(checkpoint_path),
+            "candidate_checkpoint": str(candidate_checkpoint_path),
+            "champion_checkpoint": (
+                str(champion_checkpoint_path)
+                if champion_checkpoint_path is not None
+                else None
+            ),
+            "best_checkpoint": (
+                str(champion_checkpoint_path)
+                if args.promotion_gate and champion_checkpoint_path is not None
+                else str(checkpoint_path)
+            ),
+            "promotion_decision": (
+                promotion_decision.to_dict()
+                if promotion_decision is not None
+                else None
+            ),
+            "arena_summary_path": (
+                str(arena_summary_path) if arena_summary_path is not None else None
+            ),
+            "arena_games_path": (
+                str(arena_games_path) if arena_games_path is not None else None
+            ),
+            "arena_metrics": (
+                arena_summary.to_dict() if arena_summary is not None else None
+            ),
             "train_games": len(train_games),
             "train_examples": len(train_examples),
             "train_games_path": str(train_games_path),
@@ -1229,6 +1465,8 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         "output_dir": str(args.output_dir),
         "cycles": cycle_summaries,
         "latest_checkpoint": cycle_summaries[-1]["checkpoint"],
+        "latest_candidate_checkpoint": cycle_summaries[-1]["candidate_checkpoint"],
+        "best_checkpoint": cycle_summaries[-1]["best_checkpoint"],
         "viewer_url": viewer.url if viewer is not None else None,
     }
     (args.output_dir / "summary.json").write_text(
@@ -1260,6 +1498,25 @@ def _load_state_files(paths: list[Path]) -> list[GameState]:
         else:
             raise ValueError(f"State file {path!s} must contain an object or list of objects")
     return states
+
+
+def _load_arena_initial_states(args: argparse.Namespace) -> list[GameState]:
+    if args.state_file:
+        if args.randomize_handauthored_specials:
+            raise ValueError("--randomize-handauthored-specials cannot be used with --state-file")
+        return _load_state_files(args.state_file)
+    special_piece_classes = (
+        _load_piece_classes_from_directory(args.special_piece_dir)
+        if args.randomize_handauthored_specials
+        else ()
+    )
+    return _sample_loop_initial_states(
+        games=args.games,
+        seed=args.seed,
+        randomize_specials=args.randomize_handauthored_specials,
+        special_piece_classes=special_piece_classes,
+        inclusion_probability=args.special_piece_inclusion_probability,
+    )
 
 
 def _load_json_object(path: Path) -> dict[str, object]:
@@ -1398,6 +1655,15 @@ def _outcome_counts(games: list[object]) -> dict[str, int]:
         outcome = str(game.outcome)
         counts[outcome] = counts.get(outcome, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _copy_checkpoint_if_needed(source: Path, destination: Path) -> None:
+    source_path = Path(source)
+    destination_path = Path(destination)
+    if source_path.resolve() == destination_path.resolve():
+        return
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, destination_path)
 
 
 def _validate_resume_flags(args: argparse.Namespace) -> None:
@@ -1650,6 +1916,32 @@ def _build_model_eval_progress_logger(
             _stderr_print(
                 f"[{elapsed:7.1f}s] eval-model completed examples={progress.examples_total}"
             )
+
+    return callback
+
+
+def _build_arena_progress_logger(
+    *,
+    log_every_games: int,
+):
+    start_time = time.monotonic()
+
+    def callback(progress: ArenaProgress) -> None:
+        elapsed = time.monotonic() - start_time
+        if progress.event == "game_started":
+            _stderr_print(
+                f"[{elapsed:7.1f}s] arena game {progress.game_index + 1}/{progress.games_total} started"
+                f" candidate_color={progress.candidate_color}"
+            )
+            return
+        if progress.event == "game_completed":
+            if log_every_games > 0 and (progress.game_index + 1) % log_every_games == 0:
+                _stderr_print(
+                    f"[{elapsed:7.1f}s] arena game {progress.game_index + 1}/{progress.games_total} completed"
+                    f" outcome={progress.outcome}"
+                    f" candidate_score={progress.candidate_score}"
+                    f" reason={progress.termination_reason}"
+                )
 
     return callback
 

@@ -22,9 +22,10 @@ The current foundation covers:
 - deterministic search comparison utilities for search-only vs model-guided runs,
 - AlphaZero-style Dirichlet root noise for self-play exploration,
 - checkpoint save/load for model + optimizer state,
+- checkpoint arena evaluation and optional train-loop promotion gates,
 - real `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` CLI commands,
 - a local browser viewer for live self-play/training games and completed replay files,
-- a read-only training-run analyzer for monitoring train-loop artifacts,
+- a read-only training-run analyzer for monitoring train-loop artifacts and arena gates,
 - a CLI boundary for compile and verification flows,
 - live Anthropic/OpenAI LLM providers for English-to-DSL compile and mismatch repair,
 - synthetic piece curriculum runs that can compile, repair, verify, and admit DSL programs,
@@ -50,6 +51,7 @@ PYTHONPATH=src python3 -m pixie_solver selfplay --standard-initial-state --rando
 PYTHONPATH=src python3 -m pixie_solver train --examples data/selfplay/examples.jsonl --checkpoint-out checkpoints/model.pt --device mps
 PYTHONPATH=src python3 -m pixie_solver eval-model --checkpoint checkpoints/model.pt --examples data/selfplay/examples.jsonl --device mps
 PYTHONPATH=src python3 -m pixie_solver train-loop --output-dir runs/local_smoke --cycles 2 --train-games 20 --val-games 6 --device mps
+PYTHONPATH=src python3 -m pixie_solver arena --candidate runs/local_smoke/checkpoints/model_002.pt --baseline runs/local_smoke/checkpoints/model_001.pt --games 20 --simulations 16 --device mps --output runs/local_smoke/arena/model_002_vs_001.json
 PYTHONPATH=src python3 -m pixie_solver view-replay --games runs/local_smoke/selfplay/cycle_001_train_games.jsonl --viewer-open-browser
 python3 scripts/analyze_training_run.py runs/local_smoke
 ```
@@ -68,6 +70,14 @@ checkpoints do not collapse into a narrow opening sample. Set
 
 `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` emit progress logs to `stderr` during long runs.
 Use `--quiet` if you only want the final JSON summary on `stdout`.
+
+Use `pixie arena` when you need strength evidence instead of loss-only evidence. It plays
+a candidate checkpoint against a baseline checkpoint with deterministic model-guided MCTS,
+alternates colors by default, disables root noise, and reports candidate win/draw/loss,
+score rate, confidence interval, termination reasons, and a promotion decision. Add
+`--promotion-gate` to `pixie train-loop` to maintain `checkpoints/best.pt`; after each
+cycle the latest candidate plays the current champion and only replaces it when
+`--promotion-score-threshold` is met.
 
 Add `--viewer` to `pixie selfplay` or `pixie train-loop` to start a local browser board at
 `127.0.0.1` and stream games as they are generated. The viewer renders magical pieces as their
@@ -114,21 +124,21 @@ This repo is in early M5:
   self-play uses root Dirichlet noise, max-ply games use cutoff adjudication for value
   targets, and the small PyTorch policy/value model can train on CPU, MPS, or CUDA.
 - The operational loop is in place: `pixie selfplay`, `pixie train`, `pixie eval-model`,
-  and `pixie train-loop` generate artifacts, checkpoints, metrics, and progress logs;
-  `scripts/analyze_training_run.py` summarizes run health without touching an active process.
+  `pixie arena`, and `pixie train-loop` generate artifacts, checkpoints, metrics, and
+  progress logs; `scripts/analyze_training_run.py` summarizes run health and arena gates
+  without touching an active process.
 - The LLM/rules pipeline is in place: Anthropic/OpenAI providers can compile English
   descriptions into DSL candidates, mismatch repair can patch programs, and the synthetic
   piece curriculum can admit verified programs into a registry.
 - The current model has only been validated as a learning smoke test. Policy loss/top-1
-  metrics show it can imitate MCTS targets, and cutoff adjudication gives nonzero value
-  targets, but there is not yet evidence that newer checkpoints beat older checkpoints.
+  metrics show it can imitate MCTS targets, cutoff adjudication gives nonzero value
+  targets, and `pixie arena` can now test whether newer checkpoints beat older checkpoints.
 
 ## Next High-Leverage Improvements
 
-1. Add a checkpoint arena and promotion gate. Run latest-vs-previous checkpoint matches
-   from fixed seeds, report win/draw/loss rates with confidence intervals, and only
-   promote checkpoints that beat the current best. This is the most important missing
-   proof that training improves play rather than only fitting generated targets.
+1. Run and calibrate arena-gated training. Use fixed arena seeds to compare latest vs.
+   best checkpoints, tune `--promotion-score-threshold`, and confirm that accepted
+   checkpoints improve in held-out matches rather than just fitting generated targets.
 2. Add a persistent replay buffer. Train on a rolling mix of old self-play, fresh
    self-play, validation holdouts, and eventually curriculum-generated positions instead
    of one cycle's examples at a time. Keep a fixed validation slice so cycle-to-cycle
