@@ -56,6 +56,8 @@ def print_snapshot(output_dir: Path, *, top_moves: int) -> None:
 
     _print_cycle_metrics(output_dir)
     print()
+    _print_promotion_gate(output_dir)
+    print()
     _print_selfplay_summary(output_dir, split="train", top_moves=top_moves)
     print()
     _print_selfplay_summary(output_dir, split="val", top_moves=top_moves)
@@ -94,6 +96,62 @@ def _print_cycle_metrics(output_dir: Path) -> None:
             f"{_fmt(val.get('top1_agreement')):>8}  "
             f"{_fmt(train.get('value_mse')):>11}  "
             f"{_fmt(val.get('value_mse')):>9}"
+        )
+
+
+def _print_promotion_gate(output_dir: Path) -> None:
+    metric_paths = sorted((output_dir / "metrics").glob("cycle_*.json"))
+    print("Promotion Gate")
+    if not metric_paths:
+        print("  No metrics files found yet.")
+        return
+
+    rows: list[JsonObject] = []
+    for path in metric_paths:
+        payload = _read_json_object(path)
+        if payload is None:
+            continue
+        decision = payload.get("promotion_decision")
+        if isinstance(decision, dict):
+            rows.append(payload)
+
+    if not rows:
+        print("  No promotion-gate metrics found. Run train-loop with --promotion-gate.")
+        return
+
+    print("  cycle  promoted  score   threshold  games  reason")
+    for payload in rows:
+        decision = dict(payload.get("promotion_decision") or {})
+        arena = dict(payload.get("arena_metrics") or {})
+        print(
+            "  "
+            f"{int(payload.get('cycle', 0)):>5}  "
+            f"{str(bool(decision.get('promoted'))):>8}  "
+            f"{_fmt(decision.get('candidate_score_rate')):>6}  "
+            f"{_fmt(decision.get('threshold')):>9}  "
+            f"{str(arena.get('games_played', '-')):>5}  "
+            f"{str(decision.get('reason', '-'))}"
+        )
+
+    latest = rows[-1]
+    latest_arena = dict(latest.get("arena_metrics") or {})
+    latest_best = latest.get("best_checkpoint")
+    if latest_best is not None:
+        print(f"  current_best={latest_best}")
+    if latest_arena:
+        ci = dict(latest_arena.get("candidate_score_rate_ci95") or {})
+        print(
+            "  latest_arena: "
+            f"score={_fmt(latest_arena.get('candidate_score_rate'))} "
+            f"ci95=[{_fmt(ci.get('lower'))}, {_fmt(ci.get('upper'))}] "
+            f"w/d/l={latest_arena.get('candidate_wins', 0)}/"
+            f"{latest_arena.get('draws', 0)}/"
+            f"{latest_arena.get('candidate_losses', 0)} "
+            f"reasons={latest_arena.get('termination_reasons', {})}"
+        )
+    else:
+        print(
+            "  latest_arena: initial champion selected; arena comparison starts on the next cycle."
         )
 
 
@@ -185,6 +243,18 @@ def _print_readiness_notes(output_dir: Path) -> None:
                 "  Move agreement signal: "
                 f"train_top1={train_top1:.3f}, val_top1={val_top1:.3f}; higher is better."
             )
+        decision = latest_metrics.get("promotion_decision")
+        if isinstance(decision, dict):
+            score_rate = _as_float(decision.get("candidate_score_rate"))
+            threshold = _as_float(decision.get("threshold"))
+            if score_rate is not None and threshold is not None:
+                print(
+                    "  Arena signal: "
+                    f"candidate_score_rate={score_rate:.4f} vs threshold={threshold:.4f}; "
+                    f"promoted={bool(decision.get('promoted'))}."
+                )
+            else:
+                print("  Arena signal: initial champion selected; compare from the next cycle.")
 
     if latest_train_examples is not None:
         examples = _read_jsonl_objects(latest_train_examples)

@@ -30,8 +30,10 @@ from pixie_solver.training import (
     SelfPlayConfig,
     generate_selfplay_games,
     load_training_checkpoint,
+    save_training_checkpoint,
     write_selfplay_examples_jsonl,
 )
+from pixie_solver.model import PolicyValueConfig, PolicyValueModel
 from pixie_solver.utils import canonical_json
 
 cli_main = importlib.import_module("pixie_solver.cli.main")
@@ -499,6 +501,61 @@ class CLITest(unittest.TestCase):
             self.assertLessEqual(payload["metrics"]["top1_agreement"], 1.0)
             self.assertGreaterEqual(payload["metrics"]["value_mse"], 0.0)
 
+    def test_arena_command_compares_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            candidate_path = temp_path / "candidate.pt"
+            baseline_path = temp_path / "baseline.pt"
+            output_path = temp_path / "arena.json"
+            games_path = temp_path / "arena_games.jsonl"
+            model_config = PolicyValueConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            )
+            save_training_checkpoint(
+                candidate_path,
+                model=PolicyValueModel(model_config, device="cpu"),
+            )
+            save_training_checkpoint(
+                baseline_path,
+                model=PolicyValueModel(model_config, device="cpu"),
+            )
+
+            result = self._run(
+                "arena",
+                "--candidate",
+                str(candidate_path),
+                "--baseline",
+                str(baseline_path),
+                "--output",
+                str(output_path),
+                "--games-out",
+                str(games_path),
+                "--games",
+                "2",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--device",
+                "cpu",
+                "--no-randomize-handauthored-specials",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual(2, payload["arena_summary"]["games_played"])
+            self.assertIn("candidate_score_rate", payload["arena_summary"])
+            self.assertIn("promotion_decision", payload)
+            self.assertTrue(output_path.exists())
+            self.assertTrue(games_path.exists())
+            self.assertEqual(2, len(games_path.read_text(encoding="utf-8").splitlines()))
+
     def test_train_loop_command_runs_one_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "run"
@@ -549,6 +606,93 @@ class CLITest(unittest.TestCase):
             self.assertGreater(cycle["val_examples"], 0)
             self.assertIn("average_policy_cross_entropy", cycle["train_eval_metrics"])
             self.assertIn("average_policy_cross_entropy", cycle["val_eval_metrics"])
+
+    def test_train_loop_promotion_gate_records_best_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "run"
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "2",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "37",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--promotion-gate",
+                "--arena-games",
+                "1",
+                "--arena-simulations",
+                "1",
+                "--arena-max-plies",
+                "1",
+                "--promotion-score-threshold",
+                "1.0",
+                "--no-randomize-handauthored-specials",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual(2, len(payload["cycles"]))
+            self.assertTrue(Path(payload["best_checkpoint"]).exists())
+            self.assertTrue(Path(payload["latest_candidate_checkpoint"]).exists())
+            first_cycle = payload["cycles"][0]
+            second_cycle = payload["cycles"][1]
+            self.assertTrue(first_cycle["promotion_decision"]["promoted"])
+            self.assertEqual(
+                "initial_candidate",
+                first_cycle["promotion_decision"]["reason"],
+            )
+            self.assertIsNotNone(second_cycle["promotion_decision"])
+            self.assertIsNotNone(second_cycle["arena_metrics"])
+            self.assertTrue(Path(second_cycle["arena_summary_path"]).exists())
+            self.assertTrue(Path(second_cycle["arena_games_path"]).exists())
+            metrics_payload = json.loads(
+                (output_dir / "metrics/cycle_002.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                second_cycle["promotion_decision"],
+                metrics_payload["promotion_decision"],
+            )
+            analyzer = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/analyze_training_run.py",
+                    str(output_dir),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, analyzer.returncode, analyzer.stderr)
+            self.assertIn("Promotion Gate", analyzer.stdout)
+            self.assertIn("latest_arena", analyzer.stdout)
 
 def _war_automaton_with_forward_offset(offset: int) -> dict[str, object]:
     program = load_piece_program(ROOT / "data/pieces/handauthored/war_automaton.json")
