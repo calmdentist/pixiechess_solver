@@ -7,6 +7,5 @@ dist/
 *.egg-info/
 checkpoints/
 data/selfplay/
-runs/
 .env
 .env.*
