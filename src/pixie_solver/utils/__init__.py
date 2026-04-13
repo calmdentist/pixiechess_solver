@@ -16,13 +16,16 @@ from pixie_solver.utils.squares import (
     normalize_square,
     square_to_coords,
 )
+from pixie_solver.utils.run_manifest import PIXIE_RULESET_ID, build_run_manifest, write_run_manifest
 
 __all__ = [
     "JsonScalar",
     "JsonValue",
+    "PIXIE_RULESET_ID",
     "ReplayStep",
     "ReplayTrace",
     "build_replay_trace",
+    "build_run_manifest",
     "canonical_json",
     "coords_to_square",
     "is_valid_square",
@@ -32,4 +35,5 @@ __all__ = [
     "square_to_coords",
     "to_primitive",
     "write_jsonl",
+    "write_run_manifest",
 ]

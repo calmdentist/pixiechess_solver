@@ -19,11 +19,19 @@ from pixie_solver.training.selfplay import (
     adjudicate_cutoff,
     flatten_selfplay_examples,
     generate_selfplay_games,
+    generate_selfplay_games_parallel,
+    seed_for_game,
 )
 from pixie_solver.training.pipeline import (
     BootstrapConfig,
     BootstrapRunResult,
     bootstrap_policy_value_model,
+)
+from pixie_solver.training.inference_service import (
+    BatchedInferenceClient,
+    BatchedInferenceConfig,
+    BatchedInferenceService,
+    BatchedInferenceStats,
 )
 from pixie_solver.training.train import (
     TrainingConfig,
@@ -37,6 +45,10 @@ from pixie_solver.training.train import (
 __all__ = [
     "BootstrapConfig",
     "BootstrapRunResult",
+    "BatchedInferenceClient",
+    "BatchedInferenceConfig",
+    "BatchedInferenceService",
+    "BatchedInferenceStats",
     "CutoffAdjudication",
     "LoadedTrainingCheckpoint",
     "SelfPlayConfig",
@@ -53,10 +65,12 @@ __all__ = [
     "collate_selfplay_examples",
     "flatten_selfplay_examples",
     "generate_selfplay_games",
+    "generate_selfplay_games_parallel",
     "load_training_checkpoint",
     "read_selfplay_examples_jsonl",
     "read_selfplay_games_jsonl",
     "save_training_checkpoint",
+    "seed_for_game",
     "train_from_replays",
     "write_selfplay_examples_jsonl",
     "write_selfplay_games_jsonl",

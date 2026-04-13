@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+import time
 
 import torch
 from torch import Tensor, nn
@@ -10,7 +11,7 @@ from pixie_solver.core.move import Move
 from pixie_solver.core.state import GameState
 from pixie_solver.model.board_encoder import BoardEncoder
 from pixie_solver.model.dsl_encoder import DSLFeatureEncoder
-from pixie_solver.model.move_encoder import MoveEncoder
+from pixie_solver.model.move_encoder import MoveEncoder, MoveEncodingMetrics
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,38 @@ class PolicyValueForwardOutput:
 class PolicyValueOutput:
     policy_logits: dict[str, float] = field(default_factory=dict)
     value: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyValueBatchMetrics:
+    requests: int = 0
+    total_legal_moves: int = 0
+    total_ms: float = 0.0
+    board_encode_ms: float = 0.0
+    transformer_ms: float = 0.0
+    move_encode_ms: float = 0.0
+    policy_head_ms: float = 0.0
+    value_head_ms: float = 0.0
+    consequence_total_ms: float = 0.0
+    consequence_apply_move_ms: float = 0.0
+    consequence_terminal_check_ms: float = 0.0
+    consequence_check_eval_ms: float = 0.0
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "requests": self.requests,
+            "total_legal_moves": self.total_legal_moves,
+            "total_ms": self.total_ms,
+            "board_encode_ms": self.board_encode_ms,
+            "transformer_ms": self.transformer_ms,
+            "move_encode_ms": self.move_encode_ms,
+            "policy_head_ms": self.policy_head_ms,
+            "value_head_ms": self.value_head_ms,
+            "consequence_total_ms": self.consequence_total_ms,
+            "consequence_apply_move_ms": self.consequence_apply_move_ms,
+            "consequence_terminal_check_ms": self.consequence_terminal_check_ms,
+            "consequence_check_eval_ms": self.consequence_check_eval_ms,
+        }
 
 
 class PolicyValueModel(nn.Module):
@@ -73,6 +106,7 @@ class PolicyValueModel(nn.Module):
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=self.config.num_layers,
+            enable_nested_tensor=False,
         )
         self.policy_head = nn.Sequential(
             nn.LayerNorm(self.config.d_model),
@@ -97,36 +131,157 @@ class PolicyValueModel(nn.Module):
         state: GameState,
         legal_moves: Sequence[Move],
     ) -> PolicyValueForwardOutput:
-        board_encoding = self.board_encoder.encode_state(state)
-        tokens = torch.cat(
-            (
-                board_encoding.global_token.unsqueeze(0),
-                board_encoding.piece_tokens,
-            ),
-            dim=0,
-        ).unsqueeze(0)
-        contextual_tokens = self.transformer(tokens).squeeze(0)
-        global_context = contextual_tokens[0]
-        piece_context_by_id = {
-            piece_id: contextual_tokens[index + 1]
-            for index, piece_id in enumerate(board_encoding.piece_ids)
-        }
+        return self.forward_batch(((state, legal_moves),))[0]
 
-        encoded_moves = self.move_encoder.encode_moves(
-            state,
-            tuple(legal_moves),
-            piece_context_by_id=piece_context_by_id,
-            global_context=global_context,
+    def forward_batch(
+        self,
+        requests: Sequence[tuple[GameState, Sequence[Move]]],
+    ) -> tuple[PolicyValueForwardOutput, ...]:
+        return self._forward_batch_with_metrics(requests)[0]
+
+    def _forward_batch_with_metrics(
+        self,
+        requests: Sequence[tuple[GameState, Sequence[Move]]],
+    ) -> tuple[tuple[PolicyValueForwardOutput, ...], PolicyValueBatchMetrics]:
+        total_start = time.perf_counter()
+        if not requests:
+            return (), PolicyValueBatchMetrics()
+
+        board_encode_start = time.perf_counter()
+        board_encodings = [
+            self.board_encoder.encode_state(state)
+            for state, _ in requests
+        ]
+        board_encode_ms = (time.perf_counter() - board_encode_start) * 1000.0
+        token_rows = [
+            torch.cat(
+                (
+                    board_encoding.global_token.unsqueeze(0),
+                    board_encoding.piece_tokens,
+                ),
+                dim=0,
+            )
+            for board_encoding in board_encodings
+        ]
+        max_tokens = max(row.shape[0] for row in token_rows)
+        padded_rows: list[Tensor] = []
+        padding_masks: list[Tensor] = []
+        for row in token_rows:
+            padding_length = max_tokens - row.shape[0]
+            if padding_length:
+                padding = torch.zeros(
+                    (padding_length, self.config.d_model),
+                    dtype=row.dtype,
+                    device=row.device,
+                )
+                padded_rows.append(torch.cat((row, padding), dim=0))
+            else:
+                padded_rows.append(row)
+            padding_masks.append(
+                torch.tensor(
+                    [False] * row.shape[0] + [True] * padding_length,
+                    dtype=torch.bool,
+                    device=row.device,
+                )
+            )
+
+        transformer_start = time.perf_counter()
+        contextual_batch = self.transformer(
+            torch.stack(padded_rows, dim=0),
+            src_key_padding_mask=torch.stack(padding_masks, dim=0),
         )
-        if encoded_moves.move_ids:
-            policy_logits = self.policy_head(encoded_moves.candidate_embeddings).squeeze(-1)
+        transformer_ms = (time.perf_counter() - transformer_start) * 1000.0
+
+        outputs: list[PolicyValueForwardOutput] = []
+        global_contexts: list[Tensor] = []
+        encoded_moves_by_request = []
+        total_move_metrics = MoveEncodingMetrics()
+        move_encode_start = time.perf_counter()
+        for request_index, ((state, legal_moves), board_encoding) in enumerate(
+            zip(requests, board_encodings, strict=True)
+        ):
+            contextual_tokens = contextual_batch[request_index]
+            global_context = contextual_tokens[0]
+            global_contexts.append(global_context)
+            piece_context_by_id = {
+                piece_id: contextual_tokens[index + 1]
+                for index, piece_id in enumerate(board_encoding.piece_ids)
+            }
+            encoded_moves, move_metrics = self.move_encoder.encode_moves_with_metrics(
+                state,
+                tuple(legal_moves),
+                piece_context_by_id=piece_context_by_id,
+                global_context=global_context,
+            )
+            encoded_moves_by_request.append(encoded_moves)
+            total_move_metrics = MoveEncodingMetrics(
+                moves_encoded=total_move_metrics.moves_encoded + move_metrics.moves_encoded,
+                total_ms=total_move_metrics.total_ms + move_metrics.total_ms,
+                consequence_total_ms=(
+                    total_move_metrics.consequence_total_ms + move_metrics.consequence_total_ms
+                ),
+                consequence_apply_move_ms=(
+                    total_move_metrics.consequence_apply_move_ms + move_metrics.consequence_apply_move_ms
+                ),
+                consequence_terminal_check_ms=(
+                    total_move_metrics.consequence_terminal_check_ms + move_metrics.consequence_terminal_check_ms
+                ),
+                consequence_check_eval_ms=(
+                    total_move_metrics.consequence_check_eval_ms + move_metrics.consequence_check_eval_ms
+                ),
+            )
+        move_encode_ms = (time.perf_counter() - move_encode_start) * 1000.0
+
+        candidate_lengths = [
+            len(encoded_moves.move_ids)
+            for encoded_moves in encoded_moves_by_request
+        ]
+        candidate_tensors = [
+            encoded_moves.candidate_embeddings
+            for encoded_moves in encoded_moves_by_request
+            if encoded_moves.move_ids
+        ]
+        policy_head_start = time.perf_counter()
+        if candidate_tensors:
+            all_policy_logits = self.policy_head(
+                torch.cat(candidate_tensors, dim=0)
+            ).squeeze(-1)
         else:
-            policy_logits = torch.zeros(0, dtype=torch.float32, device=self.device)
-        value = torch.tanh(self.value_head(global_context)).squeeze(-1)
-        return PolicyValueForwardOutput(
-            move_ids=encoded_moves.move_ids,
-            policy_logits=policy_logits,
-            value=value,
+            all_policy_logits = torch.zeros(0, dtype=torch.float32, device=self.device)
+        policy_head_ms = (time.perf_counter() - policy_head_start) * 1000.0
+        value_head_start = time.perf_counter()
+        values = torch.tanh(self.value_head(torch.stack(global_contexts, dim=0))).squeeze(-1)
+        value_head_ms = (time.perf_counter() - value_head_start) * 1000.0
+
+        offset = 0
+        for request_index, encoded_moves in enumerate(encoded_moves_by_request):
+            length = candidate_lengths[request_index]
+            if length:
+                policy_logits = all_policy_logits[offset : offset + length]
+            else:
+                policy_logits = torch.zeros(0, dtype=torch.float32, device=self.device)
+            offset += length
+            outputs.append(
+                PolicyValueForwardOutput(
+                    move_ids=encoded_moves.move_ids,
+                    policy_logits=policy_logits,
+                    value=values[request_index],
+                )
+            )
+        total_legal_moves = sum(len(legal_moves) for _, legal_moves in requests)
+        return tuple(outputs), PolicyValueBatchMetrics(
+            requests=len(requests),
+            total_legal_moves=total_legal_moves,
+            total_ms=(time.perf_counter() - total_start) * 1000.0,
+            board_encode_ms=board_encode_ms,
+            transformer_ms=transformer_ms,
+            move_encode_ms=move_encode_ms,
+            policy_head_ms=policy_head_ms,
+            value_head_ms=value_head_ms,
+            consequence_total_ms=total_move_metrics.consequence_total_ms,
+            consequence_apply_move_ms=total_move_metrics.consequence_apply_move_ms,
+            consequence_terminal_check_ms=total_move_metrics.consequence_terminal_check_ms,
+            consequence_check_eval_ms=total_move_metrics.consequence_check_eval_ms,
         )
 
     def infer(
@@ -134,27 +289,44 @@ class PolicyValueModel(nn.Module):
         state: GameState,
         legal_moves: Sequence[Move],
     ) -> PolicyValueOutput:
+        return self.infer_batch(((state, legal_moves),))[0]
+
+    def infer_batch(
+        self,
+        requests: Sequence[tuple[GameState, Sequence[Move]]],
+    ) -> tuple[PolicyValueOutput, ...]:
+        return self.infer_batch_with_metrics(requests)[0]
+
+    def infer_batch_with_metrics(
+        self,
+        requests: Sequence[tuple[GameState, Sequence[Move]]],
+    ) -> tuple[tuple[PolicyValueOutput, ...], PolicyValueBatchMetrics]:
         was_training = self.training
         self.eval()
         try:
             with torch.inference_mode():
-                forward_output = self.forward(state, legal_moves)
+                forward_outputs, metrics = self._forward_batch_with_metrics(requests)
         finally:
             if was_training:
                 self.train()
 
-        policy_logits = {
-            move_id: float(logit)
-            for move_id, logit in zip(
-                forward_output.move_ids,
-                forward_output.policy_logits.detach().cpu().tolist(),
-                strict=True,
+        outputs: list[PolicyValueOutput] = []
+        for forward_output in forward_outputs:
+            policy_logits = {
+                move_id: float(logit)
+                for move_id, logit in zip(
+                    forward_output.move_ids,
+                    forward_output.policy_logits.detach().cpu().tolist(),
+                    strict=True,
+                )
+            }
+            outputs.append(
+                PolicyValueOutput(
+                    policy_logits=policy_logits,
+                    value=float(forward_output.value.detach().cpu().item()),
+                )
             )
-        }
-        return PolicyValueOutput(
-            policy_logits=policy_logits,
-            value=float(forward_output.value.detach().cpu().item()),
-        )
+        return tuple(outputs), metrics
 
 
 def resolve_device(device: str | torch.device | None = None) -> torch.device:

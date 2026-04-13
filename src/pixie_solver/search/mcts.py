@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -99,6 +100,7 @@ def run_mcts(
     if simulations < 1:
         raise ValueError("simulations must be at least 1")
 
+    total_start = time.perf_counter()
     evaluator_impl = HeuristicEvaluator() if evaluator is None else evaluator
     root = SearchNode.from_state(state)
     diagnostics = {
@@ -107,6 +109,18 @@ def run_mcts(
         "heuristic_evaluations": 0,
         "model_inference_calls": 0,
         "applied_moves": 0,
+        "terminal_checks": 0,
+        "legal_move_generations": 0,
+        "child_selection_calls": 0,
+    }
+    timings = {
+        "search_expand_ms": 0.0,
+        "search_terminal_check_ms": 0.0,
+        "search_legal_moves_ms": 0.0,
+        "search_model_inference_ms": 0.0,
+        "search_evaluator_ms": 0.0,
+        "search_apply_move_ms": 0.0,
+        "search_child_selection_ms": 0.0,
     }
     noise_metadata: dict[str, JsonValue] = {
         "root_noise_applied": False,
@@ -120,6 +134,7 @@ def run_mcts(
             policy_value_model=policy_value_model,
             evaluator=evaluator_impl,
             diagnostics=diagnostics,
+            timings=timings,
         )
         root.visit_count += 1
         root.value_sum += value
@@ -137,6 +152,7 @@ def run_mcts(
             evaluator=evaluator_impl,
             c_puct=c_puct,
             diagnostics=diagnostics,
+            timings=timings,
         )
 
     visit_counts = {
@@ -172,8 +188,12 @@ def run_mcts(
             "evaluator": type(evaluator_impl).__name__,
             "used_model": policy_value_model is not None,
             "c_puct": c_puct,
+            "simulations_completed": root.visit_count,
+            "root_legal_move_count": len(root.legal_moves),
+            "search_total_ms": (time.perf_counter() - total_start) * 1000.0,
             **noise_metadata,
             **diagnostics,
+            **timings,
         },
     )
 
@@ -185,6 +205,7 @@ def _simulate(
     evaluator: StateEvaluator,
     c_puct: float,
     diagnostics: dict[str, int],
+    timings: dict[str, float],
 ) -> float:
     if node.is_terminal:
         value = 0.0 if node.terminal_value is None else node.terminal_value
@@ -198,15 +219,21 @@ def _simulate(
             policy_value_model=policy_value_model,
             evaluator=evaluator,
             diagnostics=diagnostics,
+            timings=timings,
         )
         node.visit_count += 1
         node.value_sum += value
         return value
 
+    diagnostics["child_selection_calls"] += 1
+    selection_start = time.perf_counter()
     edge = _select_child(node=node, c_puct=c_puct)
+    timings["search_child_selection_ms"] += (time.perf_counter() - selection_start) * 1000.0
     if edge is None:
         diagnostics["heuristic_evaluations"] += 1
+        eval_start = time.perf_counter()
         value = evaluator.evaluate(node.state)
+        timings["search_evaluator_ms"] += (time.perf_counter() - eval_start) * 1000.0
         node.visit_count += 1
         node.value_sum += value
         return value
@@ -214,7 +241,9 @@ def _simulate(
     child = edge.child
     if child is None:
         diagnostics["applied_moves"] += 1
+        apply_start = time.perf_counter()
         child_state, delta = apply_move(node.state, edge.move)
+        timings["search_apply_move_ms"] += (time.perf_counter() - apply_start) * 1000.0
         child = SearchNode.from_state(child_state)
         edge.child = child
         edge.child_state_hash = child.state_hash
@@ -226,6 +255,7 @@ def _simulate(
         evaluator=evaluator,
         c_puct=c_puct,
         diagnostics=diagnostics,
+        timings=timings,
     )
     value = -child_value
     edge.visit_count += 1
@@ -241,17 +271,26 @@ def _expand_node(
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator,
     diagnostics: dict[str, int],
+    timings: dict[str, float],
 ) -> float:
+    expand_start = time.perf_counter()
     diagnostics["expanded_nodes"] += 1
+    diagnostics["terminal_checks"] += 1
+    terminal_start = time.perf_counter()
     terminal = result(node.state)
+    timings["search_terminal_check_ms"] += (time.perf_counter() - terminal_start) * 1000.0
     if terminal is not None:
         diagnostics["terminal_expansions"] += 1
         node.is_terminal = True
         node.terminal_value = _outcome_value(terminal, node.to_play)
         node.is_expanded = True
+        timings["search_expand_ms"] += (time.perf_counter() - expand_start) * 1000.0
         return node.terminal_value
 
+    diagnostics["legal_move_generations"] += 1
+    movegen_start = time.perf_counter()
     moves = tuple(legal_moves(node.state))
+    timings["search_legal_moves_ms"] += (time.perf_counter() - movegen_start) * 1000.0
     move_ids = tuple(stable_move_id(move) for move in moves)
     node.legal_moves = moves
     node.move_ids = move_ids
@@ -260,12 +299,15 @@ def _expand_node(
     if not moves:
         node.is_terminal = True
         node.terminal_value = 0.0
+        timings["search_expand_ms"] += (time.perf_counter() - expand_start) * 1000.0
         return 0.0
 
     policy_logits: dict[str, float] = {}
     if policy_value_model is not None:
         diagnostics["model_inference_calls"] += 1
+        model_start = time.perf_counter()
         model_output = policy_value_model.infer(node.state, moves)
+        timings["search_model_inference_ms"] += (time.perf_counter() - model_start) * 1000.0
         policy_logits = {
             str(move_id): float(logit)
             for move_id, logit in model_output.policy_logits.items()
@@ -274,7 +316,9 @@ def _expand_node(
         value = _clamp_value(model_output.value)
     else:
         diagnostics["heuristic_evaluations"] += 1
+        eval_start = time.perf_counter()
         value = _clamp_value(evaluator.evaluate(node.state))
+        timings["search_evaluator_ms"] += (time.perf_counter() - eval_start) * 1000.0
     node.policy_logits = dict(sorted(policy_logits.items()))
 
     priors = _priors_for_moves(move_ids=move_ids, policy_logits=policy_logits)
@@ -282,6 +326,7 @@ def _expand_node(
         move_id: SearchEdge(move=move, move_id=move_id, prior=priors[move_id])
         for move_id, move in zip(move_ids, moves, strict=True)
     }
+    timings["search_expand_ms"] += (time.perf_counter() - expand_start) * 1000.0
     return value
 
 
