@@ -8,3 +8,5 @@ dist/
 checkpoints/
 data/selfplay/
 runs/
+.env
+.env.*
