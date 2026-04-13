@@ -161,6 +161,12 @@ class SearchTest(unittest.TestCase):
         )
         self.assertIn(search_result.selected_move, search_result.legal_moves)
         self.assertAlmostEqual(1.0, sum(search_result.visit_distribution.values()))
+        self.assertGreaterEqual(float(search_result.metadata["search_total_ms"]), 0.0)
+        self.assertGreaterEqual(float(search_result.metadata["search_expand_ms"]), 0.0)
+        self.assertGreaterEqual(float(search_result.metadata["search_legal_moves_ms"]), 0.0)
+        self.assertGreaterEqual(int(search_result.metadata["expanded_nodes"]), 1)
+        self.assertGreaterEqual(int(search_result.metadata["terminal_checks"]), 1)
+        self.assertGreaterEqual(int(search_result.metadata["legal_move_generations"]), 1)
 
     def test_model_priors_are_respected_when_visits_are_tied(self) -> None:
         state = GameState(
@@ -209,6 +215,8 @@ class SearchTest(unittest.TestCase):
             {stable_move_id(move) for move in result.legal_moves},
             set(result.visit_distribution),
         )
+        self.assertGreaterEqual(float(result.metadata["search_model_inference_ms"]), 0.0)
+        self.assertGreaterEqual(int(result.metadata["model_inference_calls"]), 1)
 
     def test_root_dirichlet_noise_mixes_root_priors_deterministically(self) -> None:
         state = GameState(

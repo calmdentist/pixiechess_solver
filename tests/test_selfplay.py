@@ -22,8 +22,10 @@ from pixie_solver.training import (
     SelfPlayConfig,
     flatten_selfplay_examples,
     generate_selfplay_games,
+    generate_selfplay_games_parallel,
     read_selfplay_examples_jsonl,
     read_selfplay_games_jsonl,
+    seed_for_game,
     write_selfplay_examples_jsonl,
     write_selfplay_games_jsonl,
 )
@@ -104,9 +106,46 @@ class SelfPlayTest(unittest.TestCase):
         games_b = generate_selfplay_games([self.initial_state], games=2, config=self.config)
 
         self.assertEqual(
-            [game.to_dict() for game in games_a],
-            [game.to_dict() for game in games_b],
+            [_normalize_timing_metadata(game.to_dict()) for game in games_a],
+            [_normalize_timing_metadata(game.to_dict()) for game in games_b],
         )
+
+    def test_parallel_selfplay_matches_serial_with_per_game_seeds(self) -> None:
+        config = SelfPlayConfig(
+            simulations=4,
+            max_plies=2,
+            opening_temperature=0.0,
+            final_temperature=0.0,
+            temperature_drop_after_ply=0,
+            seed=29,
+            root_exploration_fraction=0.0,
+        )
+
+        serial_games = generate_selfplay_games(
+            [self.initial_state],
+            games=3,
+            config=config,
+        )
+        parallel_games, inference_stats = generate_selfplay_games_parallel(
+            [self.initial_state],
+            games=3,
+            workers=2,
+            config=config,
+        )
+
+        self.assertIsNone(inference_stats)
+        normalized_parallel = []
+        for game in parallel_games:
+            payload = game.to_dict()
+            payload["metadata"].pop("parallel_worker", None)
+            payload["replay_trace"]["metadata"].pop("parallel_worker", None)
+            normalized_parallel.append(payload)
+        self.assertEqual(
+            [_normalize_timing_metadata(game.to_dict()) for game in serial_games],
+            [_normalize_timing_metadata(payload) for payload in normalized_parallel],
+        )
+        self.assertEqual(29, serial_games[0].metadata["seed"])
+        self.assertEqual(seed_for_game(29, 2), serial_games[2].metadata["seed"])
 
     def test_selfplay_game_contains_replay_and_labeled_examples(self) -> None:
         game = generate_selfplay_games([self.initial_state], games=1, config=self.config)[0]
@@ -118,6 +157,8 @@ class SelfPlayTest(unittest.TestCase):
         chosen_move = game.replay_trace.steps[0].move
         self.assertEqual(stable_move_id(chosen_move), example.selected_move_id)
         self.assertEqual(1.0, example.outcome)
+        self.assertIn("search_total_ms", example.metadata)
+        self.assertGreaterEqual(float(example.metadata["search_total_ms"]), 0.0)
 
         final_state = replay_trace(game.replay_trace)
         self.assertEqual("white", result(final_state))
@@ -324,6 +365,19 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(white_war_automata[0].square[0], black_war_automata[0].square[0])
         self.assertEqual("2", white_war_automata[0].square[1])
         self.assertEqual("7", black_war_automata[0].square[1])
+
+
+def _normalize_timing_metadata(payload: object) -> object:
+    if isinstance(payload, dict):
+        normalized: dict[object, object] = {}
+        for key, value in payload.items():
+            if isinstance(key, str) and key.endswith("_ms"):
+                continue
+            normalized[key] = _normalize_timing_metadata(value)
+        return normalized
+    if isinstance(payload, list):
+        return [_normalize_timing_metadata(value) for value in payload]
+    return payload
 
 
 if __name__ == "__main__":

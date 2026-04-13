@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 import torch
 from torch import Tensor, nn
@@ -27,6 +28,26 @@ CONSEQUENCE_FEATURES = 12
 class EncodedMoves:
     move_ids: tuple[str, ...]
     candidate_embeddings: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class MoveEncodingMetrics:
+    moves_encoded: int = 0
+    total_ms: float = 0.0
+    consequence_total_ms: float = 0.0
+    consequence_apply_move_ms: float = 0.0
+    consequence_terminal_check_ms: float = 0.0
+    consequence_check_eval_ms: float = 0.0
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "moves_encoded": self.moves_encoded,
+            "total_ms": self.total_ms,
+            "consequence_total_ms": self.consequence_total_ms,
+            "consequence_apply_move_ms": self.consequence_apply_move_ms,
+            "consequence_terminal_check_ms": self.consequence_terminal_check_ms,
+            "consequence_check_eval_ms": self.consequence_check_eval_ms,
+        }
 
 
 class MoveEncoder(nn.Module):
@@ -84,32 +105,68 @@ class MoveEncoder(nn.Module):
         piece_context_by_id: dict[str, Tensor],
         global_context: Tensor,
     ) -> EncodedMoves:
+        return self.encode_moves_with_metrics(
+            state,
+            legal_moves,
+            piece_context_by_id=piece_context_by_id,
+            global_context=global_context,
+        )[0]
+
+    def encode_moves_with_metrics(
+        self,
+        state: GameState,
+        legal_moves: tuple[Move, ...] | list[Move],
+        *,
+        piece_context_by_id: dict[str, Tensor],
+        global_context: Tensor,
+    ) -> tuple[EncodedMoves, MoveEncodingMetrics]:
+        start = time.perf_counter()
         if not legal_moves:
-            return EncodedMoves(
-                move_ids=(),
-                candidate_embeddings=torch.zeros(
-                    (0, self.d_model),
-                    dtype=torch.float32,
-                    device=global_context.device,
+            return (
+                EncodedMoves(
+                    move_ids=(),
+                    candidate_embeddings=torch.zeros(
+                        (0, self.d_model),
+                        dtype=torch.float32,
+                        device=global_context.device,
+                    ),
                 ),
+                MoveEncodingMetrics(),
             )
 
         candidate_embeddings: list[Tensor] = []
         move_ids: list[str] = []
+        total_consequence_ms = 0.0
+        total_apply_move_ms = 0.0
+        total_terminal_ms = 0.0
+        total_check_eval_ms = 0.0
         for move in legal_moves:
             move_ids.append(stable_move_id(move))
-            candidate_embeddings.append(
-                self._encode_single_move(
+            candidate_embedding, metrics = self._encode_single_move_with_metrics(
                     state,
                     move,
                     piece_context_by_id=piece_context_by_id,
                     global_context=global_context,
                 )
-            )
+            candidate_embeddings.append(candidate_embedding)
+            total_consequence_ms += metrics.consequence_total_ms
+            total_apply_move_ms += metrics.consequence_apply_move_ms
+            total_terminal_ms += metrics.consequence_terminal_check_ms
+            total_check_eval_ms += metrics.consequence_check_eval_ms
 
-        return EncodedMoves(
-            move_ids=tuple(move_ids),
-            candidate_embeddings=torch.stack(candidate_embeddings, dim=0),
+        return (
+            EncodedMoves(
+                move_ids=tuple(move_ids),
+                candidate_embeddings=torch.stack(candidate_embeddings, dim=0),
+            ),
+            MoveEncodingMetrics(
+                moves_encoded=len(move_ids),
+                total_ms=(time.perf_counter() - start) * 1000.0,
+                consequence_total_ms=total_consequence_ms,
+                consequence_apply_move_ms=total_apply_move_ms,
+                consequence_terminal_check_ms=total_terminal_ms,
+                consequence_check_eval_ms=total_check_eval_ms,
+            ),
         )
 
     def _encode_single_move(
@@ -120,6 +177,21 @@ class MoveEncoder(nn.Module):
         piece_context_by_id: dict[str, Tensor],
         global_context: Tensor,
     ) -> Tensor:
+        return self._encode_single_move_with_metrics(
+            state,
+            move,
+            piece_context_by_id=piece_context_by_id,
+            global_context=global_context,
+        )[0]
+
+    def _encode_single_move_with_metrics(
+        self,
+        state: GameState,
+        move: Move,
+        *,
+        piece_context_by_id: dict[str, Tensor],
+        global_context: Tensor,
+    ) -> tuple[Tensor, MoveEncodingMetrics]:
         device = global_context.device
         moving_context = piece_context_by_id[move.piece_id]
         target_piece_id = _target_piece_id(move)
@@ -169,14 +241,17 @@ class MoveEncoder(nn.Module):
                 device=device,
             )
         )
+        consequence_features, consequence_metrics = _consequence_features_with_metrics(
+            state, move
+        )
         token = token + self.consequence_projection(
             torch.tensor(
-                _consequence_features(state, move),
+                consequence_features,
                 dtype=torch.float32,
                 device=device,
             )
         )
-        return self.output_mlp(token)
+        return self.output_mlp(token), consequence_metrics
 
     def _embed_scalar(self, embedding: nn.Embedding, token_id: int) -> Tensor:
         device = embedding.weight.device
@@ -184,17 +259,31 @@ class MoveEncoder(nn.Module):
 
 
 def _consequence_features(state: GameState, move: Move) -> tuple[float, ...]:
+    return _consequence_features_with_metrics(state, move)[0]
+
+
+def _consequence_features_with_metrics(
+    state: GameState,
+    move: Move,
+) -> tuple[tuple[float, ...], MoveEncodingMetrics]:
+    total_start = time.perf_counter()
     moving_piece = state.piece_instances[move.piece_id]
     mover = moving_piece.color
     opponent = other_color(mover)
     before_advantage = material_score(state, mover) - material_score(state, opponent)
+    check_start = time.perf_counter()
     before_self_check = is_in_check(state, mover)
     before_opponent_check = is_in_check(state, opponent)
+    before_check_eval_ms = (time.perf_counter() - check_start) * 1000.0
 
+    apply_start = time.perf_counter()
     after_state, delta = apply_move(state, move)
+    apply_move_ms = (time.perf_counter() - apply_start) * 1000.0
     after_advantage = material_score(after_state, mover) - material_score(after_state, opponent)
+    check_start = time.perf_counter()
     after_self_check = is_in_check(after_state, mover)
     after_opponent_check = is_in_check(after_state, opponent)
+    after_check_eval_ms = (time.perf_counter() - check_start) * 1000.0
     active_after = len(after_state.active_pieces())
     active_before = len(state.active_pieces())
     piece_state_changed = any(
@@ -202,7 +291,9 @@ def _consequence_features(state: GameState, move: Move) -> tuple[float, ...]:
         for piece_id in delta.changed_piece_ids
         if piece_id in state.piece_instances and piece_id in after_state.piece_instances
     )
+    terminal_start = time.perf_counter()
     terminal = result(after_state)
+    terminal_check_ms = (time.perf_counter() - terminal_start) * 1000.0
 
     return (
         normalize_scalar(after_advantage - before_advantage, scale=8.0),
@@ -217,6 +308,13 @@ def _consequence_features(state: GameState, move: Move) -> tuple[float, ...]:
         float(after_state.side_to_move == mover),
         1.0 if terminal == mover.value else -1.0 if terminal == opponent.value else 0.0,
         float(terminal == "draw"),
+    ), MoveEncodingMetrics(
+        moves_encoded=1,
+        total_ms=(time.perf_counter() - total_start) * 1000.0,
+        consequence_total_ms=(time.perf_counter() - total_start) * 1000.0,
+        consequence_apply_move_ms=apply_move_ms,
+        consequence_terminal_check_ms=terminal_check_ms,
+        consequence_check_eval_ms=before_check_eval_ms + after_check_eval_ms,
     )
 
 

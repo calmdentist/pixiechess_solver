@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from pixie_solver.core import Color, GameState, Move, StateDelta, stable_move_id
 from pixie_solver.model.policy_value import PolicyValueModel
@@ -15,8 +17,18 @@ from pixie_solver.search import (
 )
 from pixie_solver.simulator.engine import apply_move, result
 from pixie_solver.training.dataset import SelfPlayExample, SelfPlayGame
+from pixie_solver.training.checkpoint import load_training_checkpoint
+from pixie_solver.training.inference_service import (
+    BatchedInferenceClient,
+    BatchedInferenceConfig,
+    BatchedInferenceService,
+    BatchedInferenceStats,
+)
 from pixie_solver.utils import build_replay_trace
 from pixie_solver.utils.serialization import JsonValue
+
+SELFPLAY_SEED_STRIDE = 1_000_003
+_WORKER_MODEL_CACHE: dict[tuple[str, str | None], PolicyValueModel] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,17 +133,18 @@ def generate_selfplay_games(
         raise ValueError("initial_states must contain at least one GameState")
 
     active_config = SelfPlayConfig() if config is None else config
-    rng = random.Random(active_config.seed)
     generated_games: list[SelfPlayGame] = []
     for game_index in range(games):
         seed_state = initial_states[game_index % len(initial_states)]
+        game_seed = seed_for_game(active_config.seed, game_index)
         generated_games.append(
             _play_single_game(
                 initial_state=_clone_state(seed_state),
                 game_index=game_index,
                 games_total=games,
                 config=active_config,
-                rng=rng,
+                game_seed=game_seed,
+                rng=random.Random(game_seed),
                 policy_value_model=policy_value_model,
                 evaluator=evaluator,
                 progress_callback=progress_callback,
@@ -139,6 +152,132 @@ def generate_selfplay_games(
             )
         )
     return generated_games
+
+
+def generate_selfplay_games_parallel(
+    initial_states: Sequence[GameState],
+    *,
+    games: int,
+    workers: int,
+    config: SelfPlayConfig | None = None,
+    checkpoint_path: str | Path | None = None,
+    device: str | None = None,
+    batched_inference_config: BatchedInferenceConfig | None = None,
+    inference_device: str | None = None,
+    progress_callback: Callable[[SelfPlayProgress], None] | None = None,
+) -> tuple[list[SelfPlayGame], BatchedInferenceStats | None]:
+    if games < 1:
+        raise ValueError("games must be at least 1")
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    if not initial_states:
+        raise ValueError("initial_states must contain at least one GameState")
+
+    active_config = SelfPlayConfig() if config is None else config
+    if workers == 1:
+        model = (
+            load_training_checkpoint(checkpoint_path, device=device).model
+            if checkpoint_path is not None
+            else None
+        )
+        return (
+            generate_selfplay_games(
+                initial_states,
+                games=games,
+                config=active_config,
+                policy_value_model=model,
+                progress_callback=progress_callback,
+            ),
+            None,
+        )
+
+    config_payload = asdict(active_config)
+    checkpoint_payload = str(checkpoint_path) if checkpoint_path is not None else None
+    inference_stats = None
+    if checkpoint_payload is not None and batched_inference_config is not None:
+        with BatchedInferenceService(
+            checkpoint_payload,
+            device=inference_device or device,
+            config=batched_inference_config,
+        ) as inference_service:
+            games_out = _run_parallel_selfplay_jobs(
+                initial_states=initial_states,
+                games=games,
+                workers=workers,
+                config_payload=config_payload,
+                checkpoint_payload=None,
+                device=device,
+                inference_client=inference_service.client(),
+                progress_callback=progress_callback,
+            )
+            inference_stats = inference_service.stats()
+        return games_out, inference_stats
+
+    return (
+        _run_parallel_selfplay_jobs(
+            initial_states=initial_states,
+            games=games,
+            workers=workers,
+            config_payload=config_payload,
+            checkpoint_payload=checkpoint_payload,
+            device=device,
+            inference_client=None,
+            progress_callback=progress_callback,
+        ),
+        inference_stats,
+    )
+
+
+def _run_parallel_selfplay_jobs(
+    *,
+    initial_states: Sequence[GameState],
+    games: int,
+    workers: int,
+    config_payload: dict[str, object],
+    checkpoint_payload: str | None,
+    device: str | None,
+    inference_client: BatchedInferenceClient | None,
+    progress_callback: Callable[[SelfPlayProgress], None] | None,
+) -> list[SelfPlayGame]:
+    jobs = [
+        {
+            "initial_state": initial_states[game_index % len(initial_states)].to_dict(),
+            "game_index": game_index,
+            "games_total": games,
+            "config": config_payload,
+            "checkpoint_path": checkpoint_payload,
+            "device": device,
+            "inference_client": inference_client,
+        }
+        for game_index in range(games)
+    ]
+
+    completed: dict[int, SelfPlayGame] = {}
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(_parallel_selfplay_worker, job)
+            for job in jobs
+        ]
+        for future in as_completed(futures):
+            game = SelfPlayGame.from_dict(future.result())
+            completed[int(game.metadata["game_index"])] = game
+            if progress_callback is not None:
+                progress_callback(
+                    SelfPlayProgress(
+                        event="game_completed",
+                        game_index=int(game.metadata["game_index"]),
+                        games_total=games,
+                        plies_played=int(game.metadata["plies_played"]),
+                        outcome=game.outcome,
+                        termination_reason=str(game.metadata["termination_reason"]),
+                        used_model=checkpoint_path is not None,
+                    )
+                )
+
+    return [
+        completed[game_index]
+        for game_index in range(games)
+    ]
 
 
 def flatten_selfplay_examples(games: Sequence[SelfPlayGame]) -> list[SelfPlayExample]:
@@ -172,12 +311,19 @@ def adjudicate_cutoff(
     )
 
 
+def seed_for_game(base_seed: int, game_index: int) -> int:
+    if game_index < 0:
+        raise ValueError("game_index must be non-negative")
+    return int(base_seed) + game_index * SELFPLAY_SEED_STRIDE
+
+
 def _play_single_game(
     *,
     initial_state: GameState,
     game_index: int,
     games_total: int,
     config: SelfPlayConfig,
+    game_seed: int,
     rng: random.Random,
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator | None,
@@ -312,7 +458,8 @@ def _play_single_game(
         moves,
         metadata={
             "game_index": game_index,
-            "seed": config.seed,
+            "base_seed": config.seed,
+            "seed": game_seed,
             "simulations": config.simulations,
             "max_plies": config.max_plies,
             "opening_temperature": config.opening_temperature,
@@ -336,6 +483,8 @@ def _play_single_game(
         outcome=outcome,
         metadata={
             "game_index": game_index,
+            "base_seed": config.seed,
+            "seed": game_seed,
             "plies_played": len(moves),
             "termination_reason": termination_reason,
             "cutoff_adjudication": (
@@ -435,3 +584,36 @@ def _with_side_to_move(state: GameState, side_to_move: Color) -> GameState:
 
 def _clone_state(state: GameState) -> GameState:
     return GameState.from_dict(state.to_dict())
+
+
+def _parallel_selfplay_worker(job: dict[str, object]) -> dict[str, JsonValue]:
+    config = SelfPlayConfig(**dict(job["config"]))
+    game_index = int(job["game_index"])
+    game_seed = seed_for_game(config.seed, game_index)
+    checkpoint_path = job.get("checkpoint_path")
+    inference_client = job.get("inference_client")
+    model = None
+    if inference_client is not None:
+        model = inference_client
+    elif checkpoint_path is not None:
+        device = str(job["device"]) if job.get("device") is not None else None
+        cache_key = (str(checkpoint_path), device)
+        model = _WORKER_MODEL_CACHE.get(cache_key)
+        if model is None:
+            model = load_training_checkpoint(str(checkpoint_path), device=device).model
+            _WORKER_MODEL_CACHE[cache_key] = model
+    game = _play_single_game(
+        initial_state=GameState.from_dict(dict(job["initial_state"])),
+        game_index=game_index,
+        games_total=int(job["games_total"]),
+        config=config,
+        game_seed=game_seed,
+        rng=random.Random(game_seed),
+        policy_value_model=model,
+        evaluator=None,
+        progress_callback=None,
+        trace_callback=None,
+    )
+    game.metadata["parallel_worker"] = True
+    game.replay_trace.metadata["parallel_worker"] = True
+    return game.to_dict()

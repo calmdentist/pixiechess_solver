@@ -35,10 +35,12 @@ from pixie_solver.dsl.validator import PieceValidationError, validate_piece_prog
 from pixie_solver.eval import (
     ArenaConfig,
     ArenaProgress,
+    SimulatorStressConfig,
     decide_promotion,
     run_checkpoint_arena_from_paths,
     ModelEvalProgress,
     evaluate_policy_value_model,
+    run_simulator_stress,
     write_arena_games_jsonl,
 )
 from pixie_solver.llm import FrontierLLMClient, FrontierLLMPieceProgramProvider, LLMConfig
@@ -58,10 +60,12 @@ from pixie_solver.rules.repair import default_dsl_reference
 from pixie_solver.training import (
     SelfPlayConfig,
     SelfPlayProgress,
+    BatchedInferenceConfig,
     TrainingConfig,
     TrainingProgress,
     flatten_selfplay_examples,
     generate_selfplay_games,
+    generate_selfplay_games_parallel,
     load_training_checkpoint,
     save_training_checkpoint,
     read_selfplay_examples_jsonl,
@@ -70,6 +74,7 @@ from pixie_solver.training import (
     write_selfplay_games_jsonl,
     train_from_replays,
 )
+from pixie_solver.utils import write_run_manifest
 from pixie_solver.utils.serialization import JsonValue, canonical_json
 
 
@@ -217,10 +222,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Independent inclusion probability for each special piece when randomizing openings.",
     )
     selfplay_parser.add_argument("--games", type=int, default=1, help="Number of games to generate.")
+    selfplay_parser.add_argument("--workers", type=int, default=1, help="Parallel self-play worker processes. Use 1 for serial/viewer mode.")
     selfplay_parser.add_argument("--games-out", type=Path, help="Optional JSONL output path for self-play game records.")
     selfplay_parser.add_argument("--examples-out", type=Path, help="Optional JSONL output path for flattened self-play examples.")
+    selfplay_parser.add_argument("--manifest-out", type=Path, help="Optional run manifest output path.")
     selfplay_parser.add_argument("--checkpoint", type=Path, help="Optional checkpoint for model-guided self-play.")
     selfplay_parser.add_argument("--device", help="Device to load the checkpoint onto, e.g. cpu, mps, cuda.")
+    selfplay_parser.add_argument("--batched-inference", action="store_true", help="Use one batched inference service for parallel model-guided workers.")
+    selfplay_parser.add_argument("--inference-device", help="Device for the batched inference service. Defaults to --device.")
+    selfplay_parser.add_argument("--inference-batch-size", type=int, default=32, help="Maximum requests per batched inference call.")
+    selfplay_parser.add_argument("--inference-max-wait-ms", type=float, default=5.0, help="Maximum wait to fill an inference batch.")
     selfplay_parser.add_argument("--simulations", type=int, default=64, help="MCTS simulations per move.")
     selfplay_parser.add_argument("--max-plies", type=int, default=256, help="Maximum plies per generated game.")
     selfplay_parser.add_argument("--opening-temperature", type=float, default=1.0, help="Sampling temperature before the drop ply.")
@@ -356,6 +367,66 @@ def build_parser() -> argparse.ArgumentParser:
     arena_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
     arena_parser.set_defaults(handler=_handle_arena)
 
+    stress_parser = subparsers.add_parser(
+        "stress-simulator",
+        help="Run deterministic PixieChess-Lite simulator volume checks.",
+    )
+    stress_source_group = stress_parser.add_mutually_exclusive_group(required=True)
+    stress_source_group.add_argument("--state-file", type=Path, action="append", help="JSON GameState seed file.")
+    stress_source_group.add_argument("--standard-initial-state", action="store_true", help="Use built-in standard starting positions.")
+    stress_parser.add_argument("--games", type=int, default=32, help="Random stress games to simulate.")
+    stress_parser.add_argument("--max-plies", type=int, default=64, help="Maximum random plies per stress game.")
+    stress_parser.add_argument("--seed", type=int, default=0, help="Base stress seed.")
+    stress_parser.add_argument("--randomize-handauthored-specials", action="store_true", default=False, help="Randomize hand-authored special pieces in standard starts.")
+    stress_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard starts.")
+    stress_parser.add_argument("--special-piece-dir", type=Path, default=Path("data/pieces/handauthored"), help="Directory of hand-authored piece JSON/YAML files.")
+    stress_parser.add_argument("--special-piece-inclusion-probability", type=float, default=0.5, help="Special-piece inclusion probability.")
+    stress_parser.add_argument("--no-verify-all-legal-moves", dest="verify_all_legal_moves", action="store_false", help="Only apply sampled moves instead of checking every legal move at each visited state.")
+    stress_parser.set_defaults(verify_all_legal_moves=True)
+    stress_parser.add_argument("--output", type=Path, help="Optional JSON summary output path.")
+    stress_parser.add_argument("--manifest-out", type=Path, help="Optional run manifest output path.")
+    stress_parser.set_defaults(handler=_handle_stress_simulator)
+
+    benchmark_parser = subparsers.add_parser(
+        "bench-throughput",
+        help="Run a deterministic self-play throughput benchmark.",
+    )
+    benchmark_source_group = benchmark_parser.add_mutually_exclusive_group(required=True)
+    benchmark_source_group.add_argument("--state-file", type=Path, action="append", help="JSON GameState seed file.")
+    benchmark_source_group.add_argument("--standard-initial-state", action="store_true", help="Use built-in standard starting positions.")
+    benchmark_parser.add_argument("--output", type=Path, help="Optional JSON output path for benchmark results.")
+    benchmark_parser.add_argument("--manifest-out", type=Path, help="Optional run manifest output path.")
+    benchmark_parser.add_argument("--games", type=int, default=16, help="Games per benchmark trial.")
+    benchmark_parser.add_argument("--workers", type=int, default=1, help="Parallel self-play worker processes.")
+    benchmark_parser.add_argument("--repeats", type=int, default=1, help="Measured benchmark trials to run.")
+    benchmark_parser.add_argument("--warmup-runs", type=int, default=0, help="Unreported warmup trials to run first.")
+    benchmark_parser.add_argument("--checkpoint", type=Path, help="Optional checkpoint for model-guided self-play.")
+    benchmark_parser.add_argument("--device", help="Device for serial checkpoint loading, e.g. cpu, mps, cuda.")
+    benchmark_parser.add_argument("--selfplay-device", help="Device used by parallel self-play workers when loading checkpoints. Defaults to --device.")
+    benchmark_parser.add_argument("--batched-inference", action="store_true", help="Use one batched inference service for parallel model-guided workers.")
+    benchmark_parser.add_argument("--inference-device", help="Device for the batched inference service. Defaults to --device.")
+    benchmark_parser.add_argument("--inference-batch-size", type=int, default=32, help="Maximum requests per batched inference call.")
+    benchmark_parser.add_argument("--inference-max-wait-ms", type=float, default=5.0, help="Maximum wait to fill an inference batch.")
+    benchmark_parser.add_argument("--simulations", type=int, default=8, help="MCTS simulations per move.")
+    benchmark_parser.add_argument("--max-plies", type=int, default=16, help="Maximum plies per game.")
+    benchmark_parser.add_argument("--opening-temperature", type=float, default=0.0, help="Opening temperature. Defaults to deterministic benchmarking.")
+    benchmark_parser.add_argument("--final-temperature", type=float, default=0.0, help="Final temperature. Defaults to deterministic benchmarking.")
+    benchmark_parser.add_argument("--temperature-drop-after-ply", type=int, default=0, help="Ply after which final temperature is used.")
+    benchmark_parser.add_argument("--c-puct", type=float, default=1.5, help="PUCT exploration constant.")
+    benchmark_parser.add_argument("--root-dirichlet-alpha", type=float, default=0.3, help="Symmetric Dirichlet alpha for root exploration noise.")
+    benchmark_parser.add_argument("--root-exploration-fraction", type=float, default=0.0, help="Fraction of root priors replaced by Dirichlet noise. Defaults to deterministic benchmarking.")
+    benchmark_parser.add_argument("--seed", type=int, default=0, help="Deterministic benchmark seed.")
+    benchmark_parser.add_argument("--adjudicate-max-plies", dest="adjudicate_max_plies", action="store_true", default=True, help="Use deterministic cutoff adjudication when games reach --max-plies.")
+    benchmark_parser.add_argument("--no-adjudicate-max-plies", dest="adjudicate_max_plies", action="store_false", help="Treat non-terminal max-ply games as draws.")
+    benchmark_parser.add_argument("--adjudication-threshold", type=float, default=0.2, help="White-perspective heuristic cutoff threshold in [0, 1].")
+    benchmark_parser.add_argument("--randomize-handauthored-specials", action="store_true", default=False, help="Randomize hand-authored special pieces in standard starts.")
+    benchmark_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard starts.")
+    benchmark_parser.add_argument("--special-piece-dir", type=Path, default=Path("data/pieces/handauthored"), help="Directory of hand-authored piece JSON/YAML files.")
+    benchmark_parser.add_argument("--special-piece-inclusion-probability", type=float, default=0.5, help="Special-piece inclusion probability.")
+    benchmark_parser.add_argument("--log-every-plies", type=int, default=32, help="Self-play progress frequency.")
+    benchmark_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
+    benchmark_parser.set_defaults(handler=_handle_bench_throughput)
+
     train_loop_parser = subparsers.add_parser(
         "train-loop",
         help="Run self-play, training, and train/validation evaluation for multiple cycles.",
@@ -373,10 +444,16 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--root-dirichlet-alpha", type=float, default=0.3, help="Symmetric Dirichlet alpha for root exploration noise during self-play.")
     train_loop_parser.add_argument("--root-exploration-fraction", type=float, default=0.25, help="Fraction of root priors replaced by Dirichlet noise during self-play. Set to 0 to disable.")
     train_loop_parser.add_argument("--seed", type=int, default=0, help="Base seed for self-play and training.")
+    train_loop_parser.add_argument("--workers", type=int, default=1, help="Parallel self-play worker processes for train/validation generation. Use 1 for serial/viewer mode.")
     train_loop_parser.add_argument("--adjudicate-max-plies", dest="adjudicate_max_plies", action="store_true", default=True, help="Use deterministic cutoff adjudication when self-play reaches --max-plies.")
     train_loop_parser.add_argument("--no-adjudicate-max-plies", dest="adjudicate_max_plies", action="store_false", help="Treat non-terminal max-ply games as draws.")
     train_loop_parser.add_argument("--adjudication-threshold", type=float, default=0.2, help="White-perspective heuristic cutoff threshold in [0, 1].")
     train_loop_parser.add_argument("--device", help="Device for training/eval/model-guided self-play, e.g. cpu, mps, cuda.")
+    train_loop_parser.add_argument("--selfplay-device", help="Device used by parallel self-play workers when loading checkpoints. Defaults to --device.")
+    train_loop_parser.add_argument("--batched-inference", action="store_true", help="Use one batched inference service for parallel model-guided self-play workers.")
+    train_loop_parser.add_argument("--inference-device", help="Device for the batched inference service. Defaults to --device.")
+    train_loop_parser.add_argument("--inference-batch-size", type=int, default=32, help="Maximum requests per batched inference call.")
+    train_loop_parser.add_argument("--inference-max-wait-ms", type=float, default=5.0, help="Maximum wait to fill an inference batch.")
     train_loop_parser.add_argument("--epochs-per-cycle", type=int, default=2, help="Training epochs per cycle.")
     train_loop_parser.add_argument("--batch-size", type=int, default=4, help="Training batch size.")
     train_loop_parser.add_argument("--learning-rate", type=float, default=3e-4, help="AdamW learning rate.")
@@ -663,6 +740,14 @@ def _handle_piece_curriculum(args: argparse.Namespace) -> int:
 def _handle_selfplay(args: argparse.Namespace) -> int:
     if args.games_out is None and args.examples_out is None and not args.viewer:
         raise ValueError("selfplay requires --games-out, --examples-out, --viewer, or both")
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.viewer and args.workers != 1:
+        raise ValueError("--viewer requires --workers 1")
+    if args.batched_inference and args.checkpoint is None:
+        raise ValueError("--batched-inference requires --checkpoint")
+    if args.batched_inference and args.workers == 1:
+        raise ValueError("--batched-inference requires --workers greater than 1")
     if args.use_verified_pieces and not args.standard_initial_state:
         raise ValueError("--use-verified-pieces requires --standard-initial-state")
     if args.use_verified_pieces and not args.randomize_handauthored_specials:
@@ -703,14 +788,16 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
                 "--randomize-handauthored-specials requires --standard-initial-state"
             )
         initial_states = _load_state_files(args.state_file)
-    model = None
     checkpoint_metadata: dict[str, object] = {}
+    model = None
     if args.checkpoint is not None:
-        checkpoint = load_training_checkpoint(args.checkpoint, device=args.device)
-        model = checkpoint.model
+        checkpoint = None
+        if args.workers == 1:
+            checkpoint = load_training_checkpoint(args.checkpoint, device=args.device)
+            model = checkpoint.model
         checkpoint_metadata = {
             "checkpoint_path": str(args.checkpoint),
-            "checkpoint_metadata": dict(checkpoint.metadata),
+            "checkpoint_metadata": dict(checkpoint.metadata) if checkpoint is not None else {},
         }
 
     config = SelfPlayConfig(
@@ -728,33 +815,90 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
     )
     viewer = _start_live_viewer(args, enabled=args.viewer)
     try:
-        games = generate_selfplay_games(
-            initial_states,
-            games=args.games,
-            config=config,
-            policy_value_model=model,
-            progress_callback=(
-                None
-                if args.quiet
-                else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
-            ),
-            trace_callback=_build_selfplay_viewer_trace_callback(
-                viewer,
-                cycle=None,
-                phase="selfplay",
-            ),
+        progress_logger = (
+            None
+            if args.quiet
+            else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
         )
+        inference_stats = None
+        if args.workers == 1:
+            games = generate_selfplay_games(
+                initial_states,
+                games=args.games,
+                config=config,
+                policy_value_model=model,
+                progress_callback=progress_logger,
+                trace_callback=_build_selfplay_viewer_trace_callback(
+                    viewer,
+                    cycle=None,
+                    phase="selfplay",
+                ),
+            )
+        else:
+            games, inference_stats = generate_selfplay_games_parallel(
+                initial_states,
+                games=args.games,
+                workers=args.workers,
+                config=config,
+                checkpoint_path=args.checkpoint,
+                device=args.device,
+                batched_inference_config=(
+                    BatchedInferenceConfig(
+                        max_batch_size=args.inference_batch_size,
+                        max_wait_ms=args.inference_max_wait_ms,
+                    )
+                    if args.batched_inference
+                    else None
+                ),
+                inference_device=args.inference_device,
+                progress_callback=progress_logger,
+            )
         _annotate_games_with_registry(
             games,
             registry_path=args.piece_registry,
             verified_records=verified_records,
         )
         examples = flatten_selfplay_examples(games)
+        search_metrics = _summarize_example_search_metrics(examples)
 
         if args.games_out is not None:
             write_selfplay_games_jsonl(args.games_out, games)
         if args.examples_out is not None:
             write_selfplay_examples_jsonl(args.examples_out, examples)
+        if args.manifest_out is not None:
+            write_run_manifest(
+                args.manifest_out,
+                command="selfplay",
+                args={
+                    "games": args.games,
+                    "workers": args.workers,
+                    "simulations": config.simulations,
+                    "max_plies": config.max_plies,
+                    "seed": config.seed,
+                    "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+                    "batched_inference": args.batched_inference,
+                    "inference_device": args.inference_device or args.device,
+                    "inference_batch_size": args.inference_batch_size,
+                    "inference_max_wait_ms": args.inference_max_wait_ms,
+                    "randomize_handauthored_specials": args.randomize_handauthored_specials,
+                    "special_piece_inclusion_probability": args.special_piece_inclusion_probability,
+                    "use_verified_pieces": args.use_verified_pieces,
+                },
+                artifacts={
+                    "games_out": str(args.games_out) if args.games_out is not None else None,
+                    "examples_out": (
+                        str(args.examples_out) if args.examples_out is not None else None
+                    ),
+                    "examples_generated": len(examples),
+                    "outcomes": _outcome_counts(games),
+                    "search_metrics": search_metrics,
+                    "inference_stats": (
+                        inference_stats.to_dict()
+                        if inference_stats is not None
+                        else None
+                    ),
+                },
+            )
 
         print(
             canonical_json(
@@ -763,6 +907,15 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
                     "games_generated": len(games),
                     "examples_generated": len(examples),
                     "used_model": args.checkpoint is not None,
+                    "workers": args.workers,
+                    "batched_inference": args.batched_inference,
+                    "inference_device": args.inference_device or args.device,
+                    "inference_stats": (
+                        inference_stats.to_dict()
+                        if inference_stats is not None
+                        else None
+                    ),
+                    "search_metrics": search_metrics,
                     "games_out": str(args.games_out) if args.games_out is not None else None,
                     "examples_out": (
                         str(args.examples_out) if args.examples_out is not None else None
@@ -1022,6 +1175,340 @@ def _handle_arena(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_stress_simulator(args: argparse.Namespace) -> int:
+    if args.games < 1:
+        raise ValueError("--games must be at least 1")
+    if args.max_plies < 0:
+        raise ValueError("--max-plies must be non-negative")
+    if args.state_file:
+        if args.randomize_handauthored_specials:
+            raise ValueError("--randomize-handauthored-specials cannot be used with --state-file")
+        initial_states = _load_state_files(args.state_file)
+    else:
+        special_piece_classes = (
+            _load_piece_classes_from_directory(args.special_piece_dir)
+            if args.randomize_handauthored_specials
+            else ()
+        )
+        initial_states = _sample_loop_initial_states(
+            games=args.games,
+            seed=args.seed,
+            randomize_specials=args.randomize_handauthored_specials,
+            special_piece_classes=special_piece_classes,
+            inclusion_probability=args.special_piece_inclusion_probability,
+        )
+    config = SimulatorStressConfig(
+        games=args.games,
+        max_plies=args.max_plies,
+        seed=args.seed,
+        verify_all_legal_moves=args.verify_all_legal_moves,
+    )
+    summary = run_simulator_stress(initial_states, config=config)
+    payload = {
+        "status": "ok" if summary.ok else "failed",
+        "stress_summary": summary.to_dict(),
+        "seed_state_count": len(initial_states),
+        "randomized_special_pieces": args.randomize_handauthored_specials,
+    }
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(canonical_json(payload, indent=2), encoding="utf-8")
+    if args.manifest_out is not None:
+        write_run_manifest(
+            args.manifest_out,
+            command="stress-simulator",
+            args={
+                "games": args.games,
+                "max_plies": args.max_plies,
+                "seed": args.seed,
+                "verify_all_legal_moves": args.verify_all_legal_moves,
+                "randomize_handauthored_specials": args.randomize_handauthored_specials,
+                "special_piece_inclusion_probability": args.special_piece_inclusion_probability,
+            },
+            artifacts={
+                "output": str(args.output) if args.output is not None else None,
+                "summary_ok": summary.ok,
+            },
+        )
+    print(canonical_json(payload, indent=2))
+    return 0 if summary.ok else 2
+
+
+def _handle_bench_throughput(args: argparse.Namespace) -> int:
+    if args.games < 1:
+        raise ValueError("--games must be at least 1")
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.repeats < 1:
+        raise ValueError("--repeats must be at least 1")
+    if args.warmup_runs < 0:
+        raise ValueError("--warmup-runs must be non-negative")
+    if args.batched_inference and args.checkpoint is None:
+        raise ValueError("--batched-inference requires --checkpoint")
+    if args.batched_inference and args.workers == 1:
+        raise ValueError("--batched-inference requires --workers greater than 1")
+    if args.state_file:
+        if args.randomize_handauthored_specials:
+            raise ValueError("--randomize-handauthored-specials cannot be used with --state-file")
+        initial_states = _load_state_files(args.state_file)
+    else:
+        special_piece_classes = (
+            _load_piece_classes_from_directory(args.special_piece_dir)
+            if args.randomize_handauthored_specials
+            else ()
+        )
+        initial_states = _sample_loop_initial_states(
+            games=args.games,
+            seed=args.seed,
+            randomize_specials=args.randomize_handauthored_specials,
+            special_piece_classes=special_piece_classes,
+            inclusion_probability=args.special_piece_inclusion_probability,
+        )
+
+    config = SelfPlayConfig(
+        simulations=args.simulations,
+        max_plies=args.max_plies,
+        opening_temperature=args.opening_temperature,
+        final_temperature=args.final_temperature,
+        temperature_drop_after_ply=args.temperature_drop_after_ply,
+        c_puct=args.c_puct,
+        root_dirichlet_alpha=args.root_dirichlet_alpha,
+        root_exploration_fraction=args.root_exploration_fraction,
+        seed=args.seed,
+        adjudicate_max_plies=args.adjudicate_max_plies,
+        adjudication_threshold=args.adjudication_threshold,
+    )
+    progress_logger = (
+        None
+        if args.quiet
+        else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
+    )
+    serial_model = None
+    checkpoint_metadata: dict[str, object] = {}
+    if args.checkpoint is not None:
+        checkpoint_metadata["checkpoint_path"] = str(args.checkpoint)
+        if args.workers == 1:
+            checkpoint = load_training_checkpoint(args.checkpoint, device=args.device)
+            serial_model = checkpoint.model
+            checkpoint_metadata["checkpoint_metadata"] = dict(checkpoint.metadata)
+        else:
+            checkpoint_metadata["checkpoint_metadata"] = {}
+
+    inference_config = (
+        BatchedInferenceConfig(
+            max_batch_size=args.inference_batch_size,
+            max_wait_ms=args.inference_max_wait_ms,
+        )
+        if args.batched_inference
+        else None
+    )
+
+    def run_trial() -> tuple[list[object], object]:
+        if args.workers == 1:
+            return (
+                generate_selfplay_games(
+                    initial_states,
+                    games=args.games,
+                    config=config,
+                    policy_value_model=serial_model,
+                    progress_callback=progress_logger,
+                ),
+                None,
+            )
+        return generate_selfplay_games_parallel(
+            initial_states,
+            games=args.games,
+            workers=args.workers,
+            config=config,
+            checkpoint_path=args.checkpoint,
+            device=args.selfplay_device or args.device,
+            batched_inference_config=inference_config,
+            inference_device=args.inference_device or args.device,
+            progress_callback=progress_logger,
+        )
+
+    for warmup_index in range(args.warmup_runs):
+        if not args.quiet:
+            _stderr_print(
+                f"benchmark warmup {warmup_index + 1}/{args.warmup_runs} started"
+            )
+        run_trial()
+        if not args.quiet:
+            _stderr_print(
+                f"benchmark warmup {warmup_index + 1}/{args.warmup_runs} completed"
+            )
+
+    trials: list[dict[str, JsonValue]] = []
+    for trial_index in range(args.repeats):
+        if not args.quiet:
+            _stderr_print(f"benchmark trial {trial_index + 1}/{args.repeats} started")
+        wall_start = time.perf_counter()
+        games, inference_stats = run_trial()
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        examples = flatten_selfplay_examples(games)
+        examples_generated = len(examples)
+        games_generated = len(games)
+        wall_seconds = wall_ms / 1000.0
+        trials.append(
+            {
+                "trial_index": trial_index + 1,
+                "wall_ms": wall_ms,
+                "games_generated": games_generated,
+                "examples_generated": examples_generated,
+                "games_per_second": _safe_float_divide(games_generated, wall_seconds),
+                "examples_per_second": _safe_float_divide(
+                    examples_generated,
+                    wall_seconds,
+                ),
+                "outcomes": _outcome_counts(games),
+                "search_metrics": _summarize_example_search_metrics(examples),
+                "inference_stats": (
+                    inference_stats.to_dict()
+                    if inference_stats is not None
+                    else None
+                ),
+            }
+        )
+        if not args.quiet:
+            _stderr_print(
+                "benchmark trial "
+                f"{trial_index + 1}/{args.repeats} completed: "
+                f"wall_ms={wall_ms:.2f} examples={examples_generated}"
+            )
+
+    wall_times = [float(trial["wall_ms"]) for trial in trials]
+    trial_examples = [int(trial["examples_generated"]) for trial in trials]
+    trial_games = [int(trial["games_generated"]) for trial in trials]
+    average_search_metrics = _average_numeric_metrics(
+        [
+            dict(trial["search_metrics"])
+            for trial in trials
+            if isinstance(trial.get("search_metrics"), dict)
+        ]
+    )
+    average_inference_stats = _average_numeric_metrics(
+        [
+            dict(trial["inference_stats"])
+            for trial in trials
+            if isinstance(trial.get("inference_stats"), dict)
+        ]
+    )
+    workload_digest = stable_digest(
+        {
+            "initial_states": [state.to_dict() for state in initial_states],
+            "games": args.games,
+            "workers": args.workers,
+            "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+            "batched_inference": args.batched_inference,
+            "config": {
+                "simulations": config.simulations,
+                "max_plies": config.max_plies,
+                "opening_temperature": config.opening_temperature,
+                "final_temperature": config.final_temperature,
+                "temperature_drop_after_ply": config.temperature_drop_after_ply,
+                "c_puct": config.c_puct,
+                "root_dirichlet_alpha": config.root_dirichlet_alpha,
+                "root_exploration_fraction": config.root_exploration_fraction,
+                "seed": config.seed,
+                "adjudicate_max_plies": config.adjudicate_max_plies,
+                "adjudication_threshold": config.adjudication_threshold,
+            },
+        }
+    )
+    benchmark_summary = {
+        "repeats": args.repeats,
+        "warmup_runs": args.warmup_runs,
+        "wall_ms_total": sum(wall_times),
+        "wall_ms_average": _safe_float_divide(sum(wall_times), len(wall_times)),
+        "wall_ms_min": min(wall_times),
+        "wall_ms_max": max(wall_times),
+        "games_generated_total": sum(trial_games),
+        "examples_generated_total": sum(trial_examples),
+        "games_per_second_average": _safe_float_divide(
+            sum(int(trial["games_generated"]) for trial in trials),
+            sum(wall_times) / 1000.0,
+        ),
+        "examples_per_second_average": _safe_float_divide(
+            sum(int(trial["examples_generated"]) for trial in trials),
+            sum(wall_times) / 1000.0,
+        ),
+        "used_model": args.checkpoint is not None,
+        "seed_state_count": len(initial_states),
+        "workload_digest": workload_digest,
+    }
+    payload = {
+        "status": "ok",
+        "benchmark_summary": benchmark_summary,
+        "average_search_metrics": average_search_metrics,
+        "average_inference_stats": average_inference_stats,
+        "trials": trials,
+        "workers": args.workers,
+        "batched_inference": args.batched_inference,
+        "inference_device": args.inference_device or args.device,
+        "selfplay_device": args.selfplay_device or args.device,
+        "randomized_special_pieces": args.randomize_handauthored_specials,
+        "special_piece_dir": (
+            str(args.special_piece_dir)
+            if args.randomize_handauthored_specials
+            else None
+        ),
+        "special_piece_inclusion_probability": (
+            args.special_piece_inclusion_probability
+            if args.randomize_handauthored_specials
+            else None
+        ),
+        "config": {
+            "games": args.games,
+            "simulations": config.simulations,
+            "max_plies": config.max_plies,
+            "opening_temperature": config.opening_temperature,
+            "final_temperature": config.final_temperature,
+            "temperature_drop_after_ply": config.temperature_drop_after_ply,
+            "c_puct": config.c_puct,
+            "root_dirichlet_alpha": config.root_dirichlet_alpha,
+            "root_exploration_fraction": config.root_exploration_fraction,
+            "seed": config.seed,
+            "adjudicate_max_plies": config.adjudicate_max_plies,
+            "adjudication_threshold": config.adjudication_threshold,
+        },
+        **checkpoint_metadata,
+    }
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(canonical_json(payload, indent=2), encoding="utf-8")
+    if args.manifest_out is not None:
+        write_run_manifest(
+            args.manifest_out,
+            command="bench-throughput",
+            args={
+                "games": args.games,
+                "workers": args.workers,
+                "repeats": args.repeats,
+                "warmup_runs": args.warmup_runs,
+                "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+                "batched_inference": args.batched_inference,
+                "inference_device": args.inference_device or args.device,
+                "inference_batch_size": args.inference_batch_size,
+                "inference_max_wait_ms": args.inference_max_wait_ms,
+                "simulations": config.simulations,
+                "max_plies": config.max_plies,
+                "seed": config.seed,
+                "randomize_handauthored_specials": args.randomize_handauthored_specials,
+                "special_piece_inclusion_probability": args.special_piece_inclusion_probability,
+            },
+            artifacts={
+                "output": str(args.output) if args.output is not None else None,
+                "workload_digest": workload_digest,
+                "games_per_second_average": benchmark_summary["games_per_second_average"],
+                "examples_per_second_average": benchmark_summary["examples_per_second_average"],
+                "average_search_metrics": average_search_metrics,
+                "average_inference_stats": average_inference_stats,
+            },
+        )
+    print(canonical_json(payload, indent=2))
+    return 0
+
+
 def _handle_train_loop(args: argparse.Namespace) -> int:
     if args.cycles < 1:
         raise ValueError("--cycles must be at least 1")
@@ -1031,6 +1518,12 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         raise ValueError("--val-games must be at least 1")
     if args.use_verified_pieces and not args.randomize_handauthored_specials:
         raise ValueError("--use-verified-pieces requires randomized special-piece openings")
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.viewer and args.workers != 1:
+        raise ValueError("--viewer requires --workers 1")
+    if args.batched_inference and args.workers == 1:
+        raise ValueError("--batched-inference requires --workers greater than 1")
     if args.best_checkpoint is not None and not args.promotion_gate:
         raise ValueError("--best-checkpoint requires --promotion-gate")
     if args.best_checkpoint_out is not None and not args.promotion_gate:
@@ -1142,22 +1635,51 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             special_piece_classes=special_piece_classes,
             inclusion_probability=args.special_piece_inclusion_probability,
         )
-        train_games = generate_selfplay_games(
-            train_states,
-            games=args.train_games,
-            config=selfplay_config,
-            policy_value_model=None if args.no_guided_selfplay else model,
-            progress_callback=(
-                None
-                if args.quiet
-                else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
-            ),
-            trace_callback=_build_selfplay_viewer_trace_callback(
-                viewer,
-                cycle=cycle_index,
-                phase="train_selfplay",
-            ),
+        selfplay_progress_logger = (
+            None
+            if args.quiet
+            else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
         )
+        train_checkpoint_for_workers = (
+            previous_checkpoint_path
+            if model is not None and not args.no_guided_selfplay
+            else None
+        )
+        parallel_selfplay_device = args.selfplay_device or args.device
+        inference_config = (
+            BatchedInferenceConfig(
+                max_batch_size=args.inference_batch_size,
+                max_wait_ms=args.inference_max_wait_ms,
+            )
+            if args.batched_inference
+            else None
+        )
+        train_inference_stats = None
+        if args.workers == 1:
+            train_games = generate_selfplay_games(
+                train_states,
+                games=args.train_games,
+                config=selfplay_config,
+                policy_value_model=None if args.no_guided_selfplay else model,
+                progress_callback=selfplay_progress_logger,
+                trace_callback=_build_selfplay_viewer_trace_callback(
+                    viewer,
+                    cycle=cycle_index,
+                    phase="train_selfplay",
+                ),
+            )
+        else:
+            train_games, train_inference_stats = generate_selfplay_games_parallel(
+                train_states,
+                games=args.train_games,
+                workers=args.workers,
+                config=selfplay_config,
+                checkpoint_path=train_checkpoint_for_workers,
+                device=parallel_selfplay_device,
+                batched_inference_config=inference_config,
+                inference_device=args.inference_device or args.device,
+                progress_callback=selfplay_progress_logger,
+            )
         _annotate_games_with_registry(
             train_games,
             registry_path=args.piece_registry,
@@ -1169,6 +1691,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             phase="train_selfplay",
         )
         train_examples = flatten_selfplay_examples(train_games)
+        train_search_metrics = _summarize_example_search_metrics(train_examples)
         train_games_path = data_dir / f"cycle_{cycle_index:03d}_train_games.jsonl"
         train_examples_path = data_dir / f"cycle_{cycle_index:03d}_train_examples.jsonl"
         write_selfplay_games_jsonl(train_games_path, train_games)
@@ -1246,22 +1769,40 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             special_piece_classes=special_piece_classes,
             inclusion_probability=args.special_piece_inclusion_probability,
         )
-        val_games = generate_selfplay_games(
-            val_states,
-            games=args.val_games,
-            config=val_config,
-            policy_value_model=None if args.no_guided_selfplay else model,
-            progress_callback=(
-                None
-                if args.quiet
-                else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
-            ),
-            trace_callback=_build_selfplay_viewer_trace_callback(
-                viewer,
-                cycle=cycle_index,
-                phase="val_selfplay",
-            ),
-        )
+        val_inference_stats = None
+        if args.workers == 1:
+            val_games = generate_selfplay_games(
+                val_states,
+                games=args.val_games,
+                config=val_config,
+                policy_value_model=None if args.no_guided_selfplay else model,
+                progress_callback=(
+                    None
+                    if args.quiet
+                    else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
+                ),
+                trace_callback=_build_selfplay_viewer_trace_callback(
+                    viewer,
+                    cycle=cycle_index,
+                    phase="val_selfplay",
+                ),
+            )
+        else:
+            val_games, val_inference_stats = generate_selfplay_games_parallel(
+                val_states,
+                games=args.val_games,
+                workers=args.workers,
+                config=val_config,
+                checkpoint_path=None if args.no_guided_selfplay else checkpoint_path,
+                device=parallel_selfplay_device,
+                batched_inference_config=inference_config,
+                inference_device=args.inference_device or args.device,
+                progress_callback=(
+                    None
+                    if args.quiet
+                    else _build_selfplay_progress_logger(log_every_plies=args.log_every_plies)
+                ),
+            )
         _annotate_games_with_registry(
             val_games,
             registry_path=args.piece_registry,
@@ -1273,6 +1814,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             phase="val_selfplay",
         )
         val_examples = flatten_selfplay_examples(val_games)
+        val_search_metrics = _summarize_example_search_metrics(val_examples)
         val_games_path = data_dir / f"cycle_{cycle_index:03d}_val_games.jsonl"
         val_examples_path = data_dir / f"cycle_{cycle_index:03d}_val_examples.jsonl"
         write_selfplay_games_jsonl(val_games_path, val_games)
@@ -1439,6 +1981,22 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "val_eval_metrics": val_eval_metrics.to_dict(),
             "root_dirichlet_alpha": selfplay_config.root_dirichlet_alpha,
             "root_exploration_fraction": selfplay_config.root_exploration_fraction,
+            "workers": args.workers,
+            "selfplay_device": args.selfplay_device or args.device,
+            "batched_inference": args.batched_inference,
+            "inference_device": args.inference_device or args.device,
+            "train_inference_stats": (
+                train_inference_stats.to_dict()
+                if train_inference_stats is not None
+                else None
+            ),
+            "train_search_metrics": train_search_metrics,
+            "val_inference_stats": (
+                val_inference_stats.to_dict()
+                if val_inference_stats is not None
+                else None
+            ),
+            "val_search_metrics": val_search_metrics,
             "used_verified_pieces": args.use_verified_pieces,
             "piece_registry": (
                 str(args.piece_registry) if args.use_verified_pieces else None
@@ -1472,6 +2030,39 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
     (args.output_dir / "summary.json").write_text(
         canonical_json(summary, indent=2),
         encoding="utf-8",
+    )
+    write_run_manifest(
+        args.output_dir / "manifest.json",
+        command="train-loop",
+        args={
+            "cycles": args.cycles,
+            "train_games": args.train_games,
+            "val_games": args.val_games,
+            "simulations": args.simulations,
+            "max_plies": args.max_plies,
+            "seed": args.seed,
+            "workers": args.workers,
+            "device": args.device,
+            "selfplay_device": args.selfplay_device,
+            "batched_inference": args.batched_inference,
+            "inference_device": args.inference_device,
+            "inference_batch_size": args.inference_batch_size,
+            "inference_max_wait_ms": args.inference_max_wait_ms,
+            "promotion_gate": args.promotion_gate,
+            "arena_games": args.arena_games,
+            "arena_simulations": args.arena_simulations,
+            "randomize_handauthored_specials": args.randomize_handauthored_specials,
+            "special_piece_inclusion_probability": args.special_piece_inclusion_probability,
+            "use_verified_pieces": args.use_verified_pieces,
+        },
+        artifacts={
+            "summary": str(args.output_dir / "summary.json"),
+            "latest_checkpoint": str(summary["latest_checkpoint"]),
+            "best_checkpoint": str(summary["best_checkpoint"]),
+            "metrics_dir": str(metrics_dir),
+            "selfplay_dir": str(data_dir),
+            "arena_dir": str(arena_dir) if args.promotion_gate else None,
+        },
     )
     print(canonical_json(summary, indent=2))
     _finish_live_viewer(args, viewer)
@@ -1655,6 +2246,106 @@ def _outcome_counts(games: list[object]) -> dict[str, int]:
         outcome = str(game.outcome)
         counts[outcome] = counts.get(outcome, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _summarize_example_search_metrics(
+    examples: list[object],
+) -> dict[str, JsonValue] | None:
+    int_fields = (
+        "simulations",
+        "simulations_completed",
+        "expanded_nodes",
+        "terminal_expansions",
+        "heuristic_evaluations",
+        "model_inference_calls",
+        "applied_moves",
+        "terminal_checks",
+        "legal_move_generations",
+        "child_selection_calls",
+        "legal_move_count",
+    )
+    float_fields = (
+        "search_total_ms",
+        "search_expand_ms",
+        "search_terminal_check_ms",
+        "search_legal_moves_ms",
+        "search_model_inference_ms",
+        "search_evaluator_ms",
+        "search_apply_move_ms",
+        "search_child_selection_ms",
+    )
+    int_totals = {field: 0 for field in int_fields}
+    float_totals = {field: 0.0 for field in float_fields}
+    plies = 0
+    for example in examples:
+        metadata = dict(getattr(example, "metadata", {}) or {})
+        if "search_total_ms" not in metadata:
+            continue
+        plies += 1
+        for field in int_fields:
+            value = metadata.get(field)
+            if value is not None:
+                int_totals[field] += int(value)
+        for field in float_fields:
+            value = metadata.get(field)
+            if value is not None:
+                float_totals[field] += float(value)
+
+    if plies == 0:
+        return None
+
+    total_search_seconds = float_totals["search_total_ms"] / 1000.0
+    search_metrics: dict[str, JsonValue] = {
+        "plies": plies,
+        "avg_search_ms": _safe_float_divide(float_totals["search_total_ms"], plies),
+        "plies_per_search_second": _safe_float_divide(plies, total_search_seconds),
+        "expanded_nodes_per_search_second": _safe_float_divide(
+            int_totals["expanded_nodes"],
+            total_search_seconds,
+        ),
+        "model_inference_calls_per_search_second": _safe_float_divide(
+            int_totals["model_inference_calls"],
+            total_search_seconds,
+        ),
+    }
+    search_metrics.update(
+        {field: total for field, total in int_totals.items()}
+    )
+    search_metrics.update(
+        {field: total for field, total in float_totals.items()}
+    )
+    for field, total in int_totals.items():
+        search_metrics[f"avg_{field}"] = _safe_float_divide(total, plies)
+    for field, total in float_totals.items():
+        search_metrics[f"avg_{field}"] = _safe_float_divide(total, plies)
+    return search_metrics
+
+
+def _average_numeric_metrics(
+    metrics_list: list[dict[str, JsonValue]],
+) -> dict[str, JsonValue] | None:
+    if not metrics_list:
+        return None
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for metrics in metrics_list:
+        for key, value in metrics.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            totals[key] = totals.get(key, 0.0) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+    if not totals:
+        return None
+    return {
+        key: _safe_float_divide(totals[key], counts[key])
+        for key in sorted(totals)
+    }
+
+
+def _safe_float_divide(numerator: float | int, denominator: float | int) -> float:
+    if denominator == 0:
+        return 0.0
+    return float(numerator) / float(denominator)
 
 
 def _copy_checkpoint_if_needed(source: Path, destination: Path) -> None:

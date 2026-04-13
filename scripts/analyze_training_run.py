@@ -56,6 +56,8 @@ def print_snapshot(output_dir: Path, *, top_moves: int) -> None:
 
     _print_cycle_metrics(output_dir)
     print()
+    _print_throughput_metrics(output_dir)
+    print()
     _print_promotion_gate(output_dir)
     print()
     _print_selfplay_summary(output_dir, split="train", top_moves=top_moves)
@@ -152,6 +154,85 @@ def _print_promotion_gate(output_dir: Path) -> None:
     else:
         print(
             "  latest_arena: initial champion selected; arena comparison starts on the next cycle."
+        )
+
+
+def _print_throughput_metrics(output_dir: Path) -> None:
+    metric_paths = sorted((output_dir / "metrics").glob("cycle_*.json"))
+    print("Throughput")
+    if not metric_paths:
+        print("  No metrics files found yet.")
+        return
+
+    print(
+        "  cycle  train_plies/s  val_plies/s  "
+        "train_avg_ms  val_avg_ms  train_batch  val_batch"
+    )
+    latest_payload: JsonObject | None = None
+    for path in metric_paths:
+        payload = _read_json_object(path)
+        if payload is None:
+            print(f"  {path.name}: unreadable or currently incomplete")
+            continue
+        latest_payload = payload
+        train_search = dict(payload.get("train_search_metrics") or {})
+        val_search = dict(payload.get("val_search_metrics") or {})
+        train_inference = dict(payload.get("train_inference_stats") or {})
+        val_inference = dict(payload.get("val_inference_stats") or {})
+        print(
+            "  "
+            f"{int(payload.get('cycle', 0)):>5}  "
+            f"{_fmt(train_search.get('plies_per_search_second')):>13}  "
+            f"{_fmt(val_search.get('plies_per_search_second')):>11}  "
+            f"{_fmt(train_search.get('avg_search_ms')):>12}  "
+            f"{_fmt(val_search.get('avg_search_ms')):>10}  "
+            f"{_fmt(train_inference.get('average_batch_size')):>11}  "
+            f"{_fmt(val_inference.get('average_batch_size')):>9}"
+        )
+
+    if latest_payload is None:
+        return
+
+    latest_train_search = dict(latest_payload.get("train_search_metrics") or {})
+    latest_val_search = dict(latest_payload.get("val_search_metrics") or {})
+    latest_train_inference = dict(latest_payload.get("train_inference_stats") or {})
+    latest_val_inference = dict(latest_payload.get("val_inference_stats") or {})
+
+    if latest_train_search:
+        print(
+            "  latest_train_search: "
+            f"expanded_nodes/s={_fmt(latest_train_search.get('expanded_nodes_per_search_second'))} "
+            f"model_calls/s={_fmt(latest_train_search.get('model_inference_calls_per_search_second'))} "
+            f"model_ms/ply={_fmt(latest_train_search.get('avg_search_model_inference_ms'))} "
+            f"movegen_ms/ply={_fmt(latest_train_search.get('avg_search_legal_moves_ms'))} "
+            f"apply_ms/ply={_fmt(latest_train_search.get('avg_search_apply_move_ms'))}"
+        )
+    if latest_val_search:
+        print(
+            "  latest_val_search: "
+            f"expanded_nodes/s={_fmt(latest_val_search.get('expanded_nodes_per_search_second'))} "
+            f"model_calls/s={_fmt(latest_val_search.get('model_inference_calls_per_search_second'))} "
+            f"model_ms/ply={_fmt(latest_val_search.get('avg_search_model_inference_ms'))} "
+            f"movegen_ms/ply={_fmt(latest_val_search.get('avg_search_legal_moves_ms'))} "
+            f"apply_ms/ply={_fmt(latest_val_search.get('avg_search_apply_move_ms'))}"
+        )
+    if latest_train_inference:
+        print(
+            "  latest_train_inference: "
+            f"req/s={_fmt(latest_train_inference.get('requests_per_second'))} "
+            f"batch={_fmt(latest_train_inference.get('average_batch_size'))} "
+            f"queue_wait_ms={_fmt(latest_train_inference.get('average_queue_wait_ms'))} "
+            f"latency_ms={_fmt(latest_train_inference.get('average_request_latency_ms'))} "
+            f"model_ms/batch={_fmt(latest_train_inference.get('average_model_ms_per_batch'))}"
+        )
+    if latest_val_inference:
+        print(
+            "  latest_val_inference: "
+            f"req/s={_fmt(latest_val_inference.get('requests_per_second'))} "
+            f"batch={_fmt(latest_val_inference.get('average_batch_size'))} "
+            f"queue_wait_ms={_fmt(latest_val_inference.get('average_queue_wait_ms'))} "
+            f"latency_ms={_fmt(latest_val_inference.get('average_request_latency_ms'))} "
+            f"model_ms/batch={_fmt(latest_val_inference.get('average_model_ms_per_batch'))}"
         )
 
 

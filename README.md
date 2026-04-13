@@ -23,6 +23,8 @@ The current foundation covers:
 - AlphaZero-style Dirichlet root noise for self-play exploration,
 - checkpoint save/load for model + optimizer state,
 - checkpoint arena evaluation and optional train-loop promotion gates,
+- deterministic per-game seeds and parallel self-play workers for cloud shakedowns,
+- PixieChess-Lite simulator stress checks and run manifests for reproducible scale runs,
 - real `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` CLI commands,
 - a local browser viewer for live self-play/training games and completed replay files,
 - a read-only training-run analyzer for monitoring train-loop artifacts and arena gates,
@@ -51,9 +53,13 @@ PYTHONPATH=src python3 -m pixie_solver selfplay --standard-initial-state --rando
 PYTHONPATH=src python3 -m pixie_solver train --examples data/selfplay/examples.jsonl --checkpoint-out checkpoints/model.pt --device mps
 PYTHONPATH=src python3 -m pixie_solver eval-model --checkpoint checkpoints/model.pt --examples data/selfplay/examples.jsonl --device mps
 PYTHONPATH=src python3 -m pixie_solver train-loop --output-dir runs/local_smoke --cycles 2 --train-games 20 --val-games 6 --device mps
+PYTHONPATH=src python3 -m pixie_solver stress-simulator --standard-initial-state --randomize-handauthored-specials --games 64 --max-plies 48 --output runs/local_stress/stress.json --manifest-out runs/local_stress/manifest.json
+PYTHONPATH=src python3 -m pixie_solver bench-throughput --standard-initial-state --games 32 --workers 8 --checkpoint checkpoints/model.pt --batched-inference --device cuda --selfplay-device cpu --inference-device cuda --simulations 16 --max-plies 8 --output runs/benchmarks/throughput.json
+PYTHONPATH=src python3 -m pixie_solver train-loop --output-dir runs/local_parallel --cycles 2 --train-games 40 --val-games 8 --workers 4 --promotion-gate --device mps
 PYTHONPATH=src python3 -m pixie_solver arena --candidate runs/local_smoke/checkpoints/model_002.pt --baseline runs/local_smoke/checkpoints/model_001.pt --games 20 --simulations 16 --device mps --output runs/local_smoke/arena/model_002_vs_001.json
 PYTHONPATH=src python3 -m pixie_solver view-replay --games runs/local_smoke/selfplay/cycle_001_train_games.jsonl --viewer-open-browser
 python3 scripts/analyze_training_run.py runs/local_smoke
+OUTPUT_DIR=runs/runpod_001 WORKERS=16 DEVICE=cuda SELFPLAY_DEVICE=cpu scripts/runpod_train_loop.sh
 ```
 
 `pixie train-loop` is the ergonomic local learning check: each cycle generates fresh self-play,
@@ -78,6 +84,23 @@ score rate, confidence interval, termination reasons, and a promotion decision. 
 `--promotion-gate` to `pixie train-loop` to maintain `checkpoints/best.pt`; after each
 cycle the latest candidate plays the current champion and only replaces it when
 `--promotion-score-threshold` is met.
+
+Use `--workers` on `pixie selfplay` or `pixie train-loop` for deterministic process-level
+parallel self-play. Each game gets a stable per-game seed derived from the base seed, so
+serial and parallel search-only runs are reproducible by game index. Viewer streaming stays
+serial and requires `--workers 1`. Add `--batched-inference --inference-device cuda`
+for model-guided parallel workers so CPU actors share one model-owning GPU process
+instead of loading one CUDA model per worker.
+
+`pixie stress-simulator` is the PixieChess-Lite volume check before cloud runs. It plays
+random legal games, verifies that generated legal moves can be applied, and replay-checks
+the final state hash. This is intentionally about deterministic simulator stability under
+volume, not exact FIDE edge-case coverage.
+
+`pixie bench-throughput` is the fixed throughput harness for config comparisons. It runs
+deterministic self-play workloads, reports end-to-end wall-clock games/examples per second,
+and also preserves the lower-level search and batched-inference timing breakdowns so you can
+tell whether a change helped move generation, model inference, queueing, or overall throughput.
 
 Add `--viewer` to `pixie selfplay` or `pixie train-loop` to start a local browser board at
 `127.0.0.1` and stream games as they are generated. The viewer renders magical pieces as their

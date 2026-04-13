@@ -47,7 +47,13 @@ def save_training_checkpoint(
         "optimizer_state_dict": optimizer_state_dict,
         "metadata": dict(metadata or {}),
     }
-    torch.save(payload, checkpoint_path)
+    temp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp")
+    try:
+        torch.save(payload, temp_path)
+        temp_path.replace(checkpoint_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def load_training_checkpoint(

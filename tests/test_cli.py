@@ -301,6 +301,7 @@ class CLITest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             games_path = Path(temp_dir) / "games.jsonl"
             examples_path = Path(temp_dir) / "examples.jsonl"
+            manifest_path = Path(temp_dir) / "manifest.json"
 
             result = self._run(
                 "selfplay",
@@ -314,6 +315,8 @@ class CLITest(unittest.TestCase):
                 str(games_path),
                 "--examples-out",
                 str(examples_path),
+                "--manifest-out",
+                str(manifest_path),
                 "--simulations",
                 "8",
                 "--max-plies",
@@ -335,13 +338,189 @@ class CLITest(unittest.TestCase):
             self.assertEqual(1, payload["seed_state_count"])
             self.assertTrue(payload["randomized_special_pieces"])
             self.assertFalse(payload["used_model"])
+            self.assertEqual(payload["examples_generated"], payload["search_metrics"]["plies"])
+            self.assertGreaterEqual(payload["search_metrics"]["avg_search_ms"], 0.0)
             self.assertIn("selfplay game 1/1 started", result.stderr)
             self.assertIn("selfplay game 1/1 completed", result.stderr)
             self.assertTrue(games_path.exists())
             self.assertTrue(examples_path.exists())
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("pixie-lite-v0", manifest["ruleset"])
+            self.assertEqual("selfplay", manifest["command"])
             games_lines = games_path.read_text(encoding="utf-8").strip().splitlines()
             game_payload = json.loads(games_lines[0])
             self.assertIn("phasing_rook", game_payload["replay_trace"]["initial_state"]["piece_classes"])
+
+    def test_selfplay_command_supports_parallel_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            games_path = Path(temp_dir) / "games.jsonl"
+            examples_path = Path(temp_dir) / "examples.jsonl"
+
+            result = self._run(
+                "selfplay",
+                "--standard-initial-state",
+                "--games",
+                "2",
+                "--workers",
+                "2",
+                "--games-out",
+                str(games_path),
+                "--examples-out",
+                str(examples_path),
+                "--simulations",
+                "2",
+                "--max-plies",
+                "1",
+                "--opening-temperature",
+                "0",
+                "--final-temperature",
+                "0",
+                "--temperature-drop-after-ply",
+                "0",
+                "--root-exploration-fraction",
+                "0",
+                "--seed",
+                "13",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(2, payload["games_generated"])
+            self.assertEqual(2, payload["workers"])
+            self.assertEqual(payload["examples_generated"], payload["search_metrics"]["plies"])
+            self.assertGreaterEqual(payload["search_metrics"]["plies_per_search_second"], 0.0)
+            self.assertTrue(games_path.exists())
+            self.assertEqual(2, len(games_path.read_text(encoding="utf-8").splitlines()))
+
+    def test_stress_simulator_command_reports_ok_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "stress.json"
+            manifest_path = Path(temp_dir) / "stress_manifest.json"
+
+            result = self._run(
+                "stress-simulator",
+                "--standard-initial-state",
+                "--no-randomize-handauthored-specials",
+                "--games",
+                "1",
+                "--max-plies",
+                "1",
+                "--seed",
+                "17",
+                "--output",
+                str(output_path),
+                "--manifest-out",
+                str(manifest_path),
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertTrue(payload["stress_summary"]["ok"])
+            self.assertTrue(output_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("pixie-lite-v0", manifest["ruleset"])
+
+    def test_bench_throughput_command_reports_wall_clock_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "bench.json"
+            manifest_path = Path(temp_dir) / "bench_manifest.json"
+
+            result = self._run(
+                "bench-throughput",
+                "--standard-initial-state",
+                "--games",
+                "2",
+                "--repeats",
+                "1",
+                "--output",
+                str(output_path),
+                "--manifest-out",
+                str(manifest_path),
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--seed",
+                "23",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual(1, payload["benchmark_summary"]["repeats"])
+            self.assertEqual(2, payload["benchmark_summary"]["games_generated_total"])
+            self.assertEqual(2, payload["benchmark_summary"]["examples_generated_total"])
+            self.assertGreaterEqual(payload["benchmark_summary"]["wall_ms_average"], 0.0)
+            self.assertGreaterEqual(
+                payload["benchmark_summary"]["examples_per_second_average"],
+                0.0,
+            )
+            self.assertIsNotNone(payload["average_search_metrics"])
+            self.assertIsNone(payload["average_inference_stats"])
+            self.assertEqual(1, len(payload["trials"]))
+            self.assertEqual(2, payload["trials"][0]["examples_generated"])
+            self.assertTrue(output_path.exists())
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("bench-throughput", manifest["command"])
+
+    def test_bench_throughput_command_supports_batched_inference(self) -> None:
+        model = PolicyValueModel(
+            PolicyValueConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "model.pt"
+            save_training_checkpoint(checkpoint_path, model=model)
+
+            result = self._run(
+                "bench-throughput",
+                "--standard-initial-state",
+                "--games",
+                "2",
+                "--workers",
+                "2",
+                "--repeats",
+                "1",
+                "--checkpoint",
+                str(checkpoint_path),
+                "--batched-inference",
+                "--device",
+                "cpu",
+                "--selfplay-device",
+                "cpu",
+                "--inference-device",
+                "cpu",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--seed",
+                "29",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertTrue(payload["batched_inference"])
+            self.assertIsNotNone(payload["average_inference_stats"])
+            self.assertGreaterEqual(
+                payload["average_inference_stats"]["average_batch_size"],
+                1.0,
+            )
+            self.assertIsNotNone(payload["average_search_metrics"])
 
     def test_train_command_writes_checkpoint_and_supports_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -600,6 +779,7 @@ class CLITest(unittest.TestCase):
             self.assertEqual(1, len(payload["cycles"]))
             self.assertTrue(Path(payload["latest_checkpoint"]).exists())
             self.assertTrue((output_dir / "summary.json").exists())
+            self.assertTrue((output_dir / "manifest.json").exists())
             self.assertTrue((output_dir / "metrics/cycle_001.json").exists())
             cycle = payload["cycles"][0]
             self.assertGreater(cycle["train_examples"], 0)

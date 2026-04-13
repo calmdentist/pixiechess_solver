@@ -24,6 +24,11 @@ from pixie_solver.eval.search_compare import (
     compare_search_modes,
 )
 from pixie_solver.eval.tactical import evaluate_tactical_suite
+from pixie_solver.eval.stress import (
+    SimulatorStressConfig,
+    SimulatorStressSummary,
+    run_simulator_stress,
+)
 
 __all__ = [
     "ModelEvalMetrics",
@@ -37,6 +42,8 @@ __all__ = [
     "SearchComparisonCase",
     "SearchComparisonConfig",
     "SearchComparisonSummary",
+    "SimulatorStressConfig",
+    "SimulatorStressSummary",
     "compare_search_modes",
     "decide_promotion",
     "evaluate_policy_value_model",
@@ -45,6 +52,7 @@ __all__ = [
     "run_checkpoint_arena",
     "run_checkpoint_arena_from_paths",
     "run_engine_match",
+    "run_simulator_stress",
     "summarize_replay",
     "write_arena_games_jsonl",
 ]
