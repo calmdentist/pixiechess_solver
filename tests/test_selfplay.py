@@ -147,6 +147,32 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(29, serial_games[0].metadata["seed"])
         self.assertEqual(seed_for_game(29, 2), serial_games[2].metadata["seed"])
 
+    def test_parallel_selfplay_reports_completion_progress_without_checkpoint(self) -> None:
+        config = SelfPlayConfig(
+            simulations=1,
+            max_plies=1,
+            opening_temperature=0.0,
+            final_temperature=0.0,
+            temperature_drop_after_ply=0,
+            seed=31,
+            root_exploration_fraction=0.0,
+        )
+        events = []
+
+        games, inference_stats = generate_selfplay_games_parallel(
+            [self.initial_state],
+            games=2,
+            workers=2,
+            config=config,
+            progress_callback=events.append,
+        )
+
+        self.assertIsNone(inference_stats)
+        self.assertEqual(2, len(games))
+        self.assertEqual(2, len(events))
+        self.assertTrue(all(event.event == "game_completed" for event in events))
+        self.assertTrue(all(event.used_model is False for event in events))
+
     def test_selfplay_game_contains_replay_and_labeled_examples(self) -> None:
         game = generate_selfplay_games([self.initial_state], games=1, config=self.config)[0]
 

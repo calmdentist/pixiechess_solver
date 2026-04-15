@@ -42,6 +42,21 @@ from pixie_solver.training import (
 )
 
 
+class CountingPolicyValueModel(PolicyValueModel):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.forward_calls = 0
+        self.forward_batch_calls = 0
+
+    def forward(self, state, legal_moves):
+        self.forward_calls += 1
+        return super().forward(state, legal_moves)
+
+    def forward_batch(self, requests):
+        self.forward_batch_calls += 1
+        return super().forward_batch(requests)
+
+
 class ModelTest(unittest.TestCase):
     def setUp(self) -> None:
         self.king = PieceClass(
@@ -190,6 +205,46 @@ class ModelTest(unittest.TestCase):
         self.assertGreaterEqual(run_result.metrics.average_policy_loss, 0.0)
         self.assertGreaterEqual(run_result.metrics.average_value_loss, 0.0)
         self.assertGreaterEqual(run_result.metrics.average_total_loss, 0.0)
+
+    def test_train_from_replays_uses_batched_forward_path(self) -> None:
+        games = generate_selfplay_games(
+            [self.state],
+            games=1,
+            config=SelfPlayConfig(
+                simulations=2,
+                max_plies=4,
+                opening_temperature=0.0,
+                final_temperature=0.0,
+                seed=11,
+            ),
+        )
+        examples = flatten_selfplay_examples(games)
+        model = CountingPolicyValueModel(
+            PolicyValueConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        run_result = train_from_replays(
+            examples,
+            model=model,
+            config=TrainingConfig(
+                epochs=1,
+                batch_size=2,
+                device="cpu",
+                shuffle=False,
+                model_config=model.config,
+            ),
+        )
+
+        self.assertEqual(len(examples), run_result.metrics.examples_seen)
+        self.assertGreater(model.forward_batch_calls, 0)
+        self.assertEqual(0, model.forward_calls)
 
     def test_training_checkpoint_round_trip(self) -> None:
         games = generate_selfplay_games(
