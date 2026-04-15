@@ -270,7 +270,7 @@ def _run_parallel_selfplay_jobs(
                         plies_played=int(game.metadata["plies_played"]),
                         outcome=game.outcome,
                         termination_reason=str(game.metadata["termination_reason"]),
-                        used_model=checkpoint_path is not None,
+                        used_model=checkpoint_payload is not None,
                     )
                 )
 

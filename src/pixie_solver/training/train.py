@@ -153,12 +153,25 @@ def train_from_replays(
             optimizer.zero_grad(set_to_none=True)
             batch_policy_loss = torch.zeros((), dtype=torch.float32, device=device)
             batch_value_loss = torch.zeros((), dtype=torch.float32, device=device)
-            valid_examples = 0
+            valid_batch = [
+                example
+                for example in batch
+                if example.legal_moves
+            ]
+            valid_examples = len(valid_batch)
 
-            for example in batch:
-                if not example.legal_moves:
-                    continue
-                forward_output = model_impl(example.state, example.legal_moves)
+            if valid_examples == 0:
+                continue
+
+            forward_outputs = model_impl.forward_batch(
+                tuple((example.state, example.legal_moves) for example in valid_batch)
+            )
+
+            for example, forward_output in zip(
+                valid_batch,
+                forward_outputs,
+                strict=True,
+            ):
                 if len(forward_output.move_ids) != len(example.legal_moves):
                     raise ValueError("model forward output must align with example legal moves")
 
@@ -180,11 +193,7 @@ def train_from_replays(
                 )
                 batch_policy_loss = batch_policy_loss + policy_loss
                 batch_value_loss = batch_value_loss + value_loss
-                valid_examples += 1
                 examples_seen += 1
-
-            if valid_examples == 0:
-                continue
 
             mean_policy_loss = batch_policy_loss / valid_examples
             mean_value_loss = batch_value_loss / valid_examples
