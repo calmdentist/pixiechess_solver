@@ -44,7 +44,7 @@ from pixie_solver.eval import (
     write_arena_games_jsonl,
 )
 from pixie_solver.llm import FrontierLLMClient, FrontierLLMPieceProgramProvider, LLMConfig
-from pixie_solver.model import PolicyValueConfig
+from pixie_solver.model import PolicyValueConfig, SUPPORTED_MODEL_ARCHITECTURES
 from pixie_solver.rules import (
     CompileRequest,
     JsonFileCompileProvider,
@@ -302,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--shuffle", dest="shuffle", action="store_true", help="Shuffle training examples before each epoch.")
     train_parser.add_argument("--no-shuffle", dest="shuffle", action="store_false", help="Disable example shuffling.")
     train_parser.set_defaults(shuffle=True)
+    train_parser.add_argument(
+        "--model-architecture",
+        choices=SUPPORTED_MODEL_ARCHITECTURES,
+        help="Model architecture for a fresh run. Only valid when not resuming.",
+    )
     train_parser.add_argument("--d-model", type=int, help="Transformer model width. Only valid when not resuming.")
     train_parser.add_argument("--num-heads", type=int, help="Transformer attention heads. Only valid when not resuming.")
     train_parser.add_argument("--num-layers", type=int, help="Transformer encoder layers. Only valid when not resuming.")
@@ -465,6 +470,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--num-layers", type=int, default=2, help="Transformer encoder layers for a fresh run.")
     train_loop_parser.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout for a fresh run.")
     train_loop_parser.add_argument("--feedforward-multiplier", type=int, default=2, help="Feedforward hidden-size multiplier for a fresh run.")
+    train_loop_parser.add_argument(
+        "--model-architecture",
+        choices=SUPPORTED_MODEL_ARCHITECTURES,
+        default=PolicyValueConfig().architecture,
+        help="Model architecture for a fresh run.",
+    )
     train_loop_parser.add_argument("--resume-checkpoint", type=Path, help="Optional checkpoint to resume the loop from.")
     train_loop_parser.add_argument("--promotion-gate", action="store_true", help="Run checkpoint arena after each cycle and keep a best/champion checkpoint.")
     train_loop_parser.add_argument("--best-checkpoint", type=Path, help="Optional existing champion checkpoint for --promotion-gate.")
@@ -1008,6 +1019,11 @@ def _handle_train(args: argparse.Namespace) -> int:
         model_config = resume_checkpoint.model_config
     else:
         model_config = PolicyValueConfig(
+            architecture=(
+                args.model_architecture
+                if args.model_architecture is not None
+                else PolicyValueConfig().architecture
+            ),
             d_model=args.d_model if args.d_model is not None else 192,
             num_heads=args.num_heads if args.num_heads is not None else 8,
             num_layers=args.num_layers if args.num_layers is not None else 4,
@@ -1079,13 +1095,7 @@ def _handle_train(args: argparse.Namespace) -> int:
                     "average_total_loss": run_result.metrics.average_total_loss,
                     "device": run_result.metrics.device,
                 },
-                "model_config": {
-                    "d_model": model_config.d_model,
-                    "num_heads": model_config.num_heads,
-                    "num_layers": model_config.num_layers,
-                    "dropout": model_config.dropout,
-                    "feedforward_multiplier": model_config.feedforward_multiplier,
-                },
+                "model_config": _model_config_summary(model_config),
             },
             indent=2,
         )
@@ -1115,13 +1125,7 @@ def _handle_eval_model(args: argparse.Namespace) -> int:
                 "examples_path": str(args.examples),
                 "examples_loaded": len(examples),
                 "metrics": metrics.to_dict(),
-                "model_config": {
-                    "d_model": checkpoint.model_config.d_model,
-                    "num_heads": checkpoint.model_config.num_heads,
-                    "num_layers": checkpoint.model_config.num_layers,
-                    "dropout": checkpoint.model_config.dropout,
-                    "feedforward_multiplier": checkpoint.model_config.feedforward_multiplier,
-                },
+                "model_config": _model_config_summary(checkpoint.model_config),
             },
             indent=2,
         )
@@ -1568,6 +1572,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
     model = None
     optimizer_state_dict = None
     model_config = PolicyValueConfig(
+        architecture=args.model_architecture,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -1977,6 +1982,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "val_games_path": str(val_games_path),
             "val_examples_path": str(val_examples_path),
             "training_metrics": _training_metrics_dict(training_run.metrics),
+            "model_config": _model_config_summary(model_config),
             "train_eval_metrics": train_eval_metrics.to_dict(),
             "val_eval_metrics": val_eval_metrics.to_dict(),
             "root_dirichlet_alpha": selfplay_config.root_dirichlet_alpha,
@@ -2021,6 +2027,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
     summary = {
         "status": "ok",
         "output_dir": str(args.output_dir),
+        "model_config": _model_config_summary(model_config),
         "cycles": cycle_summaries,
         "latest_checkpoint": cycle_summaries[-1]["checkpoint"],
         "latest_candidate_checkpoint": cycle_summaries[-1]["candidate_checkpoint"],
@@ -2044,6 +2051,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "workers": args.workers,
             "device": args.device,
             "selfplay_device": args.selfplay_device,
+            "model_architecture": args.model_architecture,
             "batched_inference": args.batched_inference,
             "inference_device": args.inference_device,
             "inference_batch_size": args.inference_batch_size,
@@ -2348,6 +2356,17 @@ def _safe_float_divide(numerator: float | int, denominator: float | int) -> floa
     return float(numerator) / float(denominator)
 
 
+def _model_config_summary(model_config: PolicyValueConfig) -> dict[str, JsonValue]:
+    return {
+        "architecture": model_config.architecture,
+        "d_model": model_config.d_model,
+        "num_heads": model_config.num_heads,
+        "num_layers": model_config.num_layers,
+        "dropout": model_config.dropout,
+        "feedforward_multiplier": model_config.feedforward_multiplier,
+    }
+
+
 def _copy_checkpoint_if_needed(source: Path, destination: Path) -> None:
     source_path = Path(source)
     destination_path = Path(destination)
@@ -2359,6 +2378,7 @@ def _copy_checkpoint_if_needed(source: Path, destination: Path) -> None:
 
 def _validate_resume_flags(args: argparse.Namespace) -> None:
     for field_name in (
+        "model_architecture",
         "d_model",
         "num_heads",
         "num_layers",

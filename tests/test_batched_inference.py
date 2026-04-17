@@ -12,8 +12,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from pixie_solver.core import standard_initial_state
-from pixie_solver.model import PolicyValueConfig, PolicyValueModel
+from pixie_solver.core import stable_move_id, standard_initial_state
+from pixie_solver.model import (
+    PolicyValueConfig,
+    PolicyValueModel,
+    build_policy_value_model,
+)
 from pixie_solver.simulator.movegen import legal_moves
 from pixie_solver.training import (
     BatchedInferenceConfig,
@@ -89,6 +93,37 @@ class BatchedInferenceTest(unittest.TestCase):
         self.assertGreaterEqual(stats.queue_wait_ms_total, 0.0)
         self.assertGreaterEqual(stats.to_dict()["average_batch_size"], 1.0)
         self.assertGreaterEqual(stats.to_dict()["requests_per_second"], 0.0)
+
+    def test_batched_inference_service_supports_world_conditioned_v2_checkpoint(self) -> None:
+        state = standard_initial_state()
+        moves = tuple(legal_moves(state))
+        model = build_policy_value_model(
+            PolicyValueConfig(
+                architecture="world_conditioned_v2",
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "world_conditioned.pt"
+            save_training_checkpoint(checkpoint_path, model=model)
+            with BatchedInferenceService(
+                checkpoint_path,
+                device="cpu",
+                config=BatchedInferenceConfig(max_batch_size=2, max_wait_ms=20.0),
+            ) as service:
+                output = service.client().infer(state, moves)
+                stats = service.stats()
+
+        self.assertEqual(set(stable_move_id(move) for move in moves), set(output.policy_logits))
+        self.assertGreaterEqual(output.value, -1.0)
+        self.assertLessEqual(output.value, 1.0)
+        self.assertEqual(1, stats.requests_completed)
 
 
 if __name__ == "__main__":

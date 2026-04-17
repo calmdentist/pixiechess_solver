@@ -30,6 +30,11 @@ class Move:
     def stable_id(self) -> str:
         return stable_move_id(self)
 
+    def to_action_intent(self) -> "ActionIntent":
+        from pixie_solver.core.action import action_intent_from_move
+
+        return action_intent_from_move(self)
+
     def to_dict(self) -> dict[str, JsonValue]:
         return {
             "piece_id": self.piece_id,
@@ -63,8 +68,20 @@ class Move:
             metadata=dict(data.get("metadata", {})),
         )
 
+    @classmethod
+    def from_action_intent(cls, action: "ActionIntent") -> "Move":
+        from pixie_solver.core.action import move_from_action_intent
+
+        return move_from_action_intent(action)
+
 
 def stable_move_id(move: Move) -> str:
     from pixie_solver.core.hash import stable_digest
 
     return stable_digest(move.to_dict())
+
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pixie_solver.core.action import ActionIntent

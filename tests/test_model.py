@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 
@@ -25,10 +27,14 @@ from pixie_solver.core import (
 )
 from pixie_solver.core.state import GameState
 from pixie_solver.model import (
+    BASELINE_MODEL_ARCHITECTURE,
     BoardEncoder,
     DSLFeatureEncoder,
     PolicyValueConfig,
     PolicyValueModel,
+    PolicyValueModelV2,
+    WORLD_CONDITIONED_MODEL_ARCHITECTURE,
+    build_policy_value_model,
 )
 from pixie_solver.simulator.movegen import legal_moves
 from pixie_solver.training import (
@@ -140,6 +146,11 @@ class ModelTest(unittest.TestCase):
         encoded = board_encoder.encode_state(self.state)
 
         self.assertEqual(("black_king", "white_king", "white_rook"), encoded.piece_ids)
+        self.assertEqual(
+            ("baseline_king", "baseline_king", "sumo_rook"),
+            encoded.piece_class_ids,
+        )
+        self.assertEqual(("baseline_king", "sumo_rook"), encoded.class_ids)
         self.assertEqual((3, 32), tuple(encoded.piece_tokens.shape))
         self.assertEqual((32,), tuple(encoded.global_token.shape))
         self.assertEqual(2, encoded.piece_index_by_id["white_rook"])
@@ -168,6 +179,28 @@ class ModelTest(unittest.TestCase):
         )
         self.assertGreaterEqual(infer_output.value, -1.0)
         self.assertLessEqual(infer_output.value, 1.0)
+
+    def test_build_policy_value_model_rejects_unknown_architecture(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported model architecture"):
+            build_policy_value_model(
+                PolicyValueConfig(architecture="future_v9"),
+                device="cpu",
+            )
+
+    def test_build_policy_value_model_supports_world_conditioned_v2(self) -> None:
+        model = build_policy_value_model(
+            PolicyValueConfig(
+                architecture=WORLD_CONDITIONED_MODEL_ARCHITECTURE,
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        self.assertIsInstance(model, PolicyValueModelV2)
 
     def test_train_from_replays_smoke(self) -> None:
         games = generate_selfplay_games(
@@ -303,6 +336,7 @@ class ModelTest(unittest.TestCase):
             loaded = load_training_checkpoint(checkpoint_path, device="cpu")
 
         self.assertEqual(32, loaded.model_config.d_model)
+        self.assertEqual(BASELINE_MODEL_ARCHITECTURE, loaded.model_config.architecture)
         self.assertEqual("unit_test", loaded.metadata["source"])
         self.assertIsNotNone(loaded.training_metrics)
         self.assertEqual(
@@ -319,6 +353,29 @@ class ModelTest(unittest.TestCase):
                 for name in original_state
             )
         )
+
+    def test_load_training_checkpoint_defaults_missing_architecture(self) -> None:
+        model = PolicyValueModel(
+            PolicyValueConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "legacy_model.pt"
+            save_training_checkpoint(checkpoint_path, model=model)
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            payload["model_config"].pop("architecture", None)
+            torch.save(payload, checkpoint_path)
+            loaded = load_training_checkpoint(checkpoint_path, device="cpu")
+
+        self.assertEqual(BASELINE_MODEL_ARCHITECTURE, loaded.model_config.architecture)
+        self.assertEqual(BASELINE_MODEL_ARCHITECTURE, loaded.model.config.architecture)
 
 
 if __name__ == "__main__":

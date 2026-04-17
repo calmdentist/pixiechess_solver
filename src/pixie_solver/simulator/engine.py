@@ -5,7 +5,12 @@ from pixie_solver.core.hash import stable_position_hash
 from pixie_solver.core.move import Move
 from pixie_solver.core.piece import BasePieceType, Color
 from pixie_solver.core.state import GameState
-from pixie_solver.simulator.movegen import is_in_check, king_for_color, legal_moves
+from pixie_solver.simulator.movegen import (
+    is_in_check,
+    king_for_color,
+    legal_moves,
+    legacy_legal_moves,
+)
 from pixie_solver.simulator.transition import apply_move_unchecked, other_color
 
 REPETITION_DRAW_COUNT = 3
@@ -13,7 +18,20 @@ FIFTY_MOVE_RULE_HALFMOVES = 100
 
 
 def apply_move(state: GameState, move: Move) -> tuple[GameState, StateDelta]:
-    legal = legal_moves(state)
+    legal_by_id = {candidate.stable_id(): candidate for candidate in legal_moves(state)}
+    move_id = move.stable_id()
+    if move_id not in legal_by_id:
+        raise ValueError(f"Illegal move: {move.to_dict()!r}")
+    from pixie_solver.simulator.resolution import apply_action_shadow_unchecked
+
+    return apply_action_shadow_unchecked(
+        state,
+        legal_by_id[move_id].to_action_intent(),
+    )
+
+
+def apply_move_legacy(state: GameState, move: Move) -> tuple[GameState, StateDelta]:
+    legal = legacy_legal_moves(state)
     if move not in legal:
         raise ValueError(f"Illegal move: {move.to_dict()!r}")
     return apply_move_unchecked(state, move)

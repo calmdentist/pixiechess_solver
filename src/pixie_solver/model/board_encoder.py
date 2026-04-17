@@ -15,20 +15,46 @@ from pixie_solver.model._features import (
     json_value_token,
     normalize_scalar,
     square_index,
+    stable_bucket,
 )
 from pixie_solver.model.dsl_encoder import DSLFeatureEncoder
+from pixie_solver.model.program_encoder import ProgramIRTokenEncoder, ProgramTokenSpec
+from pixie_solver.model.semantic_features import (
+    SEMANTIC_PROBE_FEATURES,
+    SemanticProbeSpec,
+    build_semantic_probe_specs,
+)
 
 STATE_VALUE_BUCKETS = 128
 STATE_FEATURES = 11
 GLOBAL_CLOCK_FEATURES = 6
+PROBE_NAMESPACE_BUCKETS = 64
+PROBE_LABEL_BUCKETS = 128
+CONTEXT_GLOBAL_TOKEN_TYPE = 0
+CONTEXT_ENTITY_TOKEN_TYPE = 1
+CONTEXT_PROGRAM_TOKEN_TYPE = 2
+CONTEXT_PROBE_TOKEN_TYPE = 3
 
 
 @dataclass(slots=True)
 class EncodedBoard:
     piece_ids: tuple[str, ...]
+    piece_class_ids: tuple[str, ...]
+    class_ids: tuple[str, ...]
     piece_tokens: Tensor
     global_token: Tensor
     piece_index_by_id: dict[str, int]
+    program_ids: tuple[str, ...]
+    program_token_specs: tuple[tuple[ProgramTokenSpec, ...], ...]
+    program_tokens: Tensor
+    probe_specs: tuple[SemanticProbeSpec, ...]
+    probe_tokens: Tensor
+    context_tokens: Tensor
+    context_token_type_ids: Tensor
+    context_global_index: int
+    context_piece_index_by_id: dict[str, int]
+    context_program_token_span_by_class_id: dict[str, tuple[int, int]]
+    context_probe_index_by_id: dict[str, int]
 
 
 class BoardEncoder(nn.Module):
@@ -37,12 +63,18 @@ class BoardEncoder(nn.Module):
         *,
         d_model: int = 192,
         dsl_encoder: DSLFeatureEncoder | None = None,
+        program_encoder: ProgramIRTokenEncoder | None = None,
         hidden_dim: int | None = None,
     ) -> None:
         super().__init__()
         inner_dim = d_model * 2 if hidden_dim is None else hidden_dim
         self.d_model = d_model
         self.dsl_encoder = DSLFeatureEncoder(d_model=d_model) if dsl_encoder is None else dsl_encoder
+        self.program_encoder = (
+            ProgramIRTokenEncoder(d_model=d_model, hidden_dim=inner_dim)
+            if program_encoder is None
+            else program_encoder
+        )
         self.square_embedding = nn.Embedding(65, d_model)
         self.color_embedding = nn.Embedding(len(COLOR_IDS) + 1, d_model)
         self.base_piece_embedding = nn.Embedding(len(BASE_PIECE_TYPE_IDS) + 1, d_model)
@@ -78,6 +110,19 @@ class BoardEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(inner_dim, d_model),
         )
+        self.probe_namespace_embedding = nn.Embedding(PROBE_NAMESPACE_BUCKETS + 1, d_model)
+        self.probe_label_embedding = nn.Embedding(PROBE_LABEL_BUCKETS + 1, d_model)
+        self.probe_numeric_projection = nn.Sequential(
+            nn.Linear(SEMANTIC_PROBE_FEATURES, inner_dim),
+            nn.GELU(),
+            nn.Linear(inner_dim, d_model),
+        )
+        self.probe_token_mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, inner_dim),
+            nn.GELU(),
+            nn.Linear(inner_dim, d_model),
+        )
 
     def encode_state(self, state: GameState) -> EncodedBoard:
         return self.forward(state)
@@ -90,6 +135,7 @@ class BoardEncoder(nn.Module):
             if piece.is_active
         )
         active_pieces = [state.piece_instances[piece_id] for piece_id in active_piece_ids]
+        piece_class_ids = tuple(piece.piece_class_id for piece in active_pieces)
         piece_index_by_id = {
             piece_id: index
             for index, piece_id in enumerate(active_piece_ids)
@@ -170,12 +216,72 @@ class BoardEncoder(nn.Module):
                 device=device,
             )
         )
+        global_token = self.global_token_mlp(global_token)
+
+        encoded_programs = self.program_encoder(
+            [unique_classes[class_id] for class_id in class_ids]
+        )
+        program_tokens, program_token_specs, context_program_token_span_by_class_id = self._flatten_program_tokens(
+            class_ids=class_ids,
+            encoded_programs=encoded_programs,
+            piece_count=len(active_piece_ids),
+        )
+        program_registry = {
+            class_id: program
+            for class_id, program in zip(class_ids, encoded_programs.programs, strict=True)
+        }
+        probe_specs = build_semantic_probe_specs(
+            state,
+            class_ids=class_ids,
+            piece_classes=unique_classes,
+            program_registry=program_registry,
+        )
+        probe_tokens = self._encode_probe_specs(probe_specs, device=device)
+        context_piece_index_by_id = {
+            piece_id: 1 + index
+            for index, piece_id in enumerate(active_piece_ids)
+        }
+        probe_start_index = 1 + len(active_piece_ids) + program_tokens.shape[0]
+        context_probe_index_by_id = {
+            probe_spec.probe_id: probe_start_index + index
+            for index, probe_spec in enumerate(probe_specs)
+        }
+        context_tokens = torch.cat(
+            (
+                global_token.unsqueeze(0),
+                piece_token_tensor,
+                program_tokens,
+                probe_tokens,
+            ),
+            dim=0,
+        )
+        context_token_type_ids = torch.tensor(
+            [CONTEXT_GLOBAL_TOKEN_TYPE]
+            + [CONTEXT_ENTITY_TOKEN_TYPE] * len(active_piece_ids)
+            + [CONTEXT_PROGRAM_TOKEN_TYPE] * program_tokens.shape[0]
+            + [CONTEXT_PROBE_TOKEN_TYPE] * probe_tokens.shape[0],
+            dtype=torch.long,
+            device=device,
+        )
 
         return EncodedBoard(
             piece_ids=active_piece_ids,
+            piece_class_ids=piece_class_ids,
+            class_ids=class_ids,
             piece_tokens=piece_token_tensor,
-            global_token=self.global_token_mlp(global_token),
+            global_token=global_token,
             piece_index_by_id=piece_index_by_id,
+            program_ids=encoded_programs.program_ids,
+            program_token_specs=program_token_specs,
+            program_tokens=program_tokens,
+            probe_specs=probe_specs,
+            probe_tokens=probe_tokens,
+            context_tokens=context_tokens,
+            context_token_type_ids=context_token_type_ids,
+            context_global_index=0,
+            context_piece_index_by_id=context_piece_index_by_id,
+            context_program_token_span_by_class_id=context_program_token_span_by_class_id,
+            context_probe_index_by_id=context_probe_index_by_id,
         )
 
     def _encode_piece_state(
@@ -230,3 +336,79 @@ class BoardEncoder(nn.Module):
     def _embed_scalar(self, embedding: nn.Embedding, token_id: int) -> Tensor:
         device = embedding.weight.device
         return embedding(torch.tensor(token_id, dtype=torch.long, device=device))
+
+    def _flatten_program_tokens(
+        self,
+        *,
+        class_ids: tuple[str, ...],
+        encoded_programs,
+        piece_count: int,
+    ) -> tuple[Tensor, tuple[tuple[ProgramTokenSpec, ...], ...], dict[str, tuple[int, int]]]:
+        device = self.square_embedding.weight.device
+        flattened_tokens: list[Tensor] = []
+        spans: dict[str, tuple[int, int]] = {}
+        offset = 1 + piece_count
+        for index, class_id in enumerate(class_ids):
+            token_specs = encoded_programs.token_specs[index]
+            token_count = len(token_specs)
+            if token_count == 0:
+                spans[class_id] = (offset, offset)
+                continue
+            program_tokens = encoded_programs.token_embeddings[index, :token_count]
+            flattened_tokens.append(program_tokens)
+            spans[class_id] = (offset, offset + token_count)
+            offset += token_count
+        if flattened_tokens:
+            token_tensor = torch.cat(flattened_tokens, dim=0)
+        else:
+            token_tensor = torch.zeros(
+                (0, self.d_model),
+                dtype=torch.float32,
+                device=device,
+            )
+        return token_tensor, encoded_programs.token_specs, spans
+
+    def _encode_probe_specs(
+        self,
+        probe_specs: tuple[SemanticProbeSpec, ...],
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        if not probe_specs:
+            return torch.zeros((0, self.d_model), dtype=torch.float32, device=device)
+        tokens = [
+            self._encode_probe_spec(probe_spec, device=device)
+            for probe_spec in probe_specs
+        ]
+        return torch.stack(tokens, dim=0)
+
+    def _encode_probe_spec(
+        self,
+        probe_spec: SemanticProbeSpec,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        token = self._embed_scalar(
+            self.probe_namespace_embedding,
+            stable_bucket(
+                "semantic_probe_namespace",
+                probe_spec.namespace,
+                PROBE_NAMESPACE_BUCKETS,
+            ),
+        )
+        token = token + self._embed_scalar(
+            self.probe_label_embedding,
+            stable_bucket(
+                "semantic_probe_label",
+                probe_spec.label,
+                PROBE_LABEL_BUCKETS,
+            ),
+        )
+        token = token + self.probe_numeric_projection(
+            torch.tensor(
+                probe_spec.numeric_features,
+                dtype=torch.float32,
+                device=device,
+            )
+        )
+        return self.probe_token_mlp(token)

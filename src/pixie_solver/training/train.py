@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 from pixie_solver.model.policy_value import (
     PolicyValueConfig,
     PolicyValueModel,
+    build_policy_value_model,
     resolve_device,
 )
 from pixie_solver.training.dataset import SelfPlayExample
@@ -99,7 +100,7 @@ def train_from_replays(
     _set_training_seed(active_config.seed)
     model_impl = model
     if model_impl is None:
-        model_impl = PolicyValueModel(active_config.model_config, device=device)
+        model_impl = build_policy_value_model(active_config.model_config, device=device)
     else:
         model_impl.to(device)
     model_impl.train()
