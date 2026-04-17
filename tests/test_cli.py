@@ -181,6 +181,7 @@ class CLITest(unittest.TestCase):
             registry_path = temp_path / "registry.json"
             out_dir = temp_path / "repaired"
             games_path = temp_path / "games.jsonl"
+            examples_path = temp_path / "examples.jsonl"
             patched_program = _war_automaton_with_forward_offset(2)
             record = append_verified_piece_version(
                 registry_path=registry_path,
@@ -204,6 +205,8 @@ class CLITest(unittest.TestCase):
                 "1",
                 "--games-out",
                 str(games_path),
+                "--examples-out",
+                str(examples_path),
                 "--simulations",
                 "1",
                 "--max-plies",
@@ -226,6 +229,69 @@ class CLITest(unittest.TestCase):
             self.assertEqual(record.dsl_digest, payload["verified_piece_digests"]["war_automaton"]["dsl_digest"])
             game_payload = json.loads(games_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertIn("piece_registry", game_payload["replay_trace"]["metadata"])
+            self.assertIn(
+                "active_verified_piece_digests",
+                game_payload["replay_trace"]["metadata"],
+            )
+            example_payload = json.loads(
+                examples_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertIn("verified_piece_digests", example_payload["metadata"])
+            self.assertIn("verified_piece_training_metadata", example_payload["metadata"])
+            verified_training_metadata = example_payload["metadata"]["verified_piece_training_metadata"]
+            self.assertNotIn("compile_response", verified_training_metadata["war_automaton"])
+
+    def test_selfplay_does_not_mark_foundation_examples_as_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            registry_path = temp_path / "registry.json"
+            out_dir = temp_path / "repaired"
+            examples_path = temp_path / "examples.jsonl"
+            patched_program = _war_automaton_with_forward_offset(2)
+            append_verified_piece_version(
+                registry_path=registry_path,
+                out_dir=out_dir,
+                program=patched_program,
+                description="Verified repaired automaton.",
+                source="test",
+                verified_cases=1,
+            )
+
+            result = self._run(
+                "selfplay",
+                "--standard-initial-state",
+                "--randomize-handauthored-specials",
+                "--use-verified-pieces",
+                "--piece-registry",
+                str(registry_path),
+                "--special-piece-inclusion-probability",
+                "0.0",
+                "--games",
+                "1",
+                "--examples-out",
+                str(examples_path),
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--opening-temperature",
+                "0",
+                "--final-temperature",
+                "0",
+                "--temperature-drop-after-ply",
+                "0",
+                "--seed",
+                "41",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            example_payload = json.loads(
+                examples_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertNotIn("verified_piece_digests", example_payload["metadata"])
+            self.assertNotIn("verified_piece_training_metadata", example_payload["metadata"])
+            self.assertEqual(str(registry_path), example_payload["metadata"]["piece_registry"])
 
     def test_piece_curriculum_command_repairs_and_writes_registry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -856,6 +922,20 @@ class CLITest(unittest.TestCase):
             self.assertEqual("bucket_balanced", cycle["replay_sampling_strategy"])
             self.assertEqual(cycle["replay_examples"], sum(cycle["replay_bucket_counts"].values()))
             self.assertGreater(cycle["val_examples"], 0)
+            self.assertEqual(cycle["train_games"], cycle["train_termination_summary"]["games"])
+            self.assertEqual(cycle["val_games"], cycle["val_termination_summary"]["games"])
+            self.assertEqual(
+                cycle["train_games"],
+                sum(cycle["train_termination_summary"]["termination_reasons"].values()),
+            )
+            self.assertEqual(
+                cycle["val_games"],
+                sum(cycle["val_termination_summary"]["termination_reasons"].values()),
+            )
+            self.assertGreaterEqual(cycle["train_termination_summary"]["max_plies_rate"], 0.0)
+            self.assertLessEqual(cycle["train_termination_summary"]["max_plies_rate"], 1.0)
+            self.assertGreaterEqual(cycle["val_termination_summary"]["max_plies_rate"], 0.0)
+            self.assertLessEqual(cycle["val_termination_summary"]["max_plies_rate"], 1.0)
             self.assertIn("average_policy_cross_entropy", cycle["train_eval_metrics"])
             self.assertIn("average_policy_cross_entropy", cycle["val_eval_metrics"])
 
@@ -987,6 +1067,10 @@ class CLITest(unittest.TestCase):
             self.assertEqual(1, second_cycle["curriculum_tasks_accepted"])
             self.assertEqual(1, first_cycle["verified_piece_count"])
             self.assertEqual(2, second_cycle["verified_piece_count"])
+            self.assertEqual(1.0, first_cycle["train_termination_summary"]["max_plies_rate"])
+            self.assertEqual(1.0, first_cycle["val_termination_summary"]["max_plies_rate"])
+            self.assertEqual(1.0, second_cycle["train_termination_summary"]["max_plies_rate"])
+            self.assertEqual(1.0, second_cycle["val_termination_summary"]["max_plies_rate"])
             self.assertEqual(first_cycle["train_examples"], first_cycle["replay_examples"])
             self.assertEqual(
                 first_cycle["train_examples"] + second_cycle["train_examples"],
@@ -1035,20 +1119,21 @@ class CLITest(unittest.TestCase):
             cycle_two_examples_path = Path(second_cycle["train_examples_path"])
             example_payload = json.loads(cycle_two_examples_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertIn("verified_piece_digests", example_payload["metadata"])
-            self.assertEqual(2, len(example_payload["metadata"]["verified_piece_digests"]))
             self.assertEqual(
                 str(registry_path),
                 example_payload["metadata"]["piece_registry"],
             )
-            example_registry_metadata = example_payload["metadata"]["verified_piece_record_metadata"]
-            self.assertEqual(
-                "capture_sprint",
-                example_registry_metadata[first_teacher.piece_id]["metadata"]["family_id"],
+            example_registry_metadata = example_payload["metadata"]["verified_piece_training_metadata"]
+            self.assertLessEqual(len(example_registry_metadata), 2)
+            self.assertTrue(
+                set(example_registry_metadata).issubset(
+                    {first_teacher.piece_id, second_teacher.piece_id}
+                )
             )
-            self.assertEqual(
-                "turn_charge",
-                example_registry_metadata[second_teacher.piece_id]["metadata"]["family_id"],
-            )
+            for training_metadata in example_registry_metadata.values():
+                self.assertNotIn("compile_response", training_metadata)
+                self.assertIn("version", training_metadata)
+                self.assertIn("source", training_metadata)
 
     def test_train_loop_promotion_gate_records_best_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

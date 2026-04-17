@@ -25,6 +25,7 @@ from pixie_solver.rules.registry import (
     load_verified_piece_records,
     registry_piece_digest_metadata,
     registry_piece_record_metadata,
+    registry_piece_training_metadata,
 )
 from pixie_solver.rules.repair import (
     RepairResult,
@@ -57,5 +58,6 @@ __all__ = [
     "load_verified_piece_records",
     "registry_piece_digest_metadata",
     "registry_piece_record_metadata",
+    "registry_piece_training_metadata",
     "repair_and_verify_piece",
 ]

@@ -61,6 +61,7 @@ from pixie_solver.rules import (
     load_verified_piece_records,
     registry_piece_digest_metadata,
     registry_piece_record_metadata,
+    registry_piece_training_metadata,
     repair_and_verify_piece,
 )
 from pixie_solver.rules.repair import default_dsl_reference
@@ -1917,6 +1918,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         )
         train_examples = flatten_selfplay_examples(train_games)
         train_search_metrics = _summarize_example_search_metrics(train_examples)
+        train_termination_summary = _summarize_game_termination(train_games)
         train_games_path = data_dir / f"cycle_{cycle_index:03d}_train_games.jsonl"
         train_examples_path = data_dir / f"cycle_{cycle_index:03d}_train_examples.jsonl"
         write_selfplay_games_jsonl(train_games_path, train_games)
@@ -2057,6 +2059,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         )
         val_examples = flatten_selfplay_examples(val_games)
         val_search_metrics = _summarize_example_search_metrics(val_examples)
+        val_termination_summary = _summarize_game_termination(val_games)
         val_games_path = data_dir / f"cycle_{cycle_index:03d}_val_games.jsonl"
         val_examples_path = data_dir / f"cycle_{cycle_index:03d}_val_examples.jsonl"
         write_selfplay_games_jsonl(val_games_path, val_games)
@@ -2238,12 +2241,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 else None
             ),
             "train_search_metrics": train_search_metrics,
+            "train_termination_summary": train_termination_summary,
             "val_inference_stats": (
                 val_inference_stats.to_dict()
                 if val_inference_stats is not None
                 else None
             ),
             "val_search_metrics": val_search_metrics,
+            "val_termination_summary": val_termination_summary,
             "used_verified_pieces": args.use_verified_pieces,
             "piece_registry": (
                 str(args.piece_registry) if args.use_verified_pieces else None
@@ -2267,7 +2272,9 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 f"train_ce={train_eval_metrics.average_policy_cross_entropy:.4f} "
                 f"val_ce={val_eval_metrics.average_policy_cross_entropy:.4f} "
                 f"train_top1={train_eval_metrics.top1_agreement:.3f} "
-                f"val_top1={val_eval_metrics.top1_agreement:.3f}"
+                f"val_top1={val_eval_metrics.top1_agreement:.3f} "
+                f"train_cutoff_rate={train_termination_summary['max_plies_rate']:.3f} "
+                f"val_cutoff_rate={val_termination_summary['max_plies_rate']:.3f}"
             )
 
     summary = {
@@ -2459,16 +2466,34 @@ def _annotate_games_with_registry(
 ) -> None:
     if not verified_records:
         return
-    metadata = {
+    active_digest_metadata = registry_piece_digest_metadata(verified_records)
+    active_training_metadata = registry_piece_training_metadata(verified_records)
+    game_metadata = {
         "piece_registry": str(registry_path),
-        "verified_piece_digests": registry_piece_digest_metadata(verified_records),
-        "verified_piece_record_metadata": registry_piece_record_metadata(verified_records),
+        "active_verified_piece_digests": active_digest_metadata,
+        "active_verified_piece_training_metadata": active_training_metadata,
     }
     for game in games:
-        game.metadata.update(metadata)
-        game.replay_trace.metadata.update(metadata)
+        game.metadata.update(game_metadata)
+        game.replay_trace.metadata.update(game_metadata)
         for example in game.examples:
-            example.metadata.update(metadata)
+            example.metadata["piece_registry"] = str(registry_path)
+            present_piece_ids = _present_verified_piece_ids(
+                example.state,
+                active_digest_metadata=active_digest_metadata,
+            )
+            if not present_piece_ids:
+                example.metadata.pop("verified_piece_digests", None)
+                example.metadata.pop("verified_piece_training_metadata", None)
+                continue
+            example.metadata["verified_piece_digests"] = {
+                piece_id: active_digest_metadata[piece_id]
+                for piece_id in present_piece_ids
+            }
+            example.metadata["verified_piece_training_metadata"] = {
+                piece_id: active_training_metadata[piece_id]
+                for piece_id in present_piece_ids
+            }
 
 
 def _annotate_games_with_viewer_phase(
@@ -2486,6 +2511,20 @@ def _annotate_games_with_viewer_phase(
         game.replay_trace.metadata.update(metadata)
         for example in game.examples:
             example.metadata.update(metadata)
+
+
+def _present_verified_piece_ids(
+    state: GameState,
+    *,
+    active_digest_metadata: dict[str, JsonValue],
+) -> tuple[str, ...]:
+    active_piece_ids = set(active_digest_metadata)
+    present_piece_ids = {
+        piece_instance.piece_class_id
+        for piece_instance in state.piece_instances.values()
+        if piece_instance.piece_class_id in active_piece_ids
+    }
+    return tuple(sorted(present_piece_ids))
 
 
 def _safe_path_component(value: str) -> str:
@@ -2561,6 +2600,39 @@ def _outcome_counts(games: list[object]) -> dict[str, int]:
         outcome = str(game.outcome)
         counts[outcome] = counts.get(outcome, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _summarize_game_termination(games: list[object]) -> dict[str, JsonValue]:
+    termination_reasons: dict[str, int] = {}
+    cutoff_adjudication_outcomes: dict[str, int] = {}
+    for game in games:
+        metadata = dict(getattr(game, "metadata", {}) or {})
+        termination_reason = str(metadata.get("termination_reason", "unknown"))
+        termination_reasons[termination_reason] = (
+            termination_reasons.get(termination_reason, 0) + 1
+        )
+        cutoff_adjudication = metadata.get("cutoff_adjudication")
+        if isinstance(cutoff_adjudication, dict):
+            outcome = str(cutoff_adjudication.get("outcome", "unknown"))
+            cutoff_adjudication_outcomes[outcome] = (
+                cutoff_adjudication_outcomes.get(outcome, 0) + 1
+            )
+
+    total_games = len(games)
+    max_plies_games = termination_reasons.get("max_plies", 0)
+    adjudicated_cutoff_games = sum(cutoff_adjudication_outcomes.values())
+    return {
+        "games": total_games,
+        "termination_reasons": dict(sorted(termination_reasons.items())),
+        "max_plies_games": max_plies_games,
+        "max_plies_rate": _safe_float_divide(max_plies_games, total_games),
+        "adjudicated_cutoff_games": adjudicated_cutoff_games,
+        "adjudicated_cutoff_rate": _safe_float_divide(
+            adjudicated_cutoff_games,
+            total_games,
+        ),
+        "cutoff_adjudication_outcomes": dict(sorted(cutoff_adjudication_outcomes.items())),
+    }
 
 
 def _summarize_example_search_metrics(

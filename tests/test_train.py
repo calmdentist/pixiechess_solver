@@ -79,6 +79,21 @@ class TrainingCurriculumTest(unittest.TestCase):
             counts,
         )
 
+    def test_active_verified_pool_metadata_does_not_mark_example_as_verified(self) -> None:
+        foundation_example = _example(
+            cycle=2,
+            active_verified_piece_id="verified_piece",
+        )
+
+        self.assertEqual(
+            FOUNDATION_REPLAY_BUCKET,
+            replay_bucket_for_example(
+                foundation_example,
+                reference_cycle=5,
+                recent_cycle_window=1,
+            ),
+        )
+
     def test_bucket_balanced_sampler_uses_bucket_weights(self) -> None:
         config = TrainingConfig(
             sampling_strategy=BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
@@ -108,6 +123,7 @@ def _example(
     *,
     cycle: int,
     verified_piece_id: str | None = None,
+    active_verified_piece_id: str | None = None,
 ) -> SelfPlayExample:
     metadata: dict[str, object] = {"cycle": cycle}
     if verified_piece_id is not None:
@@ -115,6 +131,14 @@ def _example(
             verified_piece_id: {
                 "version": 1,
                 "dsl_digest": f"digest:{verified_piece_id}",
+                "source": "test",
+            }
+        }
+    if active_verified_piece_id is not None:
+        metadata["active_verified_piece_digests"] = {
+            active_verified_piece_id: {
+                "version": 1,
+                "dsl_digest": f"digest:{active_verified_piece_id}",
                 "source": "test",
             }
         }
