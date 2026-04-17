@@ -22,7 +22,11 @@ from pixie_solver.core import BasePieceType, Color, Modifier, PieceClass, PieceI
 from pixie_solver.core.state import GameState
 from pixie_solver.curriculum import generate_teacher_piece
 from pixie_solver.dsl import load_piece_program
-from pixie_solver.rules import StaticCompileProvider, append_verified_piece_version
+from pixie_solver.rules import (
+    StaticCompileProvider,
+    append_verified_piece_version,
+    load_verified_piece_records,
+)
 from pixie_solver.rules.mismatch import replace_piece_program
 from pixie_solver.simulator.engine import apply_move
 from pixie_solver.simulator.movegen import legal_moves
@@ -848,6 +852,9 @@ class CLITest(unittest.TestCase):
             cycle = payload["cycles"][0]
             self.assertEqual("baseline_v1", cycle["model_config"]["architecture"])
             self.assertGreater(cycle["train_examples"], 0)
+            self.assertEqual(cycle["train_examples"], cycle["replay_examples"])
+            self.assertEqual("bucket_balanced", cycle["replay_sampling_strategy"])
+            self.assertEqual(cycle["replay_examples"], sum(cycle["replay_bucket_counts"].values()))
             self.assertGreater(cycle["val_examples"], 0)
             self.assertIn("average_policy_cross_entropy", cycle["train_eval_metrics"])
             self.assertIn("average_policy_cross_entropy", cycle["val_eval_metrics"])
@@ -899,6 +906,149 @@ class CLITest(unittest.TestCase):
             self.assertEqual("world_conditioned_v2", payload["cycles"][0]["model_config"]["architecture"])
             checkpoint = load_training_checkpoint(payload["latest_checkpoint"], device="cpu")
             self.assertEqual("world_conditioned_v2", checkpoint.model_config.architecture)
+
+    def test_train_loop_runs_scheduled_curriculum_and_reloads_training_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "run"
+            registry_path = temp_path / "registry.json"
+            special_piece_dir = temp_path / "specials"
+            special_piece_dir.mkdir(parents=True, exist_ok=True)
+            special_piece_path = ROOT / "data/pieces/handauthored/phasing_rook.json"
+            special_piece_copy = special_piece_dir / special_piece_path.name
+            special_piece_copy.write_text(special_piece_path.read_text(encoding="utf-8"), encoding="utf-8")
+            first_teacher = generate_teacher_piece(seed=101, recipe="capture_sprint")
+            second_teacher = generate_teacher_piece(seed=202, recipe="turn_charge")
+
+            parser = cli_main.build_parser()
+            args = parser.parse_args(
+                [
+                    "train-loop",
+                    "--output-dir",
+                    str(output_dir),
+                    "--cycles",
+                    "2",
+                    "--train-games",
+                    "1",
+                    "--val-games",
+                    "1",
+                    "--simulations",
+                    "1",
+                    "--max-plies",
+                    "1",
+                    "--epochs-per-cycle",
+                    "1",
+                    "--batch-size",
+                    "1",
+                    "--device",
+                    "cpu",
+                    "--seed",
+                    "59",
+                    "--model-architecture",
+                    "baseline_v1",
+                    "--d-model",
+                    "32",
+                    "--num-heads",
+                    "4",
+                    "--num-layers",
+                    "1",
+                    "--dropout",
+                    "0",
+                    "--feedforward-multiplier",
+                    "2",
+                    "--special-piece-dir",
+                    str(special_piece_dir),
+                    "--special-piece-inclusion-probability",
+                    "1.0",
+                    "--piece-registry",
+                    str(registry_path),
+                    "--use-verified-pieces",
+                    "--curriculum-task",
+                    "1:101:capture_sprint:train:introduced",
+                    "--curriculum-task",
+                    "2:202:turn_charge:train:introduced",
+                    "--curriculum-oracle",
+                    "--quiet",
+                ]
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                returncode = args.handler(args)
+
+            self.assertEqual(0, returncode)
+            payload = json.loads(output.getvalue())
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual(2, len(payload["cycles"]))
+            first_cycle = payload["cycles"][0]
+            second_cycle = payload["cycles"][1]
+            self.assertEqual(1, first_cycle["curriculum_tasks_run"])
+            self.assertEqual(1, first_cycle["curriculum_tasks_accepted"])
+            self.assertEqual(1, second_cycle["curriculum_tasks_run"])
+            self.assertEqual(1, second_cycle["curriculum_tasks_accepted"])
+            self.assertEqual(1, first_cycle["verified_piece_count"])
+            self.assertEqual(2, second_cycle["verified_piece_count"])
+            self.assertEqual(first_cycle["train_examples"], first_cycle["replay_examples"])
+            self.assertEqual(
+                first_cycle["train_examples"] + second_cycle["train_examples"],
+                second_cycle["replay_examples"],
+            )
+            self.assertGreater(second_cycle["replay_bucket_counts"]["recent"], 0)
+            self.assertGreater(second_cycle["replay_bucket_counts"]["verified"], 0)
+            self.assertEqual(
+                first_teacher.teacher_program["piece_id"],
+                first_cycle["curriculum_results"][0]["synthetic_piece"]["piece_id"],
+            )
+            self.assertEqual(
+                second_teacher.teacher_program["piece_id"],
+                second_cycle["curriculum_results"][0]["synthetic_piece"]["piece_id"],
+            )
+            self.assertEqual(
+                "capture_sprint",
+                first_cycle["curriculum_results"][0]["synthetic_piece"]["recipe"],
+            )
+            self.assertEqual(
+                "turn_charge",
+                second_cycle["curriculum_results"][0]["synthetic_piece"]["recipe"],
+            )
+            records = load_verified_piece_records(registry_path)
+            self.assertEqual(2, len(records))
+            digests_by_piece = {
+                record.piece_id: record.dsl_digest
+                for record in records
+            }
+            self.assertEqual(
+                digests_by_piece[first_teacher.piece_id],
+                first_cycle["verified_piece_digests"][first_teacher.piece_id]["dsl_digest"],
+            )
+            self.assertIn(second_teacher.piece_id, second_cycle["verified_piece_digests"])
+            record_metadata = {
+                record.piece_id: dict(record.metadata)
+                for record in records
+            }
+            self.assertEqual("capture_sprint", record_metadata[first_teacher.piece_id]["family_id"])
+            self.assertEqual("train", record_metadata[first_teacher.piece_id]["split"])
+            self.assertEqual("introduced", record_metadata[first_teacher.piece_id]["novelty_tier"])
+            self.assertEqual(1, record_metadata[first_teacher.piece_id]["admission_cycle"])
+            self.assertEqual("turn_charge", record_metadata[second_teacher.piece_id]["family_id"])
+            self.assertEqual(2, record_metadata[second_teacher.piece_id]["admission_cycle"])
+
+            cycle_two_examples_path = Path(second_cycle["train_examples_path"])
+            example_payload = json.loads(cycle_two_examples_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertIn("verified_piece_digests", example_payload["metadata"])
+            self.assertEqual(2, len(example_payload["metadata"]["verified_piece_digests"]))
+            self.assertEqual(
+                str(registry_path),
+                example_payload["metadata"]["piece_registry"],
+            )
+            example_registry_metadata = example_payload["metadata"]["verified_piece_record_metadata"]
+            self.assertEqual(
+                "capture_sprint",
+                example_registry_metadata[first_teacher.piece_id]["metadata"]["family_id"],
+            )
+            self.assertEqual(
+                "turn_charge",
+                example_registry_metadata[second_teacher.piece_id]["metadata"]["family_id"],
+            )
 
     def test_train_loop_promotion_gate_records_best_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

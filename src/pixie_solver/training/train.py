@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from pixie_solver.model.policy_value import (
     PolicyValueConfig,
@@ -15,6 +15,16 @@ from pixie_solver.model.policy_value import (
     resolve_device,
 )
 from pixie_solver.training.dataset import SelfPlayExample
+
+UNIFORM_REPLAY_SAMPLING_STRATEGY = "uniform"
+BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY = "bucket_balanced"
+SUPPORTED_REPLAY_SAMPLING_STRATEGIES = (
+    UNIFORM_REPLAY_SAMPLING_STRATEGY,
+    BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
+)
+RECENT_REPLAY_BUCKET = "recent"
+VERIFIED_REPLAY_BUCKET = "verified"
+FOUNDATION_REPLAY_BUCKET = "foundation"
 
 
 class SelfPlayDataset(Dataset[SelfPlayExample]):
@@ -43,6 +53,12 @@ class TrainingConfig:
     device: str | None = None
     shuffle: bool = True
     seed: int = 0
+    sampling_strategy: str = UNIFORM_REPLAY_SAMPLING_STRATEGY
+    recent_cycle_window: int = 1
+    recent_bucket_weight: float = 1.0
+    verified_bucket_weight: float = 1.0
+    foundation_bucket_weight: float = 1.0
+    sampling_reference_cycle: int | None = None
     model_config: PolicyValueConfig = field(default_factory=PolicyValueConfig)
 
 
@@ -95,6 +111,21 @@ def train_from_replays(
         raise ValueError("epochs must be at least 1")
     if active_config.batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    if active_config.sampling_strategy not in SUPPORTED_REPLAY_SAMPLING_STRATEGIES:
+        supported = ", ".join(SUPPORTED_REPLAY_SAMPLING_STRATEGIES)
+        raise ValueError(
+            f"Unsupported replay sampling strategy {active_config.sampling_strategy!r}. "
+            f"Supported strategies: {supported}"
+        )
+    if active_config.recent_cycle_window < 1:
+        raise ValueError("recent_cycle_window must be at least 1")
+    for field_name, weight in (
+        ("recent_bucket_weight", active_config.recent_bucket_weight),
+        ("verified_bucket_weight", active_config.verified_bucket_weight),
+        ("foundation_bucket_weight", active_config.foundation_bucket_weight),
+    ):
+        if weight <= 0.0:
+            raise ValueError(f"{field_name} must be positive")
 
     device = resolve_device(active_config.device)
     _set_training_seed(active_config.seed)
@@ -105,10 +136,12 @@ def train_from_replays(
         model_impl.to(device)
     model_impl.train()
 
+    sampler = _build_replay_sampler(replays, active_config)
     data_loader = DataLoader(
         SelfPlayDataset(replays),
         batch_size=active_config.batch_size,
-        shuffle=active_config.shuffle,
+        shuffle=active_config.shuffle if sampler is None else False,
+        sampler=sampler,
         collate_fn=collate_selfplay_examples,
         num_workers=0,
         generator=_data_loader_generator(active_config.seed),
@@ -311,3 +344,123 @@ def _data_loader_generator(seed: int) -> torch.Generator:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return generator
+
+
+def replay_bucket_for_example(
+    example: SelfPlayExample,
+    *,
+    reference_cycle: int | None,
+    recent_cycle_window: int,
+) -> str:
+    example_cycle = _example_cycle(example)
+    if (
+        reference_cycle is not None
+        and example_cycle is not None
+        and example_cycle >= reference_cycle - recent_cycle_window + 1
+    ):
+        return RECENT_REPLAY_BUCKET
+    if _has_verified_piece_metadata(example):
+        return VERIFIED_REPLAY_BUCKET
+    return FOUNDATION_REPLAY_BUCKET
+
+
+def summarize_replay_buckets(
+    replays: Sequence[SelfPlayExample],
+    *,
+    config: TrainingConfig | None = None,
+) -> dict[str, int]:
+    active_config = TrainingConfig() if config is None else config
+    reference_cycle = _resolve_sampling_reference_cycle(
+        replays,
+        active_config.sampling_reference_cycle,
+    )
+    counts = {
+        FOUNDATION_REPLAY_BUCKET: 0,
+        VERIFIED_REPLAY_BUCKET: 0,
+        RECENT_REPLAY_BUCKET: 0,
+    }
+    for example in replays:
+        bucket = replay_bucket_for_example(
+            example,
+            reference_cycle=reference_cycle,
+            recent_cycle_window=active_config.recent_cycle_window,
+        )
+        counts[bucket] += 1
+    return counts
+
+
+def _build_replay_sampler(
+    replays: Sequence[SelfPlayExample],
+    config: TrainingConfig,
+) -> WeightedRandomSampler | None:
+    if config.sampling_strategy != BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY:
+        return None
+    reference_cycle = _resolve_sampling_reference_cycle(
+        replays,
+        config.sampling_reference_cycle,
+    )
+    weights = torch.tensor(
+        [
+            _bucket_weight_for_example(
+                example,
+                reference_cycle=reference_cycle,
+                config=config,
+            )
+            for example in replays
+        ],
+        dtype=torch.double,
+    )
+    return WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(replays),
+        replacement=True,
+    )
+
+
+def _bucket_weight_for_example(
+    example: SelfPlayExample,
+    *,
+    reference_cycle: int | None,
+    config: TrainingConfig,
+) -> float:
+    bucket = replay_bucket_for_example(
+        example,
+        reference_cycle=reference_cycle,
+        recent_cycle_window=config.recent_cycle_window,
+    )
+    if bucket == RECENT_REPLAY_BUCKET:
+        return float(config.recent_bucket_weight)
+    if bucket == VERIFIED_REPLAY_BUCKET:
+        return float(config.verified_bucket_weight)
+    return float(config.foundation_bucket_weight)
+
+
+def _resolve_sampling_reference_cycle(
+    replays: Sequence[SelfPlayExample],
+    configured_reference_cycle: int | None,
+) -> int | None:
+    if configured_reference_cycle is not None:
+        return configured_reference_cycle
+    cycle_values = [
+        cycle_value
+        for cycle_value in (_example_cycle(example) for example in replays)
+        if cycle_value is not None
+    ]
+    if not cycle_values:
+        return None
+    return max(cycle_values)
+
+
+def _example_cycle(example: SelfPlayExample) -> int | None:
+    value = example.metadata.get("cycle")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_verified_piece_metadata(example: SelfPlayExample) -> bool:
+    value = example.metadata.get("verified_piece_digests")
+    return isinstance(value, dict) and bool(value)
