@@ -72,6 +72,42 @@ class CurriculumTest(unittest.TestCase):
             self.assertEqual("synthetic_capture_sprint_1", records[0].piece_id)
             self.assertEqual(1, records[0].verified_cases)
 
+    def test_curriculum_writes_registry_metadata(self) -> None:
+        teacher = generate_teacher_piece(seed=1, recipe="capture_sprint")
+        candidate = _with_forward_offset(teacher.teacher_program, offset=1)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            registry_path = temp_path / "registry.json"
+            out_dir = temp_path / "repaired"
+            result = run_synthetic_piece_curriculum(
+                seed=1,
+                recipe="capture_sprint",
+                compile_provider=StaticCompileProvider(candidate),
+                repair_provider=StaticRepairProvider(teacher.teacher_program),
+                registry_path=str(registry_path),
+                out_dir=str(out_dir),
+                registry_metadata={
+                    "family_id": "capture_sprint",
+                    "split": "train",
+                    "novelty_tier": "introduced",
+                    "admission_cycle": 1,
+                    "task_id": "cycle_001:seed_101:capture_sprint:train:introduced",
+                },
+            )
+
+            self.assertTrue(result.accepted, result.verification_errors)
+            self.assertIsNotNone(result.registry_record)
+            metadata = dict(result.registry_record.metadata)
+            self.assertEqual("capture_sprint", metadata["family_id"])
+            self.assertEqual("train", metadata["split"])
+            self.assertEqual("introduced", metadata["novelty_tier"])
+            self.assertEqual(1, metadata["admission_cycle"])
+            self.assertEqual(
+                "cycle_001:seed_101:capture_sprint:train:introduced",
+                metadata["task_id"],
+            )
+
     def test_curriculum_rejects_mismatch_without_repair_provider(self) -> None:
         teacher = generate_teacher_piece(seed=1, recipe="capture_sprint")
         candidate = _with_forward_offset(teacher.teacher_program, offset=1)

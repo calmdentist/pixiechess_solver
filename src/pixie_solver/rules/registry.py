@@ -150,7 +150,14 @@ def load_verified_piece_records(path: str | Path) -> list[PieceRegistryRecord]:
 
 def load_verified_piece_classes(path: str | Path) -> list[PieceClass]:
     records = load_verified_piece_records(path)
-    return [compile_piece_file(_resolve_record_path(path, record)) for record in records]
+    return load_piece_classes_for_records(path, records)
+
+
+def load_piece_classes_for_records(
+    registry_path: str | Path,
+    records: list[PieceRegistryRecord],
+) -> list[PieceClass]:
+    return [compile_piece_file(_resolve_record_path(registry_path, record)) for record in records]
 
 
 def registry_piece_digest_metadata(
@@ -161,6 +168,19 @@ def registry_piece_digest_metadata(
             "version": record.version,
             "dsl_digest": record.dsl_digest,
             "source": record.source,
+        }
+        for record in records
+    }
+
+
+def registry_piece_record_metadata(
+    records: list[PieceRegistryRecord],
+) -> dict[str, JsonValue]:
+    return {
+        record.piece_id: {
+            "version": record.version,
+            "source": record.source,
+            "metadata": dict(record.metadata),
         }
         for record in records
     }

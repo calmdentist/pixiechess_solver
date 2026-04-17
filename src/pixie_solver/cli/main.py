@@ -7,7 +7,7 @@ import shutil
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from pixie_solver.gui import (
@@ -27,7 +27,10 @@ from pixie_solver.core import (
     sample_standard_initial_state,
     standard_initial_state,
 )
-from pixie_solver.curriculum import run_synthetic_piece_curriculum
+from pixie_solver.curriculum import (
+    generate_teacher_piece,
+    run_synthetic_piece_curriculum,
+)
 from pixie_solver.dsl.canonicalize import canonicalize_piece_program
 from pixie_solver.dsl.compiler import compile_piece_file
 from pixie_solver.dsl.parser import load_piece_program
@@ -49,15 +52,21 @@ from pixie_solver.rules import (
     CompileRequest,
     JsonFileCompileProvider,
     JsonFileRepairProvider,
+    StaticCompileProvider,
+    StaticRepairProvider,
     append_verified_piece_version,
     build_state_mismatch,
+    load_piece_classes_for_records,
     load_verified_piece_classes,
     load_verified_piece_records,
     registry_piece_digest_metadata,
+    registry_piece_record_metadata,
     repair_and_verify_piece,
 )
 from pixie_solver.rules.repair import default_dsl_reference
 from pixie_solver.training import (
+    BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
+    SUPPORTED_REPLAY_SAMPLING_STRATEGIES,
     SelfPlayConfig,
     SelfPlayProgress,
     BatchedInferenceConfig,
@@ -70,12 +79,31 @@ from pixie_solver.training import (
     save_training_checkpoint,
     read_selfplay_examples_jsonl,
     read_selfplay_games_jsonl,
+    summarize_replay_buckets,
     write_selfplay_examples_jsonl,
     write_selfplay_games_jsonl,
     train_from_replays,
 )
 from pixie_solver.utils import write_run_manifest
 from pixie_solver.utils.serialization import JsonValue, canonical_json
+
+TRAINING_CURRICULUM_SPLITS = {"train"}
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledCurriculumTask:
+    cycle: int
+    seed: int
+    recipe: str
+    split: str = "train"
+    novelty_tier: str = "introduced"
+
+    @property
+    def task_id(self) -> str:
+        return (
+            f"cycle_{self.cycle:03d}:seed_{self.seed}:{self.recipe}:"
+            f"{self.split}:{self.novelty_tier}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -323,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress logs on stderr and only print the final JSON summary.",
     )
+    _add_replay_sampling_args(train_parser, include_window_args=False)
     train_parser.set_defaults(handler=_handle_train)
 
     eval_model_parser = subparsers.add_parser(
@@ -489,10 +518,30 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard openings.")
     train_loop_parser.add_argument("--special-piece-dir", type=Path, default=Path("data/pieces/handauthored"), help="Directory of hand-authored piece JSON/YAML files.")
     train_loop_parser.add_argument("--special-piece-inclusion-probability", type=float, default=0.5, help="Special-piece inclusion probability.")
+    train_loop_parser.add_argument(
+        "--curriculum-task",
+        action="append",
+        help=(
+            "Optional scheduled synthetic curriculum task formatted as "
+            "cycle:seed:recipe[:split[:novelty_tier]]. "
+            "Example: 1:101:capture_sprint:train:introduced"
+        ),
+    )
+    train_loop_parser.add_argument(
+        "--curriculum-oracle",
+        action="store_true",
+        help="Use the synthetic teacher program as both compile and repair provider for scheduled curriculum tasks.",
+    )
     train_loop_parser.add_argument("--log-every-plies", type=int, default=8, help="Self-play progress frequency.")
     train_loop_parser.add_argument("--log-every-batches", type=int, default=10, help="Training progress frequency.")
     train_loop_parser.add_argument("--log-every-examples", type=int, default=25, help="Evaluation progress frequency.")
     train_loop_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
+    _add_replay_sampling_args(
+        train_loop_parser,
+        include_window_args=True,
+        default_strategy=BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
+    )
+    _add_llm_args(train_loop_parser)
     _add_viewer_args(train_loop_parser)
     train_loop_parser.set_defaults(handler=_handle_train_loop)
 
@@ -547,6 +596,51 @@ def _add_llm_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_replay_sampling_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_window_args: bool,
+    default_strategy: str = TrainingConfig().sampling_strategy,
+) -> None:
+    parser.add_argument(
+        "--replay-sampling-strategy",
+        choices=SUPPORTED_REPLAY_SAMPLING_STRATEGIES,
+        default=default_strategy,
+        help="Replay sampling strategy used for training batches.",
+    )
+    if include_window_args:
+        parser.add_argument(
+            "--replay-window-cycles",
+            type=int,
+            default=4,
+            help="Number of recent train-loop cycles retained in the replay window.",
+        )
+    parser.add_argument(
+        "--replay-recent-cycle-window",
+        type=int,
+        default=1,
+        help="Number of most-recent cycles treated as the recent replay bucket.",
+    )
+    parser.add_argument(
+        "--replay-recent-bucket-weight",
+        type=float,
+        default=3.0,
+        help="Sampling weight for recent-cycle replay examples when using bucket-balanced sampling.",
+    )
+    parser.add_argument(
+        "--replay-verified-bucket-weight",
+        type=float,
+        default=2.0,
+        help="Sampling weight for older verified-world replay examples when using bucket-balanced sampling.",
+    )
+    parser.add_argument(
+        "--replay-foundation-bucket-weight",
+        type=float,
+        default=1.0,
+        help="Sampling weight for older foundation replay examples when using bucket-balanced sampling.",
+    )
+
+
 def _add_viewer_args(
     parser: argparse.ArgumentParser,
     *,
@@ -598,6 +692,126 @@ def _build_llm_piece_provider(args: argparse.Namespace) -> FrontierLLMPieceProgr
         config_kwargs["effort"] = args.llm_effort
     config = LLMConfig(**config_kwargs)
     return FrontierLLMPieceProgramProvider(FrontierLLMClient(config))
+
+
+def _parse_scheduled_curriculum_tasks(
+    raw_tasks: list[str] | None,
+) -> tuple[ScheduledCurriculumTask, ...]:
+    if not raw_tasks:
+        return ()
+    tasks: list[ScheduledCurriculumTask] = []
+    for raw_task in raw_tasks:
+        parts = raw_task.split(":")
+        if len(parts) < 3 or len(parts) > 5:
+            raise ValueError(
+                "scheduled curriculum task must have format "
+                "cycle:seed:recipe[:split[:novelty_tier]]"
+            )
+        cycle_text, seed_text, recipe = parts[:3]
+        split = parts[3] if len(parts) >= 4 and parts[3] else "train"
+        novelty_tier = parts[4] if len(parts) >= 5 and parts[4] else "introduced"
+        try:
+            cycle = int(cycle_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"scheduled curriculum cycle must be an integer: {cycle_text!r}"
+            ) from exc
+        try:
+            seed = int(seed_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"scheduled curriculum seed must be an integer: {seed_text!r}"
+            ) from exc
+        if cycle < 1:
+            raise ValueError("scheduled curriculum cycle must be at least 1")
+        tasks.append(
+            ScheduledCurriculumTask(
+                cycle=cycle,
+                seed=seed,
+                recipe=recipe,
+                split=split,
+                novelty_tier=novelty_tier,
+            )
+        )
+    return tuple(
+        sorted(
+            tasks,
+            key=lambda task: (
+                task.cycle,
+                task.seed,
+                task.recipe,
+                task.split,
+                task.novelty_tier,
+            ),
+        )
+    )
+
+
+def _scheduled_curriculum_tasks_for_cycle(
+    tasks: tuple[ScheduledCurriculumTask, ...],
+    *,
+    cycle: int,
+) -> tuple[ScheduledCurriculumTask, ...]:
+    return tuple(task for task in tasks if task.cycle == cycle)
+
+
+def _run_scheduled_curriculum_tasks(
+    args: argparse.Namespace,
+    *,
+    cycle_index: int,
+    tasks: tuple[ScheduledCurriculumTask, ...],
+):
+    if not tasks:
+        return ()
+
+    live_provider = None
+    if not args.curriculum_oracle:
+        live_provider = _build_llm_piece_provider(args)
+
+    repaired_dir = args.output_dir / "curriculum" / "repaired"
+    results = []
+    for task in tasks:
+        if args.curriculum_oracle:
+            teacher = generate_teacher_piece(seed=task.seed, recipe=task.recipe)
+            compile_provider = StaticCompileProvider(teacher.teacher_program)
+            repair_provider = StaticRepairProvider(teacher.teacher_program)
+            provider_mode = "oracle"
+        else:
+            compile_provider = live_provider
+            repair_provider = live_provider
+            provider_mode = "live_llm"
+
+        result = run_synthetic_piece_curriculum(
+            seed=task.seed,
+            recipe=task.recipe,
+            compile_provider=compile_provider,
+            repair_provider=repair_provider,
+            registry_path=str(args.piece_registry),
+            out_dir=str(repaired_dir),
+            registry_metadata={
+                "scheduled": True,
+                "family_id": task.recipe,
+                "split": task.split,
+                "novelty_tier": task.novelty_tier,
+                "admission_cycle": cycle_index,
+                "task_id": task.task_id,
+                "provider_mode": provider_mode,
+            },
+        )
+        artifact_dir = (
+            args.output_dir
+            / "curriculum"
+            / f"cycle_{cycle_index:03d}"
+            / _safe_path_component(task.task_id)
+        )
+        _write_curriculum_artifacts(artifact_dir, result)
+        results.append(result)
+        if not result.accepted:
+            raise RuntimeError(
+                "scheduled curriculum task failed verification: "
+                f"{task.task_id}: {', '.join(result.verification_errors)}"
+            )
+    return tuple(results)
 
 
 def _handle_compile_piece(args: argparse.Namespace) -> int:
@@ -1045,8 +1259,14 @@ def _handle_train(args: argparse.Namespace) -> int:
         device=args.device,
         shuffle=args.shuffle,
         seed=args.seed,
+        sampling_strategy=args.replay_sampling_strategy,
+        recent_cycle_window=args.replay_recent_cycle_window,
+        recent_bucket_weight=args.replay_recent_bucket_weight,
+        verified_bucket_weight=args.replay_verified_bucket_weight,
+        foundation_bucket_weight=args.replay_foundation_bucket_weight,
         model_config=model_config,
     )
+    replay_bucket_counts = summarize_replay_buckets(examples, config=training_config)
     run_result = train_from_replays(
         examples,
         model=model,
@@ -1095,6 +1315,7 @@ def _handle_train(args: argparse.Namespace) -> int:
                     "average_total_loss": run_result.metrics.average_total_loss,
                     "device": run_result.metrics.device,
                 },
+                "replay_bucket_counts": replay_bucket_counts,
                 "model_config": _model_config_summary(model_config),
             },
             indent=2,
@@ -1516,6 +1737,8 @@ def _handle_bench_throughput(args: argparse.Namespace) -> int:
 def _handle_train_loop(args: argparse.Namespace) -> int:
     if args.cycles < 1:
         raise ValueError("--cycles must be at least 1")
+    if args.replay_window_cycles < 1:
+        raise ValueError("--replay-window-cycles must be at least 1")
     if args.train_games < 1:
         raise ValueError("--train-games must be at least 1")
     if args.val_games < 1:
@@ -1539,6 +1762,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             raise ValueError("--arena-simulations must be at least 1")
         if args.promotion_score_threshold < 0.0 or args.promotion_score_threshold > 1.0:
             raise ValueError("--promotion-score-threshold must be in [0, 1]")
+    scheduled_curriculum_tasks = _parse_scheduled_curriculum_tasks(args.curriculum_task)
 
     data_dir = args.output_dir / "selfplay"
     checkpoint_dir = args.output_dir / "checkpoints"
@@ -1550,25 +1774,6 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
     if args.promotion_gate:
         arena_dir.mkdir(parents=True, exist_ok=True)
 
-    verified_records = (
-        _load_verified_registry_records(args.piece_registry)
-        if args.use_verified_pieces
-        else []
-    )
-    handauthored_piece_classes = (
-        _load_piece_classes_from_directory(args.special_piece_dir)
-        if args.randomize_handauthored_specials
-        else ()
-    )
-    verified_piece_classes = (
-        load_verified_piece_classes(args.piece_registry)
-        if args.use_verified_pieces
-        else ()
-    )
-    special_piece_classes = _merge_piece_classes(
-        handauthored_piece_classes,
-        verified_piece_classes,
-    )
     model = None
     optimizer_state_dict = None
     model_config = PolicyValueConfig(
@@ -1614,9 +1819,24 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
 
     viewer = _start_live_viewer(args, enabled=args.viewer)
     cycle_summaries: list[dict[str, object]] = []
+    replay_example_window: list[list[object]] = []
     for cycle_index in range(1, args.cycles + 1):
         if not args.quiet:
             _stderr_print(f"=== train-loop cycle {cycle_index}/{args.cycles} ===")
+        curriculum_results = _run_scheduled_curriculum_tasks(
+            args,
+            cycle_index=cycle_index,
+            tasks=_scheduled_curriculum_tasks_for_cycle(
+                scheduled_curriculum_tasks,
+                cycle=cycle_index,
+            ),
+        )
+        verified_records, special_piece_classes = _load_special_piece_pool(
+            randomize_specials=args.randomize_handauthored_specials,
+            special_piece_dir=args.special_piece_dir,
+            use_verified_pieces=args.use_verified_pieces,
+            piece_registry=args.piece_registry,
+        )
         train_seed = args.seed + cycle_index * 1000
         val_seed = args.seed + cycle_index * 1000 + 999
 
@@ -1701,6 +1921,13 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         train_examples_path = data_dir / f"cycle_{cycle_index:03d}_train_examples.jsonl"
         write_selfplay_games_jsonl(train_games_path, train_games)
         write_selfplay_examples_jsonl(train_examples_path, train_examples)
+        replay_example_window.append(train_examples)
+        replay_example_window = replay_example_window[-args.replay_window_cycles:]
+        replay_examples = [
+            example
+            for cycle_examples in replay_example_window
+            for example in cycle_examples
+        ]
 
         training_config = TrainingConfig(
             epochs=args.epochs_per_cycle,
@@ -1712,10 +1939,20 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             device=args.device,
             shuffle=True,
             seed=train_seed,
+            sampling_strategy=args.replay_sampling_strategy,
+            recent_cycle_window=args.replay_recent_cycle_window,
+            recent_bucket_weight=args.replay_recent_bucket_weight,
+            verified_bucket_weight=args.replay_verified_bucket_weight,
+            foundation_bucket_weight=args.replay_foundation_bucket_weight,
+            sampling_reference_cycle=cycle_index,
             model_config=model_config,
         )
+        replay_bucket_counts = summarize_replay_buckets(
+            replay_examples,
+            config=training_config,
+        )
         training_run = train_from_replays(
-            train_examples,
+            replay_examples,
             model=model,
             optimizer_state_dict=optimizer_state_dict,
             config=training_config,
@@ -1977,6 +2214,10 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "train_examples": len(train_examples),
             "train_games_path": str(train_games_path),
             "train_examples_path": str(train_examples_path),
+            "replay_examples": len(replay_examples),
+            "replay_window_cycles": min(args.replay_window_cycles, len(replay_example_window)),
+            "replay_sampling_strategy": args.replay_sampling_strategy,
+            "replay_bucket_counts": replay_bucket_counts,
             "val_games": len(val_games),
             "val_examples": len(val_examples),
             "val_games_path": str(val_games_path),
@@ -2009,6 +2250,11 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             ),
             "verified_piece_count": len(verified_records),
             "verified_piece_digests": registry_piece_digest_metadata(verified_records),
+            "verified_piece_record_metadata": registry_piece_record_metadata(verified_records),
+            "special_piece_class_count": len(special_piece_classes),
+            "curriculum_results": [result.to_dict() for result in curriculum_results],
+            "curriculum_tasks_run": len(curriculum_results),
+            "curriculum_tasks_accepted": sum(1 for result in curriculum_results if result.accepted),
             "viewer_url": viewer.url if viewer is not None else None,
         }
         cycle_summaries.append(cycle_summary)
@@ -2056,6 +2302,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "inference_device": args.inference_device,
             "inference_batch_size": args.inference_batch_size,
             "inference_max_wait_ms": args.inference_max_wait_ms,
+            "replay_sampling_strategy": args.replay_sampling_strategy,
+            "replay_window_cycles": args.replay_window_cycles,
+            "replay_recent_cycle_window": args.replay_recent_cycle_window,
+            "replay_recent_bucket_weight": args.replay_recent_bucket_weight,
+            "replay_verified_bucket_weight": args.replay_verified_bucket_weight,
+            "replay_foundation_bucket_weight": args.replay_foundation_bucket_weight,
+            "curriculum_task": list(args.curriculum_task or []),
+            "curriculum_oracle": args.curriculum_oracle,
             "promotion_gate": args.promotion_gate,
             "arena_games": args.arena_games,
             "arena_simulations": args.arena_simulations,
@@ -2148,6 +2402,44 @@ def _load_verified_registry_records(registry_path: Path):
     return records
 
 
+def _records_for_training_pool(records):
+    filtered = []
+    for record in records:
+        split = record.metadata.get("split")
+        if split is None or str(split) in TRAINING_CURRICULUM_SPLITS:
+            filtered.append(record)
+    return filtered
+
+
+def _load_special_piece_pool(
+    *,
+    randomize_specials: bool,
+    special_piece_dir: Path,
+    use_verified_pieces: bool,
+    piece_registry: Path,
+):
+    handauthored_piece_classes = (
+        _load_piece_classes_from_directory(special_piece_dir)
+        if randomize_specials
+        else ()
+    )
+    verified_records = (
+        _load_verified_registry_records(piece_registry)
+        if use_verified_pieces
+        else []
+    )
+    active_verified_records = _records_for_training_pool(verified_records)
+    verified_piece_classes = (
+        load_piece_classes_for_records(piece_registry, active_verified_records)
+        if use_verified_pieces
+        else ()
+    )
+    return active_verified_records, _merge_piece_classes(
+        handauthored_piece_classes,
+        verified_piece_classes,
+    )
+
+
 def _merge_piece_classes(*groups) -> list[PieceClass]:
     merged: dict[str, PieceClass] = {}
     for group in groups:
@@ -2170,10 +2462,13 @@ def _annotate_games_with_registry(
     metadata = {
         "piece_registry": str(registry_path),
         "verified_piece_digests": registry_piece_digest_metadata(verified_records),
+        "verified_piece_record_metadata": registry_piece_record_metadata(verified_records),
     }
     for game in games:
         game.metadata.update(metadata)
         game.replay_trace.metadata.update(metadata)
+        for example in game.examples:
+            example.metadata.update(metadata)
 
 
 def _annotate_games_with_viewer_phase(
@@ -2189,6 +2484,18 @@ def _annotate_games_with_viewer_phase(
     for game in games:
         game.metadata.update(metadata)
         game.replay_trace.metadata.update(metadata)
+        for example in game.examples:
+            example.metadata.update(metadata)
+
+
+def _safe_path_component(value: str) -> str:
+    sanitized = "".join(
+        character
+        if character.isalnum() or character in {"-", "_", "."}
+        else "_"
+        for character in value
+    ).strip("._")
+    return sanitized or "item"
 
 
 def _write_curriculum_artifacts(artifact_dir: Path, result) -> None:

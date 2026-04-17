@@ -19,10 +19,12 @@ from pixie_solver.rules.providers import (
 from pixie_solver.rules.registry import (
     PieceRegistryRecord,
     append_verified_piece_version,
+    load_piece_classes_for_records,
     load_piece_registry,
     load_verified_piece_classes,
     load_verified_piece_records,
     registry_piece_digest_metadata,
+    registry_piece_record_metadata,
 )
 from pixie_solver.rules.repair import (
     RepairResult,
@@ -49,9 +51,11 @@ __all__ = [
     "behavioral_state_signature",
     "build_state_mismatch",
     "diff_states",
+    "load_piece_classes_for_records",
     "load_piece_registry",
     "load_verified_piece_classes",
     "load_verified_piece_records",
     "registry_piece_digest_metadata",
+    "registry_piece_record_metadata",
     "repair_and_verify_piece",
 ]

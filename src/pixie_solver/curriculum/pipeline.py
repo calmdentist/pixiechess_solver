@@ -97,6 +97,7 @@ def run_synthetic_piece_curriculum(
     piece_id: str | None = None,
     registry_path: str | None = None,
     out_dir: str | None = None,
+    registry_metadata: dict[str, JsonValue] | None = None,
 ) -> CurriculumRunResult:
     synthetic_piece = generate_teacher_piece(
         seed=seed,
@@ -213,6 +214,7 @@ def run_synthetic_piece_curriculum(
                 "recipe": synthetic_piece.recipe,
                 "teacher_digest": stable_digest(synthetic_piece.teacher_program),
                 "compile_response": compile_response.to_dict(),
+                **dict(registry_metadata or {}),
             },
         )
 
