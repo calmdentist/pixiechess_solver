@@ -13,9 +13,17 @@ from pixie_solver.model.board_encoder import BoardEncoder
 from pixie_solver.model.dsl_encoder import DSLFeatureEncoder
 from pixie_solver.model.move_encoder import MoveEncoder, MoveEncodingMetrics
 
+BASELINE_MODEL_ARCHITECTURE = "baseline_v1"
+WORLD_CONDITIONED_MODEL_ARCHITECTURE = "world_conditioned_v2"
+SUPPORTED_MODEL_ARCHITECTURES = (
+    BASELINE_MODEL_ARCHITECTURE,
+    WORLD_CONDITIONED_MODEL_ARCHITECTURE,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyValueConfig:
+    architecture: str = BASELINE_MODEL_ARCHITECTURE
     d_model: int = 192
     num_heads: int = 8
     num_layers: int = 4
@@ -77,6 +85,12 @@ class PolicyValueModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = PolicyValueConfig() if config is None else config
+        if self.config.architecture != BASELINE_MODEL_ARCHITECTURE:
+            raise ValueError(
+                "PolicyValueModel only supports "
+                f"{BASELINE_MODEL_ARCHITECTURE!r}; "
+                "use build_policy_value_model for architecture-aware construction"
+            )
         if self.config.d_model % self.config.num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         hidden_dim = self.config.d_model * self.config.feedforward_multiplier
@@ -339,3 +353,22 @@ def resolve_device(device: str | torch.device | None = None) -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def build_policy_value_model(
+    config: PolicyValueConfig | None = None,
+    *,
+    device: str | torch.device | None = None,
+) -> PolicyValueModel:
+    active_config = PolicyValueConfig() if config is None else config
+    if active_config.architecture == BASELINE_MODEL_ARCHITECTURE:
+        return PolicyValueModel(active_config, device=device)
+    if active_config.architecture == WORLD_CONDITIONED_MODEL_ARCHITECTURE:
+        from pixie_solver.model.policy_value_v2 import PolicyValueModelV2
+
+        return PolicyValueModelV2(active_config, device=device)
+    supported = ", ".join(SUPPORTED_MODEL_ARCHITECTURES)
+    raise ValueError(
+        f"Unsupported model architecture {active_config.architecture!r}. "
+        f"Supported architectures: {supported}"
+    )

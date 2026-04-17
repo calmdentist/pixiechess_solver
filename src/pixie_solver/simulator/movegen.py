@@ -5,6 +5,7 @@ from typing import Iterable
 from pixie_solver.core.move import Move
 from pixie_solver.core.piece import BasePieceType, Color, PieceClass, PieceInstance
 from pixie_solver.core.state import GameState
+import pixie_solver.simulator.query as query_runtime
 from pixie_solver.simulator.transition import apply_move_unchecked, other_color
 from pixie_solver.utils.squares import coords_to_square, square_to_coords
 
@@ -41,6 +42,14 @@ CASTLE_SPECS = {
 
 
 def legal_moves(state: GameState) -> list[Move]:
+    from pixie_solver.simulator.actiongen import enumerate_shadow_legal_actions
+
+    return _sorted_moves(
+        [Move.from_action_intent(action) for action in enumerate_shadow_legal_actions(state)]
+    )
+
+
+def legacy_legal_moves(state: GameState) -> list[Move]:
     moves = pseudo_legal_moves(state, color=state.side_to_move)
     king = king_for_color(state, state.side_to_move)
     if king is None:
@@ -79,28 +88,11 @@ def pseudo_legal_moves(state: GameState, *, color: Color | None = None) -> list[
 
 
 def is_in_check(state: GameState, color: Color) -> bool:
-    king = king_for_color(state, color)
-    if king is None or king.square is None:
-        return False
-    return is_square_attacked(state, king.square, by_color=other_color(color))
+    return query_runtime.is_king_capturable(state, color)
 
 
 def is_square_attacked(state: GameState, square: str, *, by_color: Color) -> bool:
-    occupancy = state.occupancy()
-    for piece_id in sorted(state.piece_instances):
-        piece = state.piece_instances[piece_id]
-        if piece.square is None or piece.color != by_color:
-            continue
-        piece_class = state.piece_classes[piece.piece_class_id]
-        if _piece_attacks_square(
-            state=state,
-            occupancy=occupancy,
-            piece=piece,
-            piece_class=piece_class,
-            target_square=square,
-        ):
-            return True
-    return False
+    return query_runtime.is_square_capturable(state, square, by_color=by_color)
 
 
 def king_for_color(state: GameState, color: Color) -> PieceInstance | None:

@@ -16,6 +16,7 @@ from pixie_solver.core import BasePieceType, Color, Modifier, PieceClass, PieceI
 from pixie_solver.core import sample_standard_initial_state, stable_move_id, standard_initial_state
 from pixie_solver.core.state import GameState
 from pixie_solver.dsl import compile_piece_file
+from pixie_solver.model import PolicyValueConfig, build_policy_value_model
 from pixie_solver.simulator.engine import result
 from pixie_solver.simulator.movegen import legal_moves
 from pixie_solver.training import (
@@ -25,6 +26,7 @@ from pixie_solver.training import (
     generate_selfplay_games_parallel,
     read_selfplay_examples_jsonl,
     read_selfplay_games_jsonl,
+    save_training_checkpoint,
     seed_for_game,
     write_selfplay_examples_jsonl,
     write_selfplay_games_jsonl,
@@ -172,6 +174,48 @@ class SelfPlayTest(unittest.TestCase):
         self.assertEqual(2, len(events))
         self.assertTrue(all(event.event == "game_completed" for event in events))
         self.assertTrue(all(event.used_model is False for event in events))
+
+    def test_parallel_selfplay_supports_world_conditioned_v2_checkpoint(self) -> None:
+        config = SelfPlayConfig(
+            simulations=1,
+            max_plies=1,
+            opening_temperature=0.0,
+            final_temperature=0.0,
+            temperature_drop_after_ply=0,
+            seed=47,
+            root_exploration_fraction=0.0,
+        )
+        model = build_policy_value_model(
+            PolicyValueConfig(
+                architecture="world_conditioned_v2",
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+        events = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "world_conditioned.pt"
+            save_training_checkpoint(checkpoint_path, model=model)
+            games, inference_stats = generate_selfplay_games_parallel(
+                [self.initial_state],
+                games=1,
+                workers=1,
+                config=config,
+                checkpoint_path=checkpoint_path,
+                device="cpu",
+                progress_callback=events.append,
+            )
+
+        self.assertIsNone(inference_stats)
+        self.assertEqual(1, len(games))
+        self.assertGreaterEqual(len(events), 1)
+        self.assertTrue(any(event.used_model is True for event in events))
+        self.assertEqual("game_completed", events[-1].event)
 
     def test_selfplay_game_contains_replay_and_labeled_examples(self) -> None:
         game = generate_selfplay_games([self.initial_state], games=1, config=self.config)[0]

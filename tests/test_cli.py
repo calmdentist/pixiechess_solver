@@ -560,6 +560,8 @@ class CLITest(unittest.TestCase):
                 "--seed",
                 "19",
                 "--no-shuffle",
+                "--model-architecture",
+                "baseline_v1",
                 "--d-model",
                 "32",
                 "--num-heads",
@@ -578,8 +580,10 @@ class CLITest(unittest.TestCase):
             self.assertIn("train started", first_run.stderr)
             self.assertIn("train completed", first_run.stderr)
             self.assertTrue(checkpoint_path.exists())
+            self.assertEqual("baseline_v1", first_payload["model_config"]["architecture"])
 
             checkpoint = load_training_checkpoint(checkpoint_path, device="cpu")
+            self.assertEqual("baseline_v1", checkpoint.model_config.architecture)
             self.assertEqual(32, checkpoint.model_config.d_model)
             self.assertIsNotNone(checkpoint.training_metrics)
             self.assertIsNotNone(checkpoint.optimizer_state_dict)
@@ -606,8 +610,65 @@ class CLITest(unittest.TestCase):
             self.assertEqual(0, resumed_run.returncode, resumed_run.stderr)
             resumed_payload = json.loads(resumed_run.stdout)
             self.assertEqual(str(checkpoint_path), resumed_payload["resumed_from"])
+            self.assertEqual("baseline_v1", resumed_payload["model_config"]["architecture"])
             self.assertIn("train started", resumed_run.stderr)
             self.assertTrue(resumed_checkpoint_path.exists())
+
+    def test_train_command_supports_world_conditioned_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            examples_path = Path(temp_dir) / "examples.jsonl"
+            checkpoint_path = Path(temp_dir) / "world_conditioned.pt"
+
+            games = generate_selfplay_games(
+                [self.initial_state],
+                games=1,
+                config=SelfPlayConfig(
+                    simulations=4,
+                    max_plies=4,
+                    opening_temperature=0.0,
+                    final_temperature=0.0,
+                    temperature_drop_after_ply=0,
+                    seed=41,
+                ),
+            )
+            write_selfplay_examples_jsonl(examples_path, games[0].examples)
+
+            train_run = self._run(
+                "train",
+                "--examples",
+                str(examples_path),
+                "--checkpoint-out",
+                str(checkpoint_path),
+                "--epochs",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "41",
+                "--no-shuffle",
+                "--model-architecture",
+                "world_conditioned_v2",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--quiet",
+            )
+
+            self.assertEqual(0, train_run.returncode, train_run.stderr)
+            payload = json.loads(train_run.stdout)
+            self.assertEqual("world_conditioned_v2", payload["model_config"]["architecture"])
+            checkpoint = load_training_checkpoint(checkpoint_path, device="cpu")
+            self.assertEqual("world_conditioned_v2", checkpoint.model_config.architecture)
+            self.assertEqual("world_conditioned_v2", checkpoint.model.config.architecture)
 
     def test_eval_model_command_reports_learning_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -760,6 +821,8 @@ class CLITest(unittest.TestCase):
                 "cpu",
                 "--seed",
                 "31",
+                "--model-architecture",
+                "baseline_v1",
                 "--d-model",
                 "32",
                 "--num-heads",
@@ -776,16 +839,66 @@ class CLITest(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual("ok", payload["status"])
+            self.assertEqual("baseline_v1", payload["model_config"]["architecture"])
             self.assertEqual(1, len(payload["cycles"]))
             self.assertTrue(Path(payload["latest_checkpoint"]).exists())
             self.assertTrue((output_dir / "summary.json").exists())
             self.assertTrue((output_dir / "manifest.json").exists())
             self.assertTrue((output_dir / "metrics/cycle_001.json").exists())
             cycle = payload["cycles"][0]
+            self.assertEqual("baseline_v1", cycle["model_config"]["architecture"])
             self.assertGreater(cycle["train_examples"], 0)
             self.assertGreater(cycle["val_examples"], 0)
             self.assertIn("average_policy_cross_entropy", cycle["train_eval_metrics"])
             self.assertIn("average_policy_cross_entropy", cycle["val_eval_metrics"])
+
+    def test_train_loop_command_supports_world_conditioned_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "run"
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "1",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "2",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "43",
+                "--model-architecture",
+                "world_conditioned_v2",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual("world_conditioned_v2", payload["model_config"]["architecture"])
+            self.assertEqual("world_conditioned_v2", payload["cycles"][0]["model_config"]["architecture"])
+            checkpoint = load_training_checkpoint(payload["latest_checkpoint"], device="cpu")
+            self.assertEqual("world_conditioned_v2", checkpoint.model_config.architecture)
 
     def test_train_loop_promotion_gate_records_best_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

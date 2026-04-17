@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,15 +16,30 @@ from pixie_solver.core.piece import (
 from pixie_solver.dsl.canonicalize import canonicalize_piece_program
 from pixie_solver.dsl.parser import load_piece_program
 from pixie_solver.dsl.schema import SCHEMA_VERSION
+from pixie_solver.program.lower_legacy_dsl import lower_legacy_piece_program
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledPieceArtifacts:
+    piece_class: PieceClass
+    program_ir: dict[str, Any]
 
 
 def compile_piece_program(program: Mapping[str, Any]) -> PieceClass:
+    return compile_piece_artifacts(program).piece_class
+
+
+def compile_piece_program_ir(program: Mapping[str, Any]) -> dict[str, Any]:
+    return compile_piece_artifacts(program).program_ir
+
+
+def compile_piece_artifacts(program: Mapping[str, Any]) -> CompiledPieceArtifacts:
     canonical_program = canonicalize_piece_program(program)
     metadata = {
         "schema_version": SCHEMA_VERSION,
         **dict(canonical_program.get("metadata", {})),
     }
-    return PieceClass(
+    piece_class = PieceClass(
         class_id=str(canonical_program["piece_id"]),
         name=str(canonical_program["name"]),
         base_piece_type=BasePieceType(str(canonical_program["base_piece_type"])),
@@ -62,7 +78,15 @@ def compile_piece_program(program: Mapping[str, Any]) -> PieceClass:
         ),
         metadata=metadata,
     )
+    return CompiledPieceArtifacts(
+        piece_class=piece_class,
+        program_ir=lower_legacy_piece_program(canonical_program),
+    )
 
 
 def compile_piece_file(path: str | Path) -> PieceClass:
     return compile_piece_program(load_piece_program(path))
+
+
+def compile_piece_file_ir(path: str | Path) -> dict[str, Any]:
+    return compile_piece_program_ir(load_piece_program(path))

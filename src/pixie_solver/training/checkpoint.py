@@ -9,6 +9,7 @@ import torch
 from pixie_solver.model.policy_value import (
     PolicyValueConfig,
     PolicyValueModel,
+    build_policy_value_model,
     resolve_device,
 )
 from pixie_solver.training.train import TrainingConfig, TrainingMetrics
@@ -75,7 +76,7 @@ def load_training_checkpoint(
         )
 
     model_config = PolicyValueConfig(**dict(payload["model_config"]))
-    model = PolicyValueModel(model_config, device=map_location)
+    model = build_policy_value_model(model_config, device=map_location)
     model.load_state_dict(dict(payload["model_state_dict"]))
 
     training_config_payload = payload.get("training_config")
