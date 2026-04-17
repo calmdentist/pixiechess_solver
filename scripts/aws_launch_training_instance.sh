@@ -11,7 +11,7 @@ Usage:
 
 Options:
   --region REGION                    AWS region. Defaults to AWS_REGION, AWS_DEFAULT_REGION, or us-east-1.
-  --instance-type TYPE               EC2 instance type. Default: g5.8xlarge
+  --instance-type TYPE               EC2 instance type. Default: auto (g6e.16xlarge -> g5.16xlarge -> g6.16xlarge -> g5.8xlarge)
   --volume-size-gb SIZE              Root EBS volume size. Default: 500
   --volume-iops IOPS                 gp3 IOPS. Default: 6000
   --volume-throughput MBPS           gp3 throughput in MiB/s. Default: 250
@@ -31,7 +31,7 @@ Training config:
   Export the same env vars used by scripts/aws_run_proof.sh before launching to override
   the default proof workload, for example:
 
-    WORKERS=16 TRAIN_GAMES=1024 CYCLES=12 scripts/aws_launch_training_instance.sh --auto-start
+    WORKERS=16 TRAIN_GAMES=384 CYCLES=6 scripts/aws_launch_training_instance.sh --auto-start
 EOF
 }
 
@@ -48,11 +48,34 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+required_vcpus_for_instance_type() {
+  case "$1" in
+    g6e.16xlarge|g5.16xlarge|g6.16xlarge)
+      echo "64"
+      ;;
+    g5.8xlarge)
+      echo "32"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+gpu_vt_quota_value() {
+  aws service-quotas list-service-quotas \
+    --service-code ec2 \
+    --region "$REGION" \
+    --query "Quotas[?QuotaCode=='L-DB2E81BA'].Value | [0]" \
+    --output text 2>/dev/null || true
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
-INSTANCE_TYPE="g5.8xlarge"
+INSTANCE_TYPE=""
+INSTANCE_TYPE_SPECIFIED="0"
 VOLUME_SIZE_GB="500"
 VOLUME_IOPS="6000"
 VOLUME_THROUGHPUT="250"
@@ -74,6 +97,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --instance-type)
       INSTANCE_TYPE="${2:?missing value for --instance-type}"
+      INSTANCE_TYPE_SPECIFIED="1"
       shift 2
       ;;
     --volume-size-gb)
@@ -157,6 +181,7 @@ ARTIFACT_PREFIX="${BUCKET_PREFIX%/}/$RUN_NAME"
 SOURCE_KEY="$ARTIFACT_PREFIX/source/source.tar.gz"
 OUTPUT_PREFIX="$ARTIFACT_PREFIX/output"
 OUTPUT_URI="s3://$BUCKET/$OUTPUT_PREFIX"
+SHARED_ARTIFACT_PREFIX="${BUCKET_PREFIX%/}"
 
 log "bundling current checkout from $REPO_ROOT"
 ARCHIVE_PATH="$TMP_DIR/source.tar.gz"
@@ -235,8 +260,8 @@ cat >"$S3_POLICY_FILE" <<EOF
       "Condition": {
         "StringLike": {
           "s3:prefix": [
-            "$ARTIFACT_PREFIX",
-            "$ARTIFACT_PREFIX/*"
+            "$SHARED_ARTIFACT_PREFIX",
+            "$SHARED_ARTIFACT_PREFIX/*"
           ]
         }
       }
@@ -250,7 +275,7 @@ cat >"$S3_POLICY_FILE" <<EOF
         "s3:DeleteObject"
       ],
       "Resource": [
-        "arn:aws:s3:::$BUCKET/$ARTIFACT_PREFIX/*"
+        "arn:aws:s3:::$BUCKET/$SHARED_ARTIFACT_PREFIX/*"
       ]
     }
   ]
@@ -288,6 +313,7 @@ if [[ -n "$SUBNET_ID" ]]; then
     --subnet-ids "$SUBNET_ID" \
     --query 'Subnets[0].VpcId' \
     --output text)"
+  CANDIDATE_SUBNET_IDS=("$SUBNET_ID")
 else
   VPC_ID="$(aws ec2 describe-vpcs \
     --region "$REGION" \
@@ -297,14 +323,23 @@ else
   if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
     fail "no default VPC found in $REGION; rerun with --subnet-id"
   fi
-  SUBNET_ID="$(aws ec2 describe-subnets \
-    --region "$REGION" \
-    --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
-    --query 'Subnets[0].SubnetId' \
-    --output text)"
+  CANDIDATE_SUBNET_IDS=()
+  while IFS= read -r candidate_subnet_id; do
+    if [[ -n "$candidate_subnet_id" ]]; then
+      CANDIDATE_SUBNET_IDS+=("$candidate_subnet_id")
+    fi
+  done < <(
+    aws ec2 describe-subnets \
+      --region "$REGION" \
+      --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
+      --query 'Subnets[].[SubnetId,AvailabilityZone]' \
+      --output text \
+      | sort -k2,2 \
+      | awk '{print $1}'
+  )
 fi
 
-if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
+if [[ "${#CANDIDATE_SUBNET_IDS[@]}" -eq 0 ]]; then
   fail "unable to determine subnet id"
 fi
 
@@ -355,6 +390,14 @@ PASSTHROUGH_ENV_VARS=(
   BATCHED_INFERENCE
   PROMOTION_GATE
   ANALYZE_AFTER_RUN
+  MODEL_ARCHITECTURE
+  PIECE_REGISTRY
+  USE_VERIFIED_PIECES
+  SPECIAL_PIECE_INCLUSION_PROBABILITY
+  REPLAY_WINDOW_CYCLES
+  ENABLE_SCHEDULED_CURRICULUM
+  CURRICULUM_PROVIDER_MODE
+  CURRICULUM_TASKS
   D_MODEL
   NUM_HEADS
   NUM_LAYERS
@@ -395,9 +438,15 @@ exec > >(tee /var/log/pixie-user-data.log | logger -t pixie-user-data) 2>&1
 SOURCE_URI="s3://$BUCKET/$SOURCE_KEY"
 AUTO_START="$AUTO_START"
 PYTHON_BIN="/opt/pytorch/bin/python"
+export AWS_DEFAULT_REGION="$REGION"
+
+if ! command -v aws >/dev/null 2>&1; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y awscli
+fi
 
 mkdir -p /opt/pixie_solver /opt/pixie_runs /opt/pixie_bootstrap
-aws s3 cp "\$SOURCE_URI" /opt/pixie_bootstrap/source.tar.gz
+aws s3 cp --region "\$AWS_DEFAULT_REGION" "\$SOURCE_URI" /opt/pixie_bootstrap/source.tar.gz
 tar -xzf /opt/pixie_bootstrap/source.tar.gz -C /opt/pixie_solver --strip-components=1
 
 if [[ ! -x "\$PYTHON_BIN" ]]; then
@@ -475,23 +524,105 @@ cat >"$BLOCK_DEVICE_FILE" <<EOF
 ]
 EOF
 
-log "launching $INSTANCE_TYPE in $REGION with AMI $AMI_ID"
-INSTANCE_ID="$(aws ec2 run-instances \
-  --region "$REGION" \
-  --image-id "$AMI_ID" \
-  --instance-type "$INSTANCE_TYPE" \
-  --count 1 \
-  --iam-instance-profile "Name=$INSTANCE_PROFILE_NAME" \
-  --subnet-id "$SUBNET_ID" \
-  --security-group-ids "$SG_ID" \
-  --metadata-options HttpTokens=required,HttpEndpoint=enabled \
-  --block-device-mappings "file://$BLOCK_DEVICE_FILE" \
-  --tag-specifications \
-    "ResourceType=instance,Tags=[{Key=Name,Value=$RUN_NAME},{Key=Project,Value=PixieChess},{Key=ManagedBy,Value=aws_launch_training_instance.sh}]" \
-    "ResourceType=volume,Tags=[{Key=Name,Value=$RUN_NAME},{Key=Project,Value=PixieChess},{Key=ManagedBy,Value=aws_launch_training_instance.sh}]" \
-  --user-data "file://$USER_DATA_FILE" \
-  --query 'Instances[0].InstanceId' \
-  --output text)"
+if [[ "$INSTANCE_TYPE_SPECIFIED" == "1" ]]; then
+  INSTANCE_TYPE_CANDIDATES=("$INSTANCE_TYPE")
+else
+  INSTANCE_TYPE_CANDIDATES=(g6e.16xlarge g5.16xlarge g6.16xlarge g5.8xlarge)
+fi
+
+ALL_CANDIDATES_USE_GPU_VT_BUCKET="1"
+MIN_REQUIRED_VCPUS=""
+MIN_REQUIRED_INSTANCE_TYPE=""
+for candidate_instance_type in "${INSTANCE_TYPE_CANDIDATES[@]}"; do
+  case "$candidate_instance_type" in
+    g*|vt*)
+      ;;
+    *)
+      ALL_CANDIDATES_USE_GPU_VT_BUCKET="0"
+      ;;
+  esac
+  candidate_vcpus="$(required_vcpus_for_instance_type "$candidate_instance_type")"
+  if [[ -n "$candidate_vcpus" ]]; then
+    if [[ -z "$MIN_REQUIRED_VCPUS" || "$candidate_vcpus" -lt "$MIN_REQUIRED_VCPUS" ]]; then
+      MIN_REQUIRED_VCPUS="$candidate_vcpus"
+      MIN_REQUIRED_INSTANCE_TYPE="$candidate_instance_type"
+    fi
+  fi
+done
+
+if [[ "$ALL_CANDIDATES_USE_GPU_VT_BUCKET" == "1" ]]; then
+  GPU_VT_QUOTA="$(gpu_vt_quota_value)"
+  case "$GPU_VT_QUOTA" in
+    ''|None|null)
+      ;;
+    [0-9]*|[0-9]*.[0-9]*)
+      GPU_VT_QUOTA_INT="${GPU_VT_QUOTA%%.*}"
+      if [[ -z "$GPU_VT_QUOTA_INT" ]]; then
+        GPU_VT_QUOTA_INT="0"
+      fi
+      if [[ -n "$MIN_REQUIRED_VCPUS" && "$GPU_VT_QUOTA_INT" -lt "$MIN_REQUIRED_VCPUS" ]]; then
+        fail \
+"EC2 quota preflight failed in $REGION: Running On-Demand G and VT instances (quota code L-DB2E81BA) is $GPU_VT_QUOTA vCPU. The smallest configured candidate requires $MIN_REQUIRED_VCPUS vCPU ($MIN_REQUIRED_INSTANCE_TYPE). Request at least 32 vCPU to allow g5.8xlarge, or 64 vCPU for the default serious-run targets."
+      fi
+      ;;
+  esac
+fi
+
+INSTANCE_ID=""
+SELECTED_INSTANCE_TYPE=""
+SELECTED_SUBNET_ID=""
+LAST_RUN_INSTANCES_ERROR_FILE="$TMP_DIR/run-instances-last-error.log"
+LAST_RUN_INSTANCES_ERROR=""
+
+for candidate_instance_type in "${INSTANCE_TYPE_CANDIDATES[@]}"; do
+  for candidate_subnet_id in "${CANDIDATE_SUBNET_IDS[@]}"; do
+    log "launch attempt: instance_type=$candidate_instance_type subnet_id=$candidate_subnet_id"
+    if INSTANCE_ID="$(aws ec2 run-instances \
+      --region "$REGION" \
+      --image-id "$AMI_ID" \
+      --instance-type "$candidate_instance_type" \
+      --count 1 \
+      --iam-instance-profile "Name=$INSTANCE_PROFILE_NAME" \
+      --subnet-id "$candidate_subnet_id" \
+      --security-group-ids "$SG_ID" \
+      --metadata-options HttpTokens=required,HttpEndpoint=enabled \
+      --block-device-mappings "file://$BLOCK_DEVICE_FILE" \
+      --tag-specifications \
+        "ResourceType=instance,Tags=[{Key=Name,Value=$RUN_NAME},{Key=Project,Value=PixieChess},{Key=ManagedBy,Value=aws_launch_training_instance.sh}]" \
+        "ResourceType=volume,Tags=[{Key=Name,Value=$RUN_NAME},{Key=Project,Value=PixieChess},{Key=ManagedBy,Value=aws_launch_training_instance.sh}]" \
+      --user-data "file://$USER_DATA_FILE" \
+      --query 'Instances[0].InstanceId' \
+      --output text 2>"$LAST_RUN_INSTANCES_ERROR_FILE")"; then
+      SELECTED_INSTANCE_TYPE="$candidate_instance_type"
+      SELECTED_SUBNET_ID="$candidate_subnet_id"
+      break 2
+    fi
+    LAST_RUN_INSTANCES_ERROR="$(<"$LAST_RUN_INSTANCES_ERROR_FILE")"
+    log "launch attempt failed for instance_type=$candidate_instance_type subnet_id=$candidate_subnet_id"
+  done
+done
+
+if [[ -z "$INSTANCE_ID" ]]; then
+  if [[ "$LAST_RUN_INSTANCES_ERROR" == *"VcpuLimitExceeded"* ]]; then
+    GPU_VT_QUOTA="$(gpu_vt_quota_value)"
+    GPU_QUOTA_GUIDANCE=" Request at least 32 vCPU in Running On-Demand G and VT instances (quota code L-DB2E81BA) to allow g5.8xlarge, or 64 vCPU for the default serious-run targets."
+    case "$GPU_VT_QUOTA" in
+      ''|None|null)
+        ;;
+      *)
+        GPU_QUOTA_GUIDANCE=" Running On-Demand G and VT instances (quota code L-DB2E81BA) is currently $GPU_VT_QUOTA vCPU in $REGION.$GPU_QUOTA_GUIDANCE"
+        ;;
+    esac
+    fail "unable to launch an instance in $REGION using candidate types [${INSTANCE_TYPE_CANDIDATES[*]}]: $LAST_RUN_INSTANCES_ERROR$GPU_QUOTA_GUIDANCE"
+  fi
+  if [[ -n "$LAST_RUN_INSTANCES_ERROR" ]]; then
+    fail "unable to launch an instance in $REGION using candidate types [${INSTANCE_TYPE_CANDIDATES[*]}]: $LAST_RUN_INSTANCES_ERROR"
+  fi
+  fail "unable to launch an instance in $REGION using candidate types [${INSTANCE_TYPE_CANDIDATES[*]}]"
+fi
+
+INSTANCE_TYPE="$SELECTED_INSTANCE_TYPE"
+SUBNET_ID="$SELECTED_SUBNET_ID"
 
 aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 
@@ -517,6 +648,8 @@ done
 cat <<EOF
 instance_id=$INSTANCE_ID
 region=$REGION
+instance_type=$INSTANCE_TYPE
+subnet_id=$SUBNET_ID
 private_ip=$PRIVATE_IP
 ssm_status=$SSM_STATUS
 run_name=$RUN_NAME

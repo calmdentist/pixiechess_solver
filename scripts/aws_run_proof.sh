@@ -13,22 +13,22 @@ export PYTHONPATH="${PYTHONPATH:-src}"
 DEVICE="${DEVICE:-cuda}"
 SELFPLAY_DEVICE="${SELFPLAY_DEVICE:-cpu}"
 INFERENCE_DEVICE="${INFERENCE_DEVICE:-$DEVICE}"
-WORKERS="${WORKERS:-8}"
+WORKERS="${WORKERS:-16}"
 SEED="${SEED:-1000}"
 
 STRESS_GAMES="${STRESS_GAMES:-64}"
 STRESS_MAX_PLIES="${STRESS_MAX_PLIES:-48}"
 
-CYCLES="${CYCLES:-8}"
-TRAIN_GAMES="${TRAIN_GAMES:-512}"
-VAL_GAMES="${VAL_GAMES:-64}"
-SIMULATIONS="${SIMULATIONS:-64}"
+CYCLES="${CYCLES:-6}"
+TRAIN_GAMES="${TRAIN_GAMES:-256}"
+VAL_GAMES="${VAL_GAMES:-32}"
+SIMULATIONS="${SIMULATIONS:-32}"
 MAX_PLIES="${MAX_PLIES:-96}"
 EPOCHS_PER_CYCLE="${EPOCHS_PER_CYCLE:-2}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 
-ARENA_GAMES="${ARENA_GAMES:-64}"
-ARENA_SIMULATIONS="${ARENA_SIMULATIONS:-64}"
+ARENA_GAMES="${ARENA_GAMES:-32}"
+ARENA_SIMULATIONS="${ARENA_SIMULATIONS:-32}"
 ARENA_MAX_PLIES="${ARENA_MAX_PLIES:-96}"
 PROMOTION_SCORE_THRESHOLD="${PROMOTION_SCORE_THRESHOLD:-0.55}"
 
@@ -36,8 +36,22 @@ BATCHED_INFERENCE="${BATCHED_INFERENCE:-1}"
 PROMOTION_GATE="${PROMOTION_GATE:-1}"
 ANALYZE_AFTER_RUN="${ANALYZE_AFTER_RUN:-1}"
 PIXIE_S3_OUTPUT_URI="${PIXIE_S3_OUTPUT_URI:-}"
+MODEL_ARCHITECTURE="${MODEL_ARCHITECTURE:-world_conditioned_v2}"
+PIECE_REGISTRY="${PIECE_REGISTRY:-$OUTPUT_DIR/pieces/registry.json}"
+USE_VERIFIED_PIECES="${USE_VERIFIED_PIECES:-1}"
+SPECIAL_PIECE_INCLUSION_PROBABILITY="${SPECIAL_PIECE_INCLUSION_PROBABILITY:-1.0}"
+REPLAY_WINDOW_CYCLES="${REPLAY_WINDOW_CYCLES:-4}"
+ENABLE_SCHEDULED_CURRICULUM="${ENABLE_SCHEDULED_CURRICULUM:-1}"
+CURRICULUM_PROVIDER_MODE="${CURRICULUM_PROVIDER_MODE:-oracle}"
+CURRICULUM_TASKS="${CURRICULUM_TASKS:-1:101:capture_sprint:train:introduced;2:202:phase_rook:train:introduced;3:303:turn_charge:train:introduced;4:404:edge_sumo:train:introduced;5:505:capture_sprint:train:introduced;6:606:phase_rook:train:introduced}"
 
 mkdir -p "$OUTPUT_DIR"
+mkdir -p "$(dirname "$PIECE_REGISTRY")"
+
+if [[ "$BATCHED_INFERENCE" == "1" && "$WORKERS" -le 1 ]]; then
+  echo "BATCHED_INFERENCE=1 requires WORKERS greater than 1" >&2
+  exit 1
+fi
 
 sync_outputs() {
   if [[ -z "$PIXIE_S3_OUTPUT_URI" ]]; then
@@ -57,6 +71,14 @@ trap sync_outputs EXIT
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi || true
 fi
+
+cat <<EOF
+[aws-run-proof] output_dir=$OUTPUT_DIR
+[aws-run-proof] model_architecture=$MODEL_ARCHITECTURE
+[aws-run-proof] cycles=$CYCLES train_games=$TRAIN_GAMES val_games=$VAL_GAMES simulations=$SIMULATIONS max_plies=$MAX_PLIES
+[aws-run-proof] workers=$WORKERS device=$DEVICE selfplay_device=$SELFPLAY_DEVICE inference_device=$INFERENCE_DEVICE
+[aws-run-proof] piece_registry=$PIECE_REGISTRY use_verified_pieces=$USE_VERIFIED_PIECES curriculum_mode=$CURRICULUM_PROVIDER_MODE
+EOF
 
 "$PYTHON_BIN" - <<'PY'
 import sys
@@ -103,6 +125,10 @@ train_loop_cmd=(
   --arena-simulations "$ARENA_SIMULATIONS"
   --arena-max-plies "$ARENA_MAX_PLIES"
   --promotion-score-threshold "$PROMOTION_SCORE_THRESHOLD"
+  --model-architecture "$MODEL_ARCHITECTURE"
+  --piece-registry "$PIECE_REGISTRY"
+  --special-piece-inclusion-probability "$SPECIAL_PIECE_INCLUSION_PROBABILITY"
+  --replay-window-cycles "$REPLAY_WINDOW_CYCLES"
   --randomize-handauthored-specials
 )
 
@@ -112,6 +138,30 @@ fi
 
 if [[ "$PROMOTION_GATE" == "1" ]]; then
   train_loop_cmd+=(--promotion-gate)
+fi
+
+if [[ "$USE_VERIFIED_PIECES" == "1" ]]; then
+  train_loop_cmd+=(--use-verified-pieces)
+fi
+
+if [[ "$ENABLE_SCHEDULED_CURRICULUM" == "1" ]]; then
+  IFS=';' read -r -a curriculum_tasks <<<"$CURRICULUM_TASKS"
+  for task in "${curriculum_tasks[@]}"; do
+    if [[ -n "$task" ]]; then
+      train_loop_cmd+=(--curriculum-task "$task")
+    fi
+  done
+  case "$CURRICULUM_PROVIDER_MODE" in
+    oracle)
+      train_loop_cmd+=(--curriculum-oracle)
+      ;;
+    live_llm)
+      ;;
+    *)
+      echo "unsupported CURRICULUM_PROVIDER_MODE=$CURRICULUM_PROVIDER_MODE" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then

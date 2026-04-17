@@ -186,6 +186,30 @@ def registry_piece_record_metadata(
     }
 
 
+def registry_piece_training_metadata(
+    records: list[PieceRegistryRecord],
+) -> dict[str, JsonValue]:
+    training_fields = (
+        "family_id",
+        "split",
+        "novelty_tier",
+        "admission_cycle",
+        "task_id",
+    )
+    return {
+        record.piece_id: {
+            "version": record.version,
+            "source": record.source,
+            **{
+                field: record.metadata[field]
+                for field in training_fields
+                if field in record.metadata
+            },
+        }
+        for record in records
+    }
+
+
 def _resolve_record_path(
     registry_path: str | Path,
     record: PieceRegistryRecord,
