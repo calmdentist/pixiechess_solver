@@ -15,9 +15,11 @@ from pixie_solver.model.move_encoder import MoveEncoder, MoveEncodingMetrics
 
 BASELINE_MODEL_ARCHITECTURE = "baseline_v1"
 WORLD_CONDITIONED_MODEL_ARCHITECTURE = "world_conditioned_v2"
+HYPERNETWORK_MODEL_ARCHITECTURE = "hypernetwork_conditioned_v4"
 SUPPORTED_MODEL_ARCHITECTURES = (
     BASELINE_MODEL_ARCHITECTURE,
     WORLD_CONDITIONED_MODEL_ARCHITECTURE,
+    HYPERNETWORK_MODEL_ARCHITECTURE,
 )
 
 
@@ -36,12 +38,14 @@ class PolicyValueForwardOutput:
     move_ids: tuple[str, ...]
     policy_logits: Tensor
     value: Tensor
+    uncertainty: Tensor
 
 
 @dataclass(slots=True)
 class PolicyValueOutput:
     policy_logits: dict[str, float] = field(default_factory=dict)
     value: float = 0.0
+    uncertainty: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,19 +148,26 @@ class PolicyValueModel(nn.Module):
         self,
         state: GameState,
         legal_moves: Sequence[Move],
+        *,
+        strategy: object | None = None,
     ) -> PolicyValueForwardOutput:
-        return self.forward_batch(((state, legal_moves),))[0]
+        return self.forward_batch(((state, legal_moves),), strategy=strategy)[0]
 
     def forward_batch(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[PolicyValueForwardOutput, ...]:
-        return self._forward_batch_with_metrics(requests)[0]
+        return self._forward_batch_with_metrics(requests, strategy=strategy)[0]
 
     def _forward_batch_with_metrics(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[tuple[PolicyValueForwardOutput, ...], PolicyValueBatchMetrics]:
+        del strategy
         total_start = time.perf_counter()
         if not requests:
             return (), PolicyValueBatchMetrics()
@@ -280,6 +291,11 @@ class PolicyValueModel(nn.Module):
                     move_ids=encoded_moves.move_ids,
                     policy_logits=policy_logits,
                     value=values[request_index],
+                    uncertainty=torch.zeros(
+                        (),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
                 )
             )
         total_legal_moves = sum(len(legal_moves) for _, legal_moves in requests)
@@ -302,24 +318,33 @@ class PolicyValueModel(nn.Module):
         self,
         state: GameState,
         legal_moves: Sequence[Move],
+        *,
+        strategy: object | None = None,
     ) -> PolicyValueOutput:
-        return self.infer_batch(((state, legal_moves),))[0]
+        return self.infer_batch(((state, legal_moves),), strategy=strategy)[0]
 
     def infer_batch(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[PolicyValueOutput, ...]:
-        return self.infer_batch_with_metrics(requests)[0]
+        return self.infer_batch_with_metrics(requests, strategy=strategy)[0]
 
     def infer_batch_with_metrics(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[tuple[PolicyValueOutput, ...], PolicyValueBatchMetrics]:
         was_training = self.training
         self.eval()
         try:
             with torch.inference_mode():
-                forward_outputs, metrics = self._forward_batch_with_metrics(requests)
+                forward_outputs, metrics = self._forward_batch_with_metrics(
+                    requests,
+                    strategy=strategy,
+                )
         finally:
             if was_training:
                 self.train()
@@ -338,6 +363,9 @@ class PolicyValueModel(nn.Module):
                 PolicyValueOutput(
                     policy_logits=policy_logits,
                     value=float(forward_output.value.detach().cpu().item()),
+                    uncertainty=float(
+                        forward_output.uncertainty.detach().cpu().item()
+                    ),
                 )
             )
         return tuple(outputs), metrics
@@ -367,6 +395,10 @@ def build_policy_value_model(
         from pixie_solver.model.policy_value_v2 import PolicyValueModelV2
 
         return PolicyValueModelV2(active_config, device=device)
+    if active_config.architecture == HYPERNETWORK_MODEL_ARCHITECTURE:
+        from pixie_solver.model.policy_value_v4 import PolicyValueModelV4
+
+        return PolicyValueModelV4(active_config, device=device)
     supported = ", ".join(SUPPORTED_MODEL_ARCHITECTURES)
     raise ValueError(
         f"Unsupported model architecture {active_config.architecture!r}. "

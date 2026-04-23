@@ -16,8 +16,17 @@ The current foundation covers:
 - a search-only MCTS baseline with stable move ids and a deterministic fallback evaluator,
 - deterministic self-play records with replay traces and JSONL export helpers,
 - structured DSL, board, and move encoders for learned strategy,
-- a small PyTorch policy/value network with legal-candidate scoring,
-- a minimal self-play training loop that runs on CPU, MPS, or CUDA,
+- a world-conditioned transformer policy/value path (`world_conditioned_v2`) and
+  a hypernetwork-specialized successor (`hypernetwork_conditioned_v4`),
+- structured `ProgramIR`, `StrategyIR`, and action encoders for learned strategy,
+- strategy providers that can inject static, file-backed, or live frontier-LLM
+  strategy hypotheses into self-play and runtime search,
+- a hypernetwork compiler/cache that turns world + strategy context into frozen
+  executor adapters for the current search episode,
+- an uncertainty-aware search path with adaptive root simulation budgets,
+- an online executable-world runtime that can detect state contradictions,
+  refresh strategy, repair editable programs, and patch the live world model,
+- a self-play training loop that runs on CPU, MPS, or CUDA,
 - a bootstrap path from search-only self-play into model-guided self-play,
 - deterministic search comparison utilities for search-only vs model-guided runs,
 - AlphaZero-style Dirichlet root noise for self-play exploration,
@@ -40,6 +49,9 @@ The current foundation covers:
 - `docs/`: working reference docs for the initial implementation
 - `data/pieces/handauthored/`: hand-authored starter piece programs
 - `src/pixie_solver/`: package source
+- `src/pixie_solver/strategy/`: canonical strategy schema and providers
+- `src/pixie_solver/hypernet/`: world-compiler hypernetwork contracts/cache/layers
+- `src/pixie_solver/world_model/`: executable world-model interfaces and runtime
 - `tests/`: foundation tests
 
 ## Quick Start
@@ -76,6 +88,17 @@ checkpoints do not collapse into a narrow opening sample. Set
 
 `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` emit progress logs to `stderr` during long runs.
 Use `--quiet` if you only want the final JSON summary on `stdout`.
+
+The train/train-loop stack now supports multiple executor architectures through
+`--model-architecture`, including:
+
+- `baseline_v1`
+- `world_conditioned_v2`
+- `hypernetwork_conditioned_v4`
+
+`hypernetwork_conditioned_v4` is the current research path: it conditions on the
+current executable world and active strategy, compiles small adapter bundles for
+the executor, emits uncertainty, and can drive adaptive search budgets.
 
 Use `pixie arena` when you need strength evidence instead of loss-only evidence. It plays
 a candidate checkpoint against a baseline checkpoint with deterministic model-guided MCTS,
@@ -137,45 +160,48 @@ PYTHONPATH=src python3 -m pixie_solver compile-piece \
 
 ## Handoff Snapshot
 
-This repo is in early M5:
+This repo is now in a full executable-world-model research shape:
 
-- The DSL/simulator foundation is in place: hand-authored magical pieces compile through
-  the minimal DSL, orthodox movement and v1 magical modifiers/effects execute
-  deterministically, replay traces are available, threefold/fifty-move draws are handled,
-  and randomized standard openings can include hand-authored special pieces.
-- The search/training foundation is in place: MCTS can run search-only or model-guided,
-  self-play uses root Dirichlet noise, max-ply games use cutoff adjudication for value
-  targets, and the small PyTorch policy/value model can train on CPU, MPS, or CUDA.
+- The deterministic world layer is in place: hand-authored magical pieces compile through
+  the DSL and canonical `ProgramIR`, query logic and legality sit on the program path,
+  replay traces are stable, and the simulator is exact under the current inferred world.
+- The learned executor stack is in place: `world_conditioned_v2` and
+  `hypernetwork_conditioned_v4` can train end-to-end, consume structured world/program
+  semantics, and score legal actions under the current rule set.
+- The strategy-conditioning path is in place: canonical `StrategyIR`, strategy providers,
+  strategy-aware self-play, strategy-aware replay training, and uncertainty-triggered
+  strategy refreshes are all wired through the training/search path.
+- The hypernetwork path is in place: world + strategy context can compile into frozen
+  adapter bundles, and the `v4` executor can specialize per world without retraining from
+  scratch for every rules change.
+- The online runtime path is in place: `OnlineWorldModelRuntime` can act under the current
+  inferred world, compare predicted vs observed transitions, refresh strategy, repair
+  editable programs, and commit joint multi-program repairs when a contradiction spans
+  multiple implicated classes.
 - The operational loop is in place: `pixie selfplay`, `pixie train`, `pixie eval-model`,
   `pixie arena`, and `pixie train-loop` generate artifacts, checkpoints, metrics, and
   progress logs; `scripts/analyze_training_run.py` summarizes run health and arena gates
   without touching an active process.
-- The LLM/rules pipeline is in place: Anthropic/OpenAI providers can compile English
-  descriptions into DSL candidates, mismatch repair can patch programs, and the synthetic
-  piece curriculum can admit verified programs into a registry.
-- The current model has only been validated as a learning smoke test. Policy loss/top-1
-  metrics show it can imitate MCTS targets, cutoff adjudication gives nonzero value
-  targets, and `pixie arena` can now test whether newer checkpoints beat older checkpoints.
+- The main remaining gaps are experimental, not structural: larger held-out evaluations,
+  live LLM-driven strategy experiments, and proof-quality A/B runs against simpler baselines.
 
 ## Next High-Leverage Improvements
 
-1. Run and calibrate arena-gated training. Use fixed arena seeds to compare latest vs.
-   best checkpoints, tune `--promotion-score-threshold`, and confirm that accepted
-   checkpoints improve in held-out matches rather than just fitting generated targets.
-2. Add a persistent replay buffer. Train on a rolling mix of old self-play, fresh
-   self-play, validation holdouts, and eventually curriculum-generated positions instead
-   of one cycle's examples at a time. Keep a fixed validation slice so cycle-to-cycle
-   metrics are comparable.
-3. Improve self-play throughput. The current loop is correct but slow because model-guided
-   MCTS performs many small inference calls. Profile CPU/MPS behavior, batch model
-   inference where possible, and add parallel self-play workers before scaling games.
-4. Tighten self-play quality controls. Keep tuning root noise, temperatures, adjudication
-   thresholds, repetition/draw handling, and opening randomization so games stay diverse
-   and produce useful value targets.
-5. Expand rules/curriculum coverage. Add more synthetic teacher recipes, golden repair
-   fixtures, registry version metadata, and adversarial DSL cases that stress hooks,
-   counters, pushes, phasing, and delayed effects.
-6. Scale the model only after the arena exists. The current architecture is the right
-   shape for PixieChess because legality stays in the simulator and the net scores legal
-   candidates from board + DSL features, but bigger networks are not worth it until the
-   evaluation loop can prove strength gains.
+1. Run real A/B evaluations. Compare `baseline_v1`, `world_conditioned_v2`, and
+   `hypernetwork_conditioned_v4` on held-out rule families and adaptation speed after
+   world changes, not just on training loss or in-distribution self-play.
+2. Connect the live LLM loop. The runtime is ready for strategy refresh and repair,
+   but the decisive experiment is still missing: let a live frontier provider maintain
+   the world model and emit strategies under real contradiction-triggered updates.
+3. Tighten held-out evaluation. Build fixed suites for unseen mechanic families,
+   composition splits, and world-repair episodes so claims about generalization and
+   adaptation are not resting on one curriculum slice.
+4. Improve self-play throughput. The loop is now semantically richer but still slow.
+   Profile adaptive-search behavior, batch model inference more aggressively, and keep
+   pushing CPU worker throughput before scaling game counts.
+5. Expand strategy learning. Right now strategy is injected and consumed structurally.
+   The next leap is proving that strategy-conditioned executors actually adapt faster
+   than pure RL/search baselines under frequent rule changes.
+6. Scale the executor only after the evaluation story is tight. The repo now has the
+   right interfaces for bigger strategy/world-conditioned models, but wider/deeper
+   networks are only worth it once held-out evaluations can prove the gains.

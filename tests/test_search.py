@@ -35,6 +35,22 @@ class _BiasedPolicyValueModel(PolicyValueModel):
         )
 
 
+class _UncertainPolicyValueModel(PolicyValueModel):
+    def __init__(self, *, uncertainty: float) -> None:
+        self.uncertainty = uncertainty
+
+    def infer(self, state: GameState, legal_moves: tuple[Move, ...], *, strategy=None) -> PolicyValueOutput:
+        del strategy
+        return PolicyValueOutput(
+            policy_logits={
+                stable_move_id(move): 0.0
+                for move in legal_moves
+            },
+            value=0.0,
+            uncertainty=self.uncertainty,
+        )
+
+
 class SearchTest(unittest.TestCase):
     def setUp(self) -> None:
         self.king = PieceClass(
@@ -269,6 +285,58 @@ class SearchTest(unittest.TestCase):
             first.metadata["root_noise"],
             first.metadata["root_priors_after_noise"],
         )
+
+    def test_adaptive_search_scales_root_budget_with_model_uncertainty(self) -> None:
+        state = GameState(
+            piece_classes={
+                self.king.class_id: self.king,
+                self.rook.class_id: self.rook,
+            },
+            piece_instances={
+                "white_king": PieceInstance(
+                    instance_id="white_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.WHITE,
+                    square="e1",
+                ),
+                "white_rook": PieceInstance(
+                    instance_id="white_rook",
+                    piece_class_id=self.rook.class_id,
+                    color=Color.WHITE,
+                    square="a1",
+                ),
+                "black_king": PieceInstance(
+                    instance_id="black_king",
+                    piece_class_id=self.king.class_id,
+                    color=Color.BLACK,
+                    square="e8",
+                ),
+            },
+            side_to_move=Color.WHITE,
+        )
+
+        low_uncertainty = run_mcts(
+            state,
+            simulations=8,
+            policy_value_model=_UncertainPolicyValueModel(uncertainty=0.0),
+            adaptive_search=True,
+            adaptive_min_simulations=2,
+            adaptive_max_simulations=6,
+        )
+        high_uncertainty = run_mcts(
+            state,
+            simulations=8,
+            policy_value_model=_UncertainPolicyValueModel(uncertainty=1.0),
+            adaptive_search=True,
+            adaptive_min_simulations=2,
+            adaptive_max_simulations=6,
+        )
+
+        self.assertEqual(2, int(low_uncertainty.metadata["simulations_used"]))
+        self.assertEqual(6, int(high_uncertainty.metadata["simulations_used"]))
+        self.assertEqual(0.0, float(low_uncertainty.metadata["root_uncertainty"]))
+        self.assertEqual(1.0, float(high_uncertainty.metadata["root_uncertainty"]))
+        self.assertTrue(bool(high_uncertainty.metadata["adaptive_search_enabled"]))
 
 
 if __name__ == "__main__":

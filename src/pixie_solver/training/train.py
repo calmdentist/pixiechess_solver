@@ -15,6 +15,7 @@ from pixie_solver.model.policy_value import (
     resolve_device,
 )
 from pixie_solver.training.dataset import SelfPlayExample
+from pixie_solver.utils.serialization import JsonValue, canonical_json
 
 UNIFORM_REPLAY_SAMPLING_STRATEGY = "uniform"
 BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY = "bucket_balanced"
@@ -197,8 +198,9 @@ def train_from_replays(
             if valid_examples == 0:
                 continue
 
-            forward_outputs = model_impl.forward_batch(
-                tuple((example.state, example.legal_moves) for example in valid_batch)
+            forward_outputs = _forward_batch_for_examples(
+                model_impl,
+                valid_batch,
             )
 
             for example, forward_output in zip(
@@ -305,6 +307,52 @@ def train_from_replays(
             )
         )
     return result
+
+
+def _forward_batch_for_examples(
+    model: PolicyValueModel,
+    examples: Sequence[SelfPlayExample],
+):
+    outputs: list[Any] = [None] * len(examples)
+    strategy_groups: dict[str | None, list[int]] = {}
+    strategy_payloads: dict[str | None, dict[str, JsonValue] | None] = {}
+    for index, example in enumerate(examples):
+        strategy = _strategy_from_example_metadata(example.metadata)
+        strategy_key = _strategy_group_key(strategy)
+        strategy_groups.setdefault(strategy_key, []).append(index)
+        strategy_payloads[strategy_key] = strategy
+
+    for strategy_key, indices in strategy_groups.items():
+        requests = tuple(
+            (examples[index].state, examples[index].legal_moves)
+            for index in indices
+        )
+        strategy = strategy_payloads[strategy_key]
+        if strategy is None:
+            group_outputs = model.forward_batch(requests)
+        else:
+            group_outputs = model.forward_batch(
+                requests,
+                strategy=strategy,
+            )
+        for index, output in zip(indices, group_outputs, strict=True):
+            outputs[index] = output
+    return tuple(outputs)
+
+
+def _strategy_from_example_metadata(
+    metadata: dict[str, JsonValue],
+) -> dict[str, JsonValue] | None:
+    strategy = metadata.get("strategy")
+    if not isinstance(strategy, dict):
+        return None
+    return dict(strategy)
+
+
+def _strategy_group_key(strategy: dict[str, JsonValue] | None) -> str | None:
+    if strategy is None:
+        return None
+    return canonical_json(strategy)
 
 
 def _target_policy_tensor(
