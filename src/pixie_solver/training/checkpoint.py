@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from pixie_solver.model.policy_value import (
+    HYPERNETWORK_MODEL_ARCHITECTURE,
     PolicyValueConfig,
     PolicyValueModel,
     build_policy_value_model,
@@ -77,7 +78,26 @@ def load_training_checkpoint(
 
     model_config = PolicyValueConfig(**dict(payload["model_config"]))
     model = build_policy_value_model(model_config, device=map_location)
-    model.load_state_dict(dict(payload["model_state_dict"]))
+    model_state_dict = dict(payload["model_state_dict"])
+    try:
+        model.load_state_dict(model_state_dict)
+    except RuntimeError:
+        if model_config.architecture != HYPERNETWORK_MODEL_ARCHITECTURE:
+            raise
+        missing_keys, unexpected_keys = model.load_state_dict(
+            model_state_dict,
+            strict=False,
+        )
+        if unexpected_keys:
+            raise
+        allowed_missing_prefixes = ("world_compiler.",)
+        disallowed_missing = [
+            key
+            for key in missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+        if disallowed_missing:
+            raise
 
     training_config_payload = payload.get("training_config")
     training_metrics_payload = payload.get("training_metrics")

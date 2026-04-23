@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 
 from pixie_solver.core import stable_move_id, standard_initial_state
 from pixie_solver.model import (
+    HYPERNETWORK_MODEL_ARCHITECTURE,
     PolicyValueConfig,
     PolicyValueModel,
     build_policy_value_model,
@@ -124,6 +125,52 @@ class BatchedInferenceTest(unittest.TestCase):
         self.assertGreaterEqual(output.value, -1.0)
         self.assertLessEqual(output.value, 1.0)
         self.assertEqual(1, stats.requests_completed)
+
+    def test_batched_inference_service_supports_strategy_requests_for_v4(self) -> None:
+        state = standard_initial_state()
+        moves = tuple(legal_moves(state))
+        model = build_policy_value_model(
+            PolicyValueConfig(
+                architecture=HYPERNETWORK_MODEL_ARCHITECTURE,
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "hypernetwork_conditioned.pt"
+            save_training_checkpoint(checkpoint_path, model=model)
+            with BatchedInferenceService(
+                checkpoint_path,
+                device="cpu",
+                config=BatchedInferenceConfig(max_batch_size=2, max_wait_ms=20.0),
+            ) as service:
+                client = service.client()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    outputs = list(
+                        executor.map(
+                            lambda strategy_id: client.infer(
+                                state,
+                                moves,
+                                strategy={
+                                    "strategy_id": strategy_id,
+                                    "summary": f"plan for {strategy_id}",
+                                    "confidence": 0.8,
+                                    "scope": "game_start",
+                                },
+                            ),
+                            ("plan_a", "plan_b"),
+                        )
+                    )
+                stats = service.stats()
+
+        self.assertEqual(2, len(outputs))
+        self.assertTrue(all(0.0 <= output.uncertainty <= 1.0 for output in outputs))
+        self.assertEqual(2, stats.requests_completed)
 
 
 if __name__ == "__main__":

@@ -17,8 +17,11 @@ from pixie_solver.core import sample_standard_initial_state, stable_move_id, sta
 from pixie_solver.core.state import GameState
 from pixie_solver.dsl import compile_piece_file
 from pixie_solver.model import PolicyValueConfig, build_policy_value_model
+from pixie_solver.model.policy_value import PolicyValueOutput
 from pixie_solver.simulator.engine import result
 from pixie_solver.simulator.movegen import legal_moves
+from pixie_solver.strategy import StrategyHypothesis
+from pixie_solver.strategy.providers import StrategyRequest, StrategyResponse
 from pixie_solver.training import (
     SelfPlayConfig,
     flatten_selfplay_examples,
@@ -32,6 +35,60 @@ from pixie_solver.training import (
     write_selfplay_games_jsonl,
 )
 from pixie_solver.utils import replay_trace
+
+
+class _StrategyAwarePolicyValueModel:
+    def __init__(self, *, uncertainty: float) -> None:
+        self.uncertainty = uncertainty
+
+    def infer(self, state, legal_moves, *, strategy=None):
+        preferred_move = legal_moves[0] if legal_moves else None
+        preferred_move_id = None if preferred_move is None else stable_move_id(preferred_move)
+        logits = {
+            stable_move_id(move): (
+                1.0 if stable_move_id(move) == preferred_move_id else 0.0
+            )
+            for move in legal_moves
+        }
+        if strategy is not None:
+            logits = {
+                move_id: logit + (0.1 if move_id == preferred_move_id else 0.0)
+                for move_id, logit in logits.items()
+            }
+        return PolicyValueOutput(
+            policy_logits=logits,
+            value=0.0,
+            uncertainty=self.uncertainty,
+        )
+
+
+class _RefreshingStrategyProvider:
+    def __init__(self) -> None:
+        self.phases: list[str] = []
+
+    def propose_strategy(self, request: StrategyRequest) -> StrategyResponse:
+        self.phases.append(request.phase)
+        if request.phase == "game_start":
+            return StrategyResponse(
+                strategy={
+                    "strategy_id": "activate_rook",
+                    "summary": "activate the rook quickly",
+                    "confidence": 0.8,
+                    "scope": "game_start",
+                },
+                explanation="initial strategy",
+                metadata={"provider": "test"},
+            )
+        return StrategyResponse(
+            strategy={
+                "strategy_id": "refresh_plan",
+                "summary": "re-evaluate and simplify into direct pressure",
+                "confidence": 0.9,
+                "scope": "refresh",
+            },
+            explanation="refresh strategy",
+            metadata={"provider": "test"},
+        )
 
 
 class SelfPlayTest(unittest.TestCase):
@@ -259,6 +316,75 @@ class SelfPlayTest(unittest.TestCase):
 
         self.assertFalse(game.examples[0].metadata["root_noise_applied"])
         self.assertEqual(0.0, game.examples[0].metadata["root_exploration_fraction"])
+
+    def test_selfplay_records_strategy_and_adaptive_search_metadata(self) -> None:
+        config = SelfPlayConfig(
+            simulations=6,
+            max_plies=1,
+            opening_temperature=0.0,
+            final_temperature=0.0,
+            temperature_drop_after_ply=0,
+            seed=17,
+            root_exploration_fraction=0.0,
+            strategy=StrategyHypothesis(
+                strategy_id="activate_rook",
+                summary="activate the rook quickly",
+                confidence=0.9,
+                scope="game_start",
+                action_biases=("rook lift",),
+            ),
+            adaptive_search=True,
+            adaptive_min_simulations=2,
+            adaptive_max_simulations=5,
+        )
+
+        game = generate_selfplay_games(
+            [self.initial_state],
+            games=1,
+            config=config,
+            policy_value_model=_StrategyAwarePolicyValueModel(uncertainty=1.0),
+        )[0]
+
+        example = game.examples[0]
+        self.assertEqual("activate_rook", example.metadata["strategy"]["strategy_id"])
+        self.assertEqual("game_start", example.metadata["strategy_scope"])
+        self.assertIsNotNone(example.metadata["strategy_digest"])
+        self.assertTrue(bool(example.metadata["adaptive_search_enabled"]))
+        self.assertEqual(5, int(example.metadata["simulations_used"]))
+        self.assertEqual(1.0, float(example.metadata["root_uncertainty"]))
+        self.assertEqual("activate_rook", game.metadata["strategy"]["strategy_id"])
+        self.assertEqual("activate_rook", game.replay_trace.metadata["strategy"]["strategy_id"])
+
+    def test_selfplay_can_refresh_strategy_on_high_uncertainty(self) -> None:
+        provider = _RefreshingStrategyProvider()
+        config = SelfPlayConfig(
+            simulations=4,
+            max_plies=1,
+            opening_temperature=0.0,
+            final_temperature=0.0,
+            temperature_drop_after_ply=0,
+            seed=17,
+            root_exploration_fraction=0.0,
+            adaptive_search=True,
+            adaptive_min_simulations=1,
+            adaptive_max_simulations=3,
+            strategy_refresh_on_uncertainty=True,
+            strategy_refresh_uncertainty_threshold=0.5,
+        )
+
+        game = generate_selfplay_games(
+            [self.initial_state],
+            games=1,
+            config=config,
+            policy_value_model=_StrategyAwarePolicyValueModel(uncertainty=1.0),
+            strategy_provider=provider,
+        )[0]
+
+        self.assertEqual(["game_start", "high_uncertainty"], provider.phases)
+        self.assertEqual(1, game.metadata["strategy_refreshes"])
+        self.assertEqual("refresh_plan", game.metadata["strategy"]["strategy_id"])
+        self.assertEqual("activate_rook", game.metadata["initial_strategy"]["strategy_id"])
+        self.assertEqual("refresh_plan", game.examples[0].metadata["strategy"]["strategy_id"])
 
     def test_selfplay_jsonl_round_trip(self) -> None:
         games = generate_selfplay_games([self.initial_state], games=2, config=self.config)

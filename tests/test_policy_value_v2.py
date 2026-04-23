@@ -86,8 +86,10 @@ class PolicyValueV2Test(unittest.TestCase):
 
         self.assertEqual(tuple(stable_move_id(move) for move in moves), forward_output.move_ids)
         self.assertEqual((len(moves),), tuple(forward_output.policy_logits.shape))
+        self.assertEqual(0.0, float(forward_output.uncertainty.detach().cpu().item()))
         self.assertGreaterEqual(infer_output[0].value, -1.0)
         self.assertLessEqual(infer_output[0].value, 1.0)
+        self.assertEqual(0.0, infer_output[0].uncertainty)
         self.assertEqual(0.0, metrics.consequence_total_ms)
         self.assertGreaterEqual(metrics.move_encode_ms, 0.0)
 

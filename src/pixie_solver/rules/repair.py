@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any
 
 from pixie_solver.core import GameState, Move
@@ -92,6 +93,29 @@ def repair_and_verify_piece(
     dsl_reference: dict[str, JsonValue] | None = None,
     allow_piece_id_change: bool = False,
 ) -> RepairResult:
+    return repair_and_verify_piece_candidates(
+        mismatch,
+        description=description,
+        current_program=current_program,
+        provider=provider,
+        regression_cases=regression_cases,
+        dsl_reference=dsl_reference,
+        allow_piece_id_change=allow_piece_id_change,
+        candidate_count=1,
+    )[0]
+
+
+def repair_and_verify_piece_candidates(
+    mismatch: StateMismatch,
+    *,
+    description: str,
+    current_program: dict[str, Any],
+    provider: PieceProgramRepairProvider,
+    regression_cases: tuple[ReplayCase, ...] = (),
+    dsl_reference: dict[str, JsonValue] | None = None,
+    allow_piece_id_change: bool = False,
+    candidate_count: int = 1,
+) -> tuple[RepairResult, ...]:
     canonical_current = canonicalize_piece_program(current_program)
     request = RepairRequest(
         description=description,
@@ -106,8 +130,60 @@ def repair_and_verify_piece(
         implicated_piece_class_ids=mismatch.implicated_piece_class_ids,
         dsl_reference=dsl_reference or default_dsl_reference(),
     )
+    responses = _repair_candidate_responses(provider, request, candidate_count)
+    if not responses:
+        return (
+            RepairResult(
+                accepted=False,
+                current_program=canonical_current,
+                verification_errors=("repair provider returned no candidates",),
+                metadata={"stage": "provider"},
+            ),
+        )
 
-    response = provider.repair_piece(request)
+    results: list[RepairResult] = []
+    seen_signatures: set[str] = set()
+    for candidate_index, response in enumerate(responses):
+        result = verify_repair_response(
+            mismatch,
+            current_program=canonical_current,
+            response=response,
+            regression_cases=regression_cases,
+            allow_piece_id_change=allow_piece_id_change,
+        )
+        if result.patched_program is not None:
+            signature = json.dumps(result.patched_program, sort_keys=True)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+        results.append(
+            RepairResult(
+                accepted=result.accepted,
+                current_program=result.current_program,
+                patched_program=result.patched_program,
+                response=result.response,
+                verification_errors=result.verification_errors,
+                primary_diff_after_repair=result.primary_diff_after_repair,
+                verified_cases=result.verified_cases,
+                metadata={
+                    **dict(result.metadata),
+                    "candidate_index": candidate_index,
+                    "candidate_count": len(responses),
+                },
+            )
+        )
+    return tuple(results)
+
+
+def verify_repair_response(
+    mismatch: StateMismatch,
+    *,
+    current_program: dict[str, Any],
+    response: RepairResponse,
+    regression_cases: tuple[ReplayCase, ...] = (),
+    allow_piece_id_change: bool = False,
+) -> RepairResult:
+    canonical_current = canonicalize_piece_program(current_program)
     errors: list[str] = []
     try:
         patched_program = canonicalize_piece_program(response.patched_program)
@@ -181,6 +257,21 @@ def default_dsl_reference() -> dict[str, JsonValue]:
         "edge_behaviors": sorted(schema.EDGE_BEHAVIORS),
         "state_field_types": sorted(schema.STATE_FIELD_TYPES),
     }
+
+
+def _repair_candidate_responses(
+    provider: PieceProgramRepairProvider,
+    request: RepairRequest,
+    candidate_count: int,
+) -> tuple[RepairResponse, ...]:
+    if candidate_count < 1:
+        raise ValueError("candidate_count must be at least 1")
+    repair_piece_candidates = getattr(provider, "repair_piece_candidates", None)
+    if callable(repair_piece_candidates):
+        responses = tuple(repair_piece_candidates(request, candidate_count))
+        if responses:
+            return responses[:candidate_count]
+    return (provider.repair_piece(request),)
 
 
 def _verify_case(

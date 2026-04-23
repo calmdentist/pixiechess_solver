@@ -15,6 +15,12 @@ from pixie_solver.search import (
     StateEvaluator,
     run_mcts,
 )
+from pixie_solver.strategy import (
+    StrategyHypothesis,
+    StrategyProvider,
+    StrategyRequest,
+    strategy_digest as compute_strategy_digest,
+)
 from pixie_solver.simulator.engine import apply_move, result
 from pixie_solver.training.dataset import SelfPlayExample, SelfPlayGame
 from pixie_solver.training.checkpoint import load_training_checkpoint
@@ -25,7 +31,7 @@ from pixie_solver.training.inference_service import (
     BatchedInferenceStats,
 )
 from pixie_solver.utils import build_replay_trace
-from pixie_solver.utils.serialization import JsonValue
+from pixie_solver.utils.serialization import JsonValue, to_primitive
 
 SELFPLAY_SEED_STRIDE = 1_000_003
 _WORKER_MODEL_CACHE: dict[tuple[str, str | None], PolicyValueModel] = {}
@@ -44,6 +50,12 @@ class SelfPlayConfig:
     seed: int = 0
     adjudicate_max_plies: bool = True
     adjudication_threshold: float = 0.2
+    strategy: StrategyHypothesis | dict[str, JsonValue] | None = None
+    adaptive_search: bool = False
+    adaptive_min_simulations: int | None = None
+    adaptive_max_simulations: int | None = None
+    strategy_refresh_on_uncertainty: bool = False
+    strategy_refresh_uncertainty_threshold: float = 0.75
 
     def __post_init__(self) -> None:
         if self.max_plies < 0:
@@ -54,6 +66,25 @@ class SelfPlayConfig:
             raise ValueError("root_exploration_fraction must be in [0, 1]")
         if self.adjudication_threshold < 0.0 or self.adjudication_threshold > 1.0:
             raise ValueError("adjudication_threshold must be in [0, 1]")
+        if self.adaptive_min_simulations is not None and self.adaptive_min_simulations < 1:
+            raise ValueError("adaptive_min_simulations must be at least 1")
+        if self.adaptive_max_simulations is not None and self.adaptive_max_simulations < 1:
+            raise ValueError("adaptive_max_simulations must be at least 1")
+        if (
+            self.adaptive_min_simulations is not None
+            and self.adaptive_max_simulations is not None
+            and self.adaptive_max_simulations < self.adaptive_min_simulations
+        ):
+            raise ValueError(
+                "adaptive_max_simulations must be greater than or equal to adaptive_min_simulations"
+            )
+        if self.strategy is not None:
+            object.__setattr__(self, "strategy", dict(to_primitive(self.strategy)))
+        if (
+            self.strategy_refresh_uncertainty_threshold < 0.0
+            or self.strategy_refresh_uncertainty_threshold > 1.0
+        ):
+            raise ValueError("strategy_refresh_uncertainty_threshold must be in [0, 1]")
 
     def temperature_for_ply(self, ply: int) -> float:
         if ply < self.temperature_drop_after_ply:
@@ -124,6 +155,7 @@ def generate_selfplay_games(
     config: SelfPlayConfig | None = None,
     policy_value_model: PolicyValueModel | None = None,
     evaluator: StateEvaluator | None = None,
+    strategy_provider: StrategyProvider | None = None,
     progress_callback: Callable[[SelfPlayProgress], None] | None = None,
     trace_callback: Callable[[SelfPlayTraceEvent], None] | None = None,
 ) -> list[SelfPlayGame]:
@@ -147,6 +179,7 @@ def generate_selfplay_games(
                 rng=random.Random(game_seed),
                 policy_value_model=policy_value_model,
                 evaluator=evaluator,
+                strategy_provider=strategy_provider,
                 progress_callback=progress_callback,
                 trace_callback=trace_callback,
             )
@@ -164,6 +197,7 @@ def generate_selfplay_games_parallel(
     device: str | None = None,
     batched_inference_config: BatchedInferenceConfig | None = None,
     inference_device: str | None = None,
+    strategy_provider: StrategyProvider | None = None,
     progress_callback: Callable[[SelfPlayProgress], None] | None = None,
 ) -> tuple[list[SelfPlayGame], BatchedInferenceStats | None]:
     if games < 1:
@@ -186,9 +220,14 @@ def generate_selfplay_games_parallel(
                 games=games,
                 config=active_config,
                 policy_value_model=model,
+                strategy_provider=strategy_provider,
                 progress_callback=progress_callback,
             ),
             None,
+        )
+    if strategy_provider is not None and active_config.strategy_refresh_on_uncertainty:
+        raise ValueError(
+            "parallel self-play does not support uncertainty-triggered strategy refresh"
         )
 
     config_payload = asdict(active_config)
@@ -205,6 +244,12 @@ def generate_selfplay_games_parallel(
                 games=games,
                 workers=workers,
                 config_payload=config_payload,
+                strategy_payloads=_parallel_strategy_payloads(
+                    initial_states=initial_states,
+                    games=games,
+                    config=active_config,
+                    strategy_provider=strategy_provider,
+                ),
                 checkpoint_payload=None,
                 device=device,
                 inference_client=inference_service.client(),
@@ -219,6 +264,12 @@ def generate_selfplay_games_parallel(
             games=games,
             workers=workers,
             config_payload=config_payload,
+            strategy_payloads=_parallel_strategy_payloads(
+                initial_states=initial_states,
+                games=games,
+                config=active_config,
+                strategy_provider=strategy_provider,
+            ),
             checkpoint_payload=checkpoint_payload,
             device=device,
             inference_client=None,
@@ -234,6 +285,7 @@ def _run_parallel_selfplay_jobs(
     games: int,
     workers: int,
     config_payload: dict[str, object],
+    strategy_payloads: Sequence[dict[str, JsonValue] | None],
     checkpoint_payload: str | None,
     device: str | None,
     inference_client: BatchedInferenceClient | None,
@@ -244,7 +296,10 @@ def _run_parallel_selfplay_jobs(
             "initial_state": initial_states[game_index % len(initial_states)].to_dict(),
             "game_index": game_index,
             "games_total": games,
-            "config": config_payload,
+            "config": {
+                **config_payload,
+                "strategy": strategy_payloads[game_index],
+            },
             "checkpoint_path": checkpoint_payload,
             "device": device,
             "inference_client": inference_client,
@@ -327,6 +382,7 @@ def _play_single_game(
     rng: random.Random,
     policy_value_model: PolicyValueModel | None,
     evaluator: StateEvaluator | None,
+    strategy_provider: StrategyProvider | None,
     progress_callback: Callable[[SelfPlayProgress], None] | None,
     trace_callback: Callable[[SelfPlayTraceEvent], None] | None,
 ) -> SelfPlayGame:
@@ -336,6 +392,20 @@ def _play_single_game(
     termination_reason = "max_plies"
     game_result: str | None = None
     adjudication: CutoffAdjudication | None = None
+    initial_strategy_payload, strategy_provider_metadata = _resolve_strategy(
+        state=state,
+        strategy=config.strategy,
+        strategy_provider=strategy_provider,
+        phase="game_start",
+        metadata={
+            "game_index": game_index,
+            "games_total": games_total,
+        },
+    )
+    current_strategy_payload = initial_strategy_payload
+    strategy_digest = _strategy_digest(current_strategy_payload)
+    strategy_scope = _strategy_scope(current_strategy_payload)
+    strategy_refreshes = 0
     if progress_callback is not None:
         progress_callback(
             SelfPlayProgress(
@@ -371,7 +441,52 @@ def _play_single_game(
             c_puct=config.c_puct,
             root_noise=config.root_noise_for_selfplay(),
             rng=rng,
+            strategy=current_strategy_payload,
+            adaptive_search=config.adaptive_search,
+            adaptive_min_simulations=config.adaptive_min_simulations,
+            adaptive_max_simulations=config.adaptive_max_simulations,
         )
+        if (
+            strategy_provider is not None
+            and config.strategy_refresh_on_uncertainty
+            and float(search_result.metadata.get("root_uncertainty", 0.0))
+            >= config.strategy_refresh_uncertainty_threshold
+        ):
+            refreshed_strategy, refresh_metadata = _resolve_strategy(
+                state=state,
+                strategy=current_strategy_payload,
+                strategy_provider=strategy_provider,
+                phase="high_uncertainty",
+                metadata={
+                    "game_index": game_index,
+                    "games_total": games_total,
+                    "ply": ply,
+                    "root_uncertainty": search_result.metadata.get("root_uncertainty"),
+                },
+            )
+            refreshed_digest = _strategy_digest(refreshed_strategy)
+            if refreshed_digest != strategy_digest:
+                current_strategy_payload = refreshed_strategy
+                strategy_digest = refreshed_digest
+                strategy_scope = _strategy_scope(current_strategy_payload)
+                strategy_refreshes += 1
+                strategy_provider_metadata = {
+                    **dict(strategy_provider_metadata),
+                    f"refresh_{strategy_refreshes}": refresh_metadata,
+                }
+                search_result = run_mcts(
+                    state,
+                    simulations=config.simulations,
+                    policy_value_model=policy_value_model,
+                    evaluator=evaluator,
+                    c_puct=config.c_puct,
+                    root_noise=config.root_noise_for_selfplay(),
+                    rng=rng,
+                    strategy=current_strategy_payload,
+                    adaptive_search=config.adaptive_search,
+                    adaptive_min_simulations=config.adaptive_min_simulations,
+                    adaptive_max_simulations=config.adaptive_max_simulations,
+                )
         chosen_move, chosen_move_id = _select_move_for_selfplay(
             search_result=search_result,
             temperature=config.temperature_for_ply(ply),
@@ -406,6 +521,9 @@ def _play_single_game(
                     "game_index": game_index,
                     "ply": ply,
                     "temperature": config.temperature_for_ply(ply),
+                    "strategy": current_strategy_payload,
+                    "strategy_digest": strategy_digest,
+                    "strategy_scope": strategy_scope,
                     **dict(search_result.metadata),
                 },
             )
@@ -430,6 +548,7 @@ def _play_single_game(
                     metadata={
                         "temperature": config.temperature_for_ply(ply),
                         "legal_move_count": len(search_result.legal_moves),
+                        "strategy_digest": strategy_digest,
                     },
                 )
             )
@@ -470,6 +589,19 @@ def _play_single_game(
             "root_exploration_fraction": config.root_exploration_fraction,
             "adjudicate_max_plies": config.adjudicate_max_plies,
             "adjudication_threshold": config.adjudication_threshold,
+            "initial_strategy": initial_strategy_payload,
+            "strategy": current_strategy_payload,
+            "strategy_digest": strategy_digest,
+            "strategy_scope": strategy_scope,
+            "strategy_refreshes": strategy_refreshes,
+            "strategy_provider": strategy_provider_metadata,
+            "strategy_refresh_on_uncertainty": config.strategy_refresh_on_uncertainty,
+            "strategy_refresh_uncertainty_threshold": (
+                config.strategy_refresh_uncertainty_threshold
+            ),
+            "adaptive_search": config.adaptive_search,
+            "adaptive_min_simulations": config.adaptive_min_simulations,
+            "adaptive_max_simulations": config.adaptive_max_simulations,
             "cutoff_adjudication": (
                 adjudication.to_dict() if adjudication is not None else None
             ),
@@ -490,6 +622,19 @@ def _play_single_game(
             "cutoff_adjudication": (
                 adjudication.to_dict() if adjudication is not None else None
             ),
+            "initial_strategy": initial_strategy_payload,
+            "strategy": current_strategy_payload,
+            "strategy_digest": strategy_digest,
+            "strategy_scope": strategy_scope,
+            "strategy_refreshes": strategy_refreshes,
+            "strategy_provider": strategy_provider_metadata,
+            "strategy_refresh_on_uncertainty": config.strategy_refresh_on_uncertainty,
+            "strategy_refresh_uncertainty_threshold": (
+                config.strategy_refresh_uncertainty_threshold
+            ),
+            "adaptive_search": config.adaptive_search,
+            "adaptive_min_simulations": config.adaptive_min_simulations,
+            "adaptive_max_simulations": config.adaptive_max_simulations,
         },
     )
     if trace_callback is not None:
@@ -611,9 +756,95 @@ def _parallel_selfplay_worker(job: dict[str, object]) -> dict[str, JsonValue]:
         rng=random.Random(game_seed),
         policy_value_model=model,
         evaluator=None,
+        strategy_provider=None,
         progress_callback=None,
         trace_callback=None,
     )
     game.metadata["parallel_worker"] = True
     game.replay_trace.metadata["parallel_worker"] = True
     return game.to_dict()
+
+
+def _parallel_strategy_payloads(
+    *,
+    initial_states: Sequence[GameState],
+    games: int,
+    config: SelfPlayConfig,
+    strategy_provider: StrategyProvider | None,
+) -> list[dict[str, JsonValue] | None]:
+    if strategy_provider is None:
+        return [_strategy_payload(config.strategy) for _ in range(games)]
+    payloads: list[dict[str, JsonValue] | None] = []
+    for game_index in range(games):
+        state = _clone_state(initial_states[game_index % len(initial_states)])
+        strategy_payload, _ = _resolve_strategy(
+            state=state,
+            strategy=config.strategy,
+            strategy_provider=strategy_provider,
+            phase="game_start",
+            metadata={
+                "game_index": game_index,
+                "games_total": games,
+            },
+        )
+        payloads.append(strategy_payload)
+    return payloads
+
+
+def _resolve_strategy(
+    *,
+    state: GameState,
+    strategy: StrategyHypothesis | dict[str, JsonValue] | None,
+    strategy_provider: StrategyProvider | None,
+    phase: str,
+    metadata: dict[str, JsonValue],
+) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue]]:
+    strategy_payload = _strategy_payload(strategy)
+    if strategy_provider is None:
+        return strategy_payload, {"provider": None, "phase": phase}
+    request = StrategyRequest(
+        state=state.to_dict(),
+        world_summary=_world_summary(state),
+        phase=phase,
+        prior_strategy=strategy_payload,
+        metadata=metadata,
+    )
+    response = strategy_provider.propose_strategy(request)
+    return dict(response.strategy), {
+        "provider": type(strategy_provider).__name__,
+        "phase": phase,
+        "explanation": response.explanation,
+        **dict(response.metadata),
+    }
+
+
+def _strategy_payload(
+    strategy: StrategyHypothesis | dict[str, JsonValue] | None,
+) -> dict[str, JsonValue] | None:
+    if strategy is None:
+        return None
+    return dict(to_primitive(strategy))
+
+
+def _strategy_digest(strategy: dict[str, JsonValue] | None) -> str | None:
+    if strategy is None:
+        return None
+    return compute_strategy_digest(strategy)
+
+
+def _strategy_scope(strategy: dict[str, JsonValue] | None) -> str | None:
+    if strategy is None:
+        return None
+    scope = strategy.get("scope")
+    return None if scope is None else str(scope)
+
+
+def _world_summary(state: GameState) -> dict[str, JsonValue]:
+    return {
+        "side_to_move": state.side_to_move.value,
+        "piece_classes": {
+            class_id: dict(to_primitive(piece_class))
+            for class_id, piece_class in sorted(state.piece_classes.items())
+        },
+        "active_piece_count": len(state.active_pieces()),
+    }

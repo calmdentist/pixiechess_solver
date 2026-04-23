@@ -30,9 +30,11 @@ from pixie_solver.model import (
     BASELINE_MODEL_ARCHITECTURE,
     BoardEncoder,
     DSLFeatureEncoder,
+    HYPERNETWORK_MODEL_ARCHITECTURE,
     PolicyValueConfig,
     PolicyValueModel,
     PolicyValueModelV2,
+    PolicyValueModelV4,
     WORLD_CONDITIONED_MODEL_ARCHITECTURE,
     build_policy_value_model,
 )
@@ -201,6 +203,21 @@ class ModelTest(unittest.TestCase):
         )
 
         self.assertIsInstance(model, PolicyValueModelV2)
+
+    def test_build_policy_value_model_supports_hypernetwork_conditioned_v4(self) -> None:
+        model = build_policy_value_model(
+            PolicyValueConfig(
+                architecture=HYPERNETWORK_MODEL_ARCHITECTURE,
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        self.assertIsInstance(model, PolicyValueModelV4)
 
     def test_train_from_replays_smoke(self) -> None:
         games = generate_selfplay_games(
@@ -376,6 +393,38 @@ class ModelTest(unittest.TestCase):
 
         self.assertEqual(BASELINE_MODEL_ARCHITECTURE, loaded.model_config.architecture)
         self.assertEqual(BASELINE_MODEL_ARCHITECTURE, loaded.model.config.architecture)
+
+    def test_hypernetwork_checkpoint_round_trip_preserves_architecture(self) -> None:
+        model = build_policy_value_model(
+            PolicyValueConfig(
+                architecture=HYPERNETWORK_MODEL_ARCHITECTURE,
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "hyper_model.pt"
+            save_training_checkpoint(
+                checkpoint_path,
+                model=model,
+                metadata={"architecture": HYPERNETWORK_MODEL_ARCHITECTURE},
+            )
+            loaded = load_training_checkpoint(checkpoint_path, device="cpu")
+
+        self.assertEqual(
+            HYPERNETWORK_MODEL_ARCHITECTURE,
+            loaded.model_config.architecture,
+        )
+        self.assertEqual(
+            HYPERNETWORK_MODEL_ARCHITECTURE,
+            loaded.model.config.architecture,
+        )
+        self.assertIsInstance(loaded.model, PolicyValueModelV4)
 
 
 if __name__ == "__main__":

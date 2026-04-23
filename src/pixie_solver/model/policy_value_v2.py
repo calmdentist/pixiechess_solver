@@ -155,19 +155,26 @@ class PolicyValueModelV2(nn.Module):
         self,
         state: GameState,
         legal_moves: Sequence[Move],
+        *,
+        strategy: object | None = None,
     ) -> PolicyValueForwardOutput:
-        return self.forward_batch(((state, legal_moves),))[0]
+        return self.forward_batch(((state, legal_moves),), strategy=strategy)[0]
 
     def forward_batch(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[PolicyValueForwardOutput, ...]:
-        return self._forward_batch_with_metrics(requests)[0]
+        return self._forward_batch_with_metrics(requests, strategy=strategy)[0]
 
     def _forward_batch_with_metrics(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[tuple[PolicyValueForwardOutput, ...], PolicyValueBatchMetrics]:
+        del strategy
         total_start = time.perf_counter()
         if not requests:
             return (), PolicyValueBatchMetrics()
@@ -282,6 +289,11 @@ class PolicyValueModelV2(nn.Module):
                     move_ids=encoded_actions.move_ids,
                     policy_logits=policy_logits,
                     value=values[request_index],
+                    uncertainty=torch.zeros(
+                        (),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
                 )
             )
 
@@ -305,24 +317,33 @@ class PolicyValueModelV2(nn.Module):
         self,
         state: GameState,
         legal_moves: Sequence[Move],
+        *,
+        strategy: object | None = None,
     ) -> PolicyValueOutput:
-        return self.infer_batch(((state, legal_moves),))[0]
+        return self.infer_batch(((state, legal_moves),), strategy=strategy)[0]
 
     def infer_batch(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[PolicyValueOutput, ...]:
-        return self.infer_batch_with_metrics(requests)[0]
+        return self.infer_batch_with_metrics(requests, strategy=strategy)[0]
 
     def infer_batch_with_metrics(
         self,
         requests: Sequence[tuple[GameState, Sequence[Move]]],
+        *,
+        strategy: object | None = None,
     ) -> tuple[tuple[PolicyValueOutput, ...], PolicyValueBatchMetrics]:
         was_training = self.training
         self.eval()
         try:
             with torch.inference_mode():
-                forward_outputs, metrics = self._forward_batch_with_metrics(requests)
+                forward_outputs, metrics = self._forward_batch_with_metrics(
+                    requests,
+                    strategy=strategy,
+                )
         finally:
             if was_training:
                 self.train()
@@ -340,6 +361,9 @@ class PolicyValueModelV2(nn.Module):
                         )
                     },
                     value=float(forward_output.value.detach().cpu().item()),
+                    uncertainty=float(
+                        forward_output.uncertainty.detach().cpu().item()
+                    ),
                 )
             )
         return tuple(outputs), metrics

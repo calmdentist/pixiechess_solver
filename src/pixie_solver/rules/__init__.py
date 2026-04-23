@@ -31,6 +31,8 @@ from pixie_solver.rules.repair import (
     RepairResult,
     ReplayCase,
     repair_and_verify_piece,
+    repair_and_verify_piece_candidates,
+    verify_repair_response,
 )
 
 __all__ = [
@@ -60,4 +62,6 @@ __all__ = [
     "registry_piece_record_metadata",
     "registry_piece_training_metadata",
     "repair_and_verify_piece",
+    "repair_and_verify_piece_candidates",
+    "verify_repair_response",
 ]

@@ -11,8 +11,9 @@ from typing import Any
 
 from pixie_solver.core import GameState, Move
 from pixie_solver.model.policy_value import PolicyValueBatchMetrics, PolicyValueOutput
+from pixie_solver.strategy import strategy_digest as compute_strategy_digest
 from pixie_solver.training.checkpoint import load_training_checkpoint
-from pixie_solver.utils.serialization import JsonValue
+from pixie_solver.utils.serialization import JsonValue, to_primitive
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +117,11 @@ class BatchedInferenceClient:
         self,
         state: GameState,
         legal_moves: tuple[Move, ...] | list[Move],
+        *,
+        strategy: object | None = None,
     ) -> PolicyValueOutput:
         request_id = f"{os.getpid()}-{time.monotonic_ns()}-{uuid.uuid4().hex}"
+        strategy_payload = None if strategy is None else dict(to_primitive(strategy))
         self.request_queue.put(
             {
                 "type": "infer",
@@ -125,6 +129,12 @@ class BatchedInferenceClient:
                 "submitted_at_ns": time.monotonic_ns(),
                 "state": state.to_dict(),
                 "legal_moves": [move.to_dict() for move in legal_moves],
+                "strategy": strategy_payload,
+                "strategy_digest": (
+                    None
+                    if strategy_payload is None
+                    else compute_strategy_digest(strategy_payload)
+                ),
             }
         )
         deadline = time.monotonic() + self.timeout_seconds
@@ -141,6 +151,7 @@ class BatchedInferenceClient:
                     for move_id, logit in dict(response["policy_logits"]).items()
                 },
                 value=float(response["value"]),
+                uncertainty=float(response.get("uncertainty", 0.0)),
             )
         raise TimeoutError(f"Timed out waiting for inference response {request_id}")
 
@@ -337,9 +348,67 @@ def _serve_inference(
                 for request in batch
             ]
             deserialize_ms = (time.perf_counter() - deserialize_start) * 1000.0
-            outputs, model_metrics = model.infer_batch_with_metrics(
-                tuple(zip(states, move_batches, strict=True))
-            )
+            outputs = [None] * len(batch)
+            strategy_groups: dict[str | None, list[int]] = {}
+            for index, request in enumerate(batch):
+                strategy_groups.setdefault(
+                    (
+                        None
+                        if request.get("strategy_digest") is None
+                        else str(request["strategy_digest"])
+                    ),
+                    [],
+                ).append(index)
+            for group_indices in strategy_groups.values():
+                group_strategy = batch[group_indices[0]].get("strategy")
+                group_requests = tuple(
+                    (states[index], move_batches[index])
+                    for index in group_indices
+                )
+                group_outputs, group_metrics = model.infer_batch_with_metrics(
+                    group_requests,
+                    strategy=group_strategy,
+                )
+                model_metrics = PolicyValueBatchMetrics(
+                    requests=model_metrics.requests + group_metrics.requests,
+                    total_legal_moves=(
+                        model_metrics.total_legal_moves + group_metrics.total_legal_moves
+                    ),
+                    total_ms=model_metrics.total_ms + group_metrics.total_ms,
+                    board_encode_ms=(
+                        model_metrics.board_encode_ms + group_metrics.board_encode_ms
+                    ),
+                    transformer_ms=(
+                        model_metrics.transformer_ms + group_metrics.transformer_ms
+                    ),
+                    move_encode_ms=(
+                        model_metrics.move_encode_ms + group_metrics.move_encode_ms
+                    ),
+                    policy_head_ms=(
+                        model_metrics.policy_head_ms + group_metrics.policy_head_ms
+                    ),
+                    value_head_ms=(
+                        model_metrics.value_head_ms + group_metrics.value_head_ms
+                    ),
+                    consequence_total_ms=(
+                        model_metrics.consequence_total_ms
+                        + group_metrics.consequence_total_ms
+                    ),
+                    consequence_apply_move_ms=(
+                        model_metrics.consequence_apply_move_ms
+                        + group_metrics.consequence_apply_move_ms
+                    ),
+                    consequence_terminal_check_ms=(
+                        model_metrics.consequence_terminal_check_ms
+                        + group_metrics.consequence_terminal_check_ms
+                    ),
+                    consequence_check_eval_ms=(
+                        model_metrics.consequence_check_eval_ms
+                        + group_metrics.consequence_check_eval_ms
+                    ),
+                )
+                for index, output in zip(group_indices, group_outputs, strict=True):
+                    outputs[index] = output
         except Exception as exc:
             stats["errors"] += len(batch)
             stats["uptime_ms"] = _elapsed_ms(service_start_ns)
@@ -353,6 +422,7 @@ def _serve_inference(
             response_dict[str(request["request_id"])] = {
                 "policy_logits": dict(output.policy_logits),
                 "value": output.value,
+                "uncertainty": output.uncertainty,
                 "error": None,
             }
         stats["requests_completed"] += len(batch)

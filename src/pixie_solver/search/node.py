@@ -36,6 +36,7 @@ class SearchNode:
     is_expanded: bool = False
     is_terminal: bool = False
     terminal_value: float | None = None
+    model_uncertainty: float | None = None
     legal_moves: tuple[Move, ...] = ()
     move_ids: tuple[str, ...] = ()
     children_by_move_id: dict[str, SearchEdge] = field(default_factory=dict)

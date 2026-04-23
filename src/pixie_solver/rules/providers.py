@@ -211,17 +211,36 @@ class StaticRepairProvider:
             metadata={"provider": "static"},
         )
 
+    def repair_piece_candidates(
+        self,
+        request: RepairRequest,
+        candidate_count: int,
+    ) -> tuple[RepairResponse, ...]:
+        del candidate_count
+        return (self.repair_piece(request),)
+
 
 @dataclass(frozen=True, slots=True)
 class JsonFileRepairProvider:
     path: Path
 
-    def repair_piece(self, request: RepairRequest) -> RepairResponse:
+    def _load_repair_responses(self) -> tuple[RepairResponse, ...]:
         with self.path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        if not isinstance(payload, dict):
-            raise ValueError("repair provider response must be a JSON object")
-        response = RepairResponse.from_dict(payload)
+        payloads: list[dict[str, JsonValue]]
+        if isinstance(payload, dict):
+            payloads = [payload]
+        elif isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+            payloads = [dict(item) for item in payload]
+        else:
+            raise ValueError("repair provider response must be a JSON object or list of objects")
+        return tuple(RepairResponse.from_dict(item) for item in payloads)
+
+    def repair_piece(self, request: RepairRequest) -> RepairResponse:
+        responses = self._load_repair_responses()
+        if not responses:
+            raise ValueError("repair provider response list was empty")
+        response = responses[0]
         return RepairResponse(
             patched_program=response.patched_program,
             explanation=response.explanation,
@@ -231,4 +250,27 @@ class JsonFileRepairProvider:
                 "provider": "json_file",
                 "path": str(self.path),
             },
+        )
+
+    def repair_piece_candidates(
+        self,
+        request: RepairRequest,
+        candidate_count: int,
+    ) -> tuple[RepairResponse, ...]:
+        del request
+        responses = self._load_repair_responses()
+        if not responses:
+            raise ValueError("repair provider response list was empty")
+        return tuple(
+            RepairResponse(
+                patched_program=response.patched_program,
+                explanation=response.explanation,
+                generated_tests=response.generated_tests,
+                metadata={
+                    **dict(response.metadata),
+                    "provider": "json_file",
+                    "path": str(self.path),
+                },
+            )
+            for response in responses[:candidate_count]
         )

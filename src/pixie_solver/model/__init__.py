@@ -1,3 +1,5 @@
+from importlib import import_module
+
 from pixie_solver.model.board_encoder import BoardEncoder, EncodedBoard
 from pixie_solver.model.dsl_encoder import DSLFeatureEncoder, PieceClassFeatureSpec
 from pixie_solver.model.move_encoder import EncodedMoves, MoveEncoder
@@ -23,6 +25,7 @@ from pixie_solver.model.semantic_features import (
 )
 from pixie_solver.model.policy_value import (
     BASELINE_MODEL_ARCHITECTURE,
+    HYPERNETWORK_MODEL_ARCHITECTURE,
     PolicyValueConfig,
     PolicyValueForwardOutput,
     PolicyValueModel,
@@ -35,6 +38,7 @@ from pixie_solver.model.policy_value import (
 
 __all__ = [
     "BASELINE_MODEL_ARCHITECTURE",
+    "HYPERNETWORK_MODEL_ARCHITECTURE",
     "ActionEncodingMetricsV2",
     "ActionTokenEncoderV2",
     "ActionTokenSpec",
@@ -53,6 +57,7 @@ __all__ = [
     "PolicyValueForwardOutput",
     "PolicyValueModel",
     "PolicyValueModelV2",
+    "PolicyValueModelV4",
     "PolicyValueOutput",
     "SEMANTIC_PROBE_FEATURES",
     "SemanticProbeSpec",
@@ -64,3 +69,14 @@ __all__ = [
     "build_policy_value_model",
     "resolve_device",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "PolicyValueModelV4":
+        value = getattr(
+            import_module("pixie_solver.model.policy_value_v4"),
+            "PolicyValueModelV4",
+        )
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

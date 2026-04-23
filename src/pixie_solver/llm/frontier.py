@@ -333,6 +333,44 @@ class FrontierLLMPieceProgramProvider:
             metadata={**dict(parsed.metadata), **response.metadata},
         )
 
+    def repair_piece_candidates(
+        self,
+        request: RepairRequest,
+        candidate_count: int,
+    ) -> tuple[RepairResponse, ...]:
+        response = self.client.generate_json(
+            user_payload={
+                "task": "repair_piece_program_candidates",
+                "candidate_count": candidate_count,
+                "repair_request": request.to_dict(),
+                "output_contract": {
+                    "candidates": "list of complete patched DSL repair responses",
+                    "metadata": "optional JSON object",
+                },
+            }
+        )
+        payload = response.data
+        if isinstance(payload, dict) and "candidates" in payload:
+            candidate_payloads = payload["candidates"]
+        elif isinstance(payload, list):
+            candidate_payloads = payload
+        else:
+            candidate_payloads = [payload]
+        candidates: list[RepairResponse] = []
+        for item in candidate_payloads:
+            if not isinstance(item, dict):
+                continue
+            parsed = RepairResponse.from_dict(item)
+            candidates.append(
+                RepairResponse(
+                    patched_program=parsed.patched_program,
+                    explanation=parsed.explanation,
+                    generated_tests=parsed.generated_tests,
+                    metadata={**dict(parsed.metadata), **response.metadata},
+                )
+            )
+        return tuple(candidates[:candidate_count])
+
 
 def _anthropic_text(response: dict[str, JsonValue]) -> str:
     chunks: list[str] = []

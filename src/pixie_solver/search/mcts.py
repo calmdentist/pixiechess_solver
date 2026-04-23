@@ -96,9 +96,17 @@ def run_mcts(
     c_puct: float = 1.5,
     root_noise: DirichletRootNoise | None = None,
     rng: random.Random | None = None,
+    strategy: object | None = None,
+    adaptive_search: bool = False,
+    adaptive_min_simulations: int | None = None,
+    adaptive_max_simulations: int | None = None,
 ) -> SearchResult:
     if simulations < 1:
         raise ValueError("simulations must be at least 1")
+    if adaptive_min_simulations is not None and adaptive_min_simulations < 1:
+        raise ValueError("adaptive_min_simulations must be at least 1")
+    if adaptive_max_simulations is not None and adaptive_max_simulations < 1:
+        raise ValueError("adaptive_max_simulations must be at least 1")
 
     total_start = time.perf_counter()
     evaluator_impl = HeuristicEvaluator() if evaluator is None else evaluator
@@ -127,14 +135,43 @@ def run_mcts(
         "root_dirichlet_alpha": None,
         "root_exploration_fraction": 0.0,
     }
+    adaptive_enabled = adaptive_search and policy_value_model is not None
+    effective_simulations = simulations
+    root_uncertainty: float | None = None
     remaining_simulations = simulations
-    if root_noise is not None:
+    if adaptive_enabled:
         value = _expand_node(
             node=root,
             policy_value_model=policy_value_model,
             evaluator=evaluator_impl,
             diagnostics=diagnostics,
             timings=timings,
+            strategy=strategy,
+        )
+        root.visit_count += 1
+        root.value_sum += value
+        root_uncertainty = root.model_uncertainty
+        effective_simulations = _adaptive_simulation_budget(
+            requested_simulations=simulations,
+            uncertainty=root_uncertainty,
+            minimum_simulations=adaptive_min_simulations,
+            maximum_simulations=adaptive_max_simulations,
+        )
+        remaining_simulations = max(0, effective_simulations - 1)
+        if root_noise is not None:
+            noise_metadata = _apply_root_dirichlet_noise(
+                root=root,
+                noise=root_noise,
+                rng=rng if rng is not None else random.Random(),
+            )
+    elif root_noise is not None:
+        value = _expand_node(
+            node=root,
+            policy_value_model=policy_value_model,
+            evaluator=evaluator_impl,
+            diagnostics=diagnostics,
+            timings=timings,
+            strategy=strategy,
         )
         root.visit_count += 1
         root.value_sum += value
@@ -153,6 +190,7 @@ def run_mcts(
             c_puct=c_puct,
             diagnostics=diagnostics,
             timings=timings,
+            strategy=strategy,
         )
 
     visit_counts = {
@@ -183,6 +221,8 @@ def run_mcts(
         policy_logits=dict(sorted(root.policy_logits.items())),
         metadata={
             "simulations": simulations,
+            "simulations_requested": simulations,
+            "simulations_used": effective_simulations,
             "root_state_hash": root.state_hash,
             "expanded_children": len(root.children_by_move_id),
             "evaluator": type(evaluator_impl).__name__,
@@ -190,6 +230,11 @@ def run_mcts(
             "c_puct": c_puct,
             "simulations_completed": root.visit_count,
             "root_legal_move_count": len(root.legal_moves),
+            "root_uncertainty": root_uncertainty,
+            "adaptive_search_enabled": adaptive_enabled,
+            "adaptive_search_requested": adaptive_search,
+            "adaptive_min_simulations": adaptive_min_simulations,
+            "adaptive_max_simulations": adaptive_max_simulations,
             "search_total_ms": (time.perf_counter() - total_start) * 1000.0,
             **noise_metadata,
             **diagnostics,
@@ -206,6 +251,7 @@ def _simulate(
     c_puct: float,
     diagnostics: dict[str, int],
     timings: dict[str, float],
+    strategy: object | None,
 ) -> float:
     if node.is_terminal:
         value = 0.0 if node.terminal_value is None else node.terminal_value
@@ -220,6 +266,7 @@ def _simulate(
             evaluator=evaluator,
             diagnostics=diagnostics,
             timings=timings,
+            strategy=strategy,
         )
         node.visit_count += 1
         node.value_sum += value
@@ -256,6 +303,7 @@ def _simulate(
         c_puct=c_puct,
         diagnostics=diagnostics,
         timings=timings,
+        strategy=strategy,
     )
     value = -child_value
     edge.visit_count += 1
@@ -272,6 +320,7 @@ def _expand_node(
     evaluator: StateEvaluator,
     diagnostics: dict[str, int],
     timings: dict[str, float],
+    strategy: object | None,
 ) -> float:
     expand_start = time.perf_counter()
     diagnostics["expanded_nodes"] += 1
@@ -306,7 +355,14 @@ def _expand_node(
     if policy_value_model is not None:
         diagnostics["model_inference_calls"] += 1
         model_start = time.perf_counter()
-        model_output = policy_value_model.infer(node.state, moves)
+        if strategy is None:
+            model_output = policy_value_model.infer(node.state, moves)
+        else:
+            model_output = policy_value_model.infer(
+                node.state,
+                moves,
+                strategy=strategy,
+            )
         timings["search_model_inference_ms"] += (time.perf_counter() - model_start) * 1000.0
         policy_logits = {
             str(move_id): float(logit)
@@ -314,11 +370,13 @@ def _expand_node(
             if move_id in set(move_ids)
         }
         value = _clamp_value(model_output.value)
+        node.model_uncertainty = _clamp_uncertainty(model_output.uncertainty)
     else:
         diagnostics["heuristic_evaluations"] += 1
         eval_start = time.perf_counter()
         value = _clamp_value(evaluator.evaluate(node.state))
         timings["search_evaluator_ms"] += (time.perf_counter() - eval_start) * 1000.0
+        node.model_uncertainty = None
     node.policy_logits = dict(sorted(policy_logits.items()))
 
     priors = _priors_for_moves(move_ids=move_ids, policy_logits=policy_logits)
@@ -328,6 +386,34 @@ def _expand_node(
     }
     timings["search_expand_ms"] += (time.perf_counter() - expand_start) * 1000.0
     return value
+
+
+def _adaptive_simulation_budget(
+    *,
+    requested_simulations: int,
+    uncertainty: float | None,
+    minimum_simulations: int | None,
+    maximum_simulations: int | None,
+) -> int:
+    max_simulations = (
+        requested_simulations if maximum_simulations is None else maximum_simulations
+    )
+    min_default = max(1, min(requested_simulations, requested_simulations // 2))
+    min_simulations = min_default if minimum_simulations is None else minimum_simulations
+    if max_simulations < min_simulations:
+        raise ValueError(
+            "adaptive_max_simulations must be greater than or equal to adaptive_min_simulations"
+        )
+    if uncertainty is None:
+        return max_simulations
+    scaled = min_simulations + int(
+        round(_clamp_uncertainty(uncertainty) * (max_simulations - min_simulations))
+    )
+    return max(min_simulations, min(max_simulations, scaled))
+
+
+def _clamp_uncertainty(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def _select_child(*, node: SearchNode, c_puct: float) -> SearchEdge | None:
