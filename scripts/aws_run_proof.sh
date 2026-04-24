@@ -133,6 +133,7 @@ RUN_PROFILE="${RUN_PROFILE:-serious}"
 
 STRESS_GAMES="${STRESS_GAMES:-64}"
 STRESS_MAX_PLIES="${STRESS_MAX_PLIES:-48}"
+RUN_STRESS_SIMULATOR="${RUN_STRESS_SIMULATOR:-1}"
 
 CYCLES="${CYCLES:-8}"
 TRAIN_GAMES="${TRAIN_GAMES:-384}"
@@ -251,6 +252,11 @@ fi
 
 if [[ "$NO_LLM_THINKING" != "0" && "$NO_LLM_THINKING" != "1" ]]; then
   echo "NO_LLM_THINKING must be 0 or 1, found: $NO_LLM_THINKING" >&2
+  exit 1
+fi
+
+if [[ "$RUN_STRESS_SIMULATOR" != "0" && "$RUN_STRESS_SIMULATOR" != "1" ]]; then
+  echo "RUN_STRESS_SIMULATOR must be 0 or 1, found: $RUN_STRESS_SIMULATOR" >&2
   exit 1
 fi
 
@@ -436,6 +442,7 @@ cat <<EOF
 [aws-run-proof] strategy_provider=$STRATEGY_PROVIDER strategy_file=${STRATEGY_FILE:-<none>} strategy_cache_scope=$STRATEGY_CACHE_SCOPE strategy_refresh=$STRATEGY_REFRESH_ON_UNCERTAINTY strategy_refresh_threshold=$STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD
 [aws-run-proof] llm_provider=$LLM_PROVIDER llm_model=${LLM_MODEL:-<default>} llm_api_key_env=$(resolve_llm_api_key_env) llm_effort=$LLM_EFFORT llm_thinking=$(( 1 - NO_LLM_THINKING ))
 [aws-run-proof] randomize_handauthored_specials=$RANDOMIZE_HANDAUTHORED_SPECIALS
+[aws-run-proof] run_stress_simulator=$RUN_STRESS_SIMULATOR stress_games=$STRESS_GAMES stress_max_plies=$STRESS_MAX_PLIES
 [aws-run-proof] throughput_preflight=$RUN_THROUGHPUT_PREFLIGHT auto_tune_workers=$AUTO_TUNE_WORKERS periodic_sync=$PERIODIC_SYNC sync_interval_seconds=$SYNC_INTERVAL_SECONDS
 [aws-run-proof] benchmark_manifest=${BENCHMARK_MANIFEST:-<none>}
 [aws-run-proof] piece_registry=$PIECE_REGISTRY use_verified_pieces=$USE_VERIFIED_PIECES curriculum_mode=$CURRICULUM_PROVIDER_MODE
@@ -471,14 +478,16 @@ if [[ "$BATCHED_INFERENCE" == "1" && "$WORKERS" -le 1 ]]; then
   exit 1
 fi
 
-"$PYTHON_BIN" -m pixie_solver stress-simulator \
-  --standard-initial-state \
-  --randomize-handauthored-specials \
-  --games "$STRESS_GAMES" \
-  --max-plies "$STRESS_MAX_PLIES" \
-  --seed "$SEED" \
-  --output "$OUTPUT_DIR/stress.json" \
-  --manifest-out "$OUTPUT_DIR/stress_manifest.json"
+if [[ "$RUN_STRESS_SIMULATOR" == "1" ]]; then
+  "$PYTHON_BIN" -m pixie_solver stress-simulator \
+    --standard-initial-state \
+    --randomize-handauthored-specials \
+    --games "$STRESS_GAMES" \
+    --max-plies "$STRESS_MAX_PLIES" \
+    --seed "$SEED" \
+    --output "$OUTPUT_DIR/stress.json" \
+    --manifest-out "$OUTPUT_DIR/stress_manifest.json"
+fi
 
 train_loop_cmd=(
   "$PYTHON_BIN" -m pixie_solver train-loop
