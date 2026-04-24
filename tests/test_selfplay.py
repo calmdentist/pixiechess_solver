@@ -317,6 +317,34 @@ class SelfPlayTest(unittest.TestCase):
         self.assertFalse(game.examples[0].metadata["root_noise_applied"])
         self.assertEqual(0.0, game.examples[0].metadata["root_exploration_fraction"])
 
+    def test_selfplay_stamps_benchmark_metadata(self) -> None:
+        game = generate_selfplay_games([self.initial_state], games=1, config=self.config)[0]
+
+        example = game.examples[0]
+        self.assertEqual(
+            example.metadata["world_model_digest"],
+            game.metadata["world_model_digest"],
+        )
+        self.assertEqual(
+            example.metadata["world_model_digest"],
+            game.replay_trace.metadata["world_model_digest"],
+        )
+        self.assertEqual("foundation", example.metadata["family_id"])
+        self.assertEqual("foundation", example.metadata["split"])
+        self.assertEqual("foundation", example.metadata["novelty_tier"])
+        self.assertEqual("search_only", example.metadata["model_architecture"])
+        self.assertEqual("search_only", game.metadata["model_architecture"])
+        self.assertEqual("search_only", game.replay_trace.metadata["model_architecture"])
+        self.assertEqual(
+            int(example.metadata["simulations_used"]),
+            int(example.metadata["search_budget"]),
+        )
+        self.assertEqual(self.config.simulations, game.metadata["search_budget"])
+        self.assertEqual(
+            self.config.simulations,
+            game.replay_trace.metadata["search_budget"],
+        )
+
     def test_selfplay_records_strategy_and_adaptive_search_metadata(self) -> None:
         config = SelfPlayConfig(
             simulations=6,

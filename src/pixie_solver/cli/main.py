@@ -6,8 +6,10 @@ import random
 import shutil
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, fields
+from itertools import combinations
 from pathlib import Path
 
 from pixie_solver.gui import (
@@ -38,11 +40,16 @@ from pixie_solver.dsl.validator import PieceValidationError, validate_piece_prog
 from pixie_solver.eval import (
     ArenaConfig,
     ArenaProgress,
+    BenchmarkCorpusConfig,
+    BenchmarkCorpusProgress,
+    BenchmarkProgress,
     SimulatorStressConfig,
+    build_benchmark_corpus,
     decide_promotion,
     run_checkpoint_arena_from_paths,
     ModelEvalProgress,
     evaluate_policy_value_model,
+    run_benchmark_manifest,
     run_simulator_stress,
     write_arena_games_jsonl,
 )
@@ -65,6 +72,11 @@ from pixie_solver.rules import (
     repair_and_verify_piece,
 )
 from pixie_solver.rules.repair import default_dsl_reference
+from pixie_solver.strategy import (
+    FrontierLLMStrategyProvider,
+    JsonFileStrategyProvider,
+    StrategyProvider,
+)
 from pixie_solver.training import (
     BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
     SUPPORTED_REPLAY_SAMPLING_STRATEGIES,
@@ -77,18 +89,27 @@ from pixie_solver.training import (
     generate_selfplay_games,
     generate_selfplay_games_parallel,
     load_training_checkpoint,
+    present_piece_metadata_for_state,
     save_training_checkpoint,
     read_selfplay_examples_jsonl,
     read_selfplay_games_jsonl,
+    summarize_benchmark_metadata_records,
     summarize_replay_buckets,
     write_selfplay_examples_jsonl,
     write_selfplay_games_jsonl,
     train_from_replays,
+    benchmark_metadata_for_state,
 )
 from pixie_solver.utils import write_run_manifest
 from pixie_solver.utils.serialization import JsonValue, canonical_json
 
 TRAINING_CURRICULUM_SPLITS = {"train"}
+TRAINING_WORLD_BUCKET_IDS = (
+    "foundation",
+    "known_mechanic",
+    "recent_admission",
+    "composition",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +126,14 @@ class ScheduledCurriculumTask:
             f"cycle_{self.cycle:03d}:seed_{self.seed}:{self.recipe}:"
             f"{self.split}:{self.novelty_tier}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingWorldSeed:
+    bucket_id: str
+    piece_ids: tuple[str, ...]
+    piece_classes: tuple[PieceClass, ...]
+    family_ids: tuple[str, ...]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -327,6 +356,24 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     train_parser.add_argument("--policy-weight", type=float, default=1.0, help="Weight on the policy loss term.")
     train_parser.add_argument("--value-weight", type=float, default=1.0, help="Weight on the value loss term.")
+    train_parser.add_argument(
+        "--uncertainty-weight",
+        type=float,
+        default=0.0,
+        help="Weight on the uncertainty loss term.",
+    )
+    train_parser.add_argument(
+        "--root-value-target-weight",
+        type=float,
+        default=0.0,
+        help="Blend weight for the stored root search value in the training value target.",
+    )
+    train_parser.add_argument(
+        "--outcome-target-weight",
+        type=float,
+        default=1.0,
+        help="Blend weight for the final game outcome in the training value target.",
+    )
     train_parser.add_argument("--seed", type=int, default=0, help="Deterministic seed for DataLoader shuffling and initialization.")
     train_parser.add_argument("--shuffle", dest="shuffle", action="store_true", help="Shuffle training examples before each epoch.")
     train_parser.add_argument("--no-shuffle", dest="shuffle", action="store_false", help="Disable example shuffling.")
@@ -374,6 +421,91 @@ def build_parser() -> argparse.ArgumentParser:
         help="Suppress progress logs on stderr and only print the final JSON summary.",
     )
     eval_model_parser.set_defaults(handler=_handle_eval_model)
+
+    benchmark_model_parser = subparsers.add_parser(
+        "benchmark-model",
+        help="Evaluate a checkpoint across a benchmark manifest of suites.",
+    )
+    benchmark_model_parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Checkpoint to evaluate.",
+    )
+    benchmark_model_parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Benchmark manifest JSON path.",
+    )
+    benchmark_model_parser.add_argument(
+        "--device",
+        help="Evaluation device, e.g. cpu, mps, cuda.",
+    )
+    benchmark_model_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional JSON output path for the benchmark report.",
+    )
+    benchmark_model_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress suite progress logs on stderr and only print the final JSON.",
+    )
+    benchmark_model_parser.set_defaults(handler=_handle_benchmark_model)
+
+    benchmark_corpus_parser = subparsers.add_parser(
+        "build-benchmark-corpus",
+        help="Generate a deterministic benchmark corpus and manifest for serious runs.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory to write benchmark games/examples/manifest into.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--manifest-name",
+        default="phase0_serious_run_v0",
+        help="Manifest name embedded in the generated benchmark corpus.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--manifest-description",
+        default=(
+            "Deterministic PixieChess benchmark corpus for serious adaptation runs."
+        ),
+        help="Manifest description embedded in the generated benchmark corpus.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--games-per-world",
+        type=int,
+        default=4,
+        help="Games to generate for each frozen world.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--simulations",
+        type=int,
+        default=16,
+        help="Search-only MCTS simulations per move while generating the corpus.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--max-plies",
+        type=int,
+        default=48,
+        help="Maximum plies per generated game.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help="Deterministic offset applied to the default suite seeds.",
+    )
+    benchmark_corpus_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress logs on stderr and only print the final JSON.",
+    )
+    benchmark_corpus_parser.set_defaults(handler=_handle_build_benchmark_corpus)
 
     arena_parser = subparsers.add_parser(
         "arena",
@@ -495,6 +627,39 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     train_loop_parser.add_argument("--policy-weight", type=float, default=1.0, help="Policy loss weight.")
     train_loop_parser.add_argument("--value-weight", type=float, default=1.0, help="Value loss weight.")
+    train_loop_parser.add_argument(
+        "--uncertainty-weight",
+        type=float,
+        default=0.0,
+        help="Uncertainty loss weight.",
+    )
+    train_loop_parser.add_argument(
+        "--root-value-target-weight",
+        type=float,
+        default=0.0,
+        help="Blend weight for root search values in the training value target.",
+    )
+    train_loop_parser.add_argument(
+        "--outcome-target-weight",
+        type=float,
+        default=1.0,
+        help="Blend weight for final outcomes in the training value target.",
+    )
+    train_loop_parser.add_argument(
+        "--adaptive-search",
+        action="store_true",
+        help="Use model uncertainty to scale self-play simulation budgets.",
+    )
+    train_loop_parser.add_argument(
+        "--adaptive-min-simulations",
+        type=int,
+        help="Minimum self-play simulations per move when --adaptive-search is enabled.",
+    )
+    train_loop_parser.add_argument(
+        "--adaptive-max-simulations",
+        type=int,
+        help="Maximum self-play simulations per move when --adaptive-search is enabled.",
+    )
     train_loop_parser.add_argument("--d-model", type=int, default=64, help="Transformer model width for a fresh run.")
     train_loop_parser.add_argument("--num-heads", type=int, default=4, help="Transformer attention heads for a fresh run.")
     train_loop_parser.add_argument("--num-layers", type=int, default=2, help="Transformer encoder layers for a fresh run.")
@@ -514,6 +679,57 @@ def build_parser() -> argparse.ArgumentParser:
     train_loop_parser.add_argument("--arena-simulations", type=int, default=8, help="Promotion-gate MCTS simulations per move.")
     train_loop_parser.add_argument("--arena-max-plies", type=int, default=80, help="Promotion-gate maximum plies per game.")
     train_loop_parser.add_argument("--promotion-score-threshold", type=float, default=0.55, help="Candidate arena score-rate threshold for promotion.")
+    train_loop_parser.add_argument(
+        "--benchmark-manifest",
+        type=Path,
+        help="Optional benchmark manifest evaluated on the candidate checkpoint after each cycle.",
+    )
+    train_loop_parser.add_argument(
+        "--benchmark-dir",
+        type=Path,
+        help="Directory for per-cycle benchmark reports. Defaults to output-dir/benchmarks.",
+    )
+    train_loop_parser.add_argument(
+        "--curriculum-foundation-weight",
+        type=float,
+        default=0.6,
+        help="Sampling weight for standard foundation worlds in train-loop self-play.",
+    )
+    train_loop_parser.add_argument(
+        "--curriculum-known-weight",
+        type=float,
+        default=0.2,
+        help="Sampling weight for older verified train worlds in train-loop self-play.",
+    )
+    train_loop_parser.add_argument(
+        "--curriculum-recent-weight",
+        type=float,
+        default=0.2,
+        help="Sampling weight for recently admitted verified worlds in train-loop self-play.",
+    )
+    train_loop_parser.add_argument(
+        "--curriculum-composition-weight",
+        type=float,
+        default=0.0,
+        help="Sampling weight for composition worlds built from multiple verified families.",
+    )
+    train_loop_parser.add_argument(
+        "--curriculum-recent-window",
+        type=int,
+        default=2,
+        help="Number of most recent admission cycles treated as recent worlds.",
+    )
+    train_loop_parser.add_argument(
+        "--strategy-provider",
+        choices=("none", "llm", "json_file"),
+        default="none",
+        help="Optional strategy provider used to propose a strategy at game start for each sampled world.",
+    )
+    train_loop_parser.add_argument(
+        "--strategy-file",
+        type=Path,
+        help="JSON file used when --strategy-provider json_file.",
+    )
     train_loop_parser.add_argument("--no-guided-selfplay", action="store_true", help="Always generate self-play with search-only MCTS instead of the latest model.")
     train_loop_parser.add_argument("--randomize-handauthored-specials", action="store_true", default=True, help="Randomize hand-authored special pieces in standard openings.")
     train_loop_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard openings.")
@@ -676,7 +892,7 @@ def _add_viewer_args(
     )
 
 
-def _build_llm_piece_provider(args: argparse.Namespace) -> FrontierLLMPieceProgramProvider:
+def _llm_config_from_args(args: argparse.Namespace) -> LLMConfig:
     config_kwargs = {
         "provider": args.llm_provider,
         "model": args.llm_model,
@@ -691,8 +907,24 @@ def _build_llm_piece_provider(args: argparse.Namespace) -> FrontierLLMPieceProgr
         config_kwargs["temperature"] = args.llm_temperature
     if args.llm_effort is not None:
         config_kwargs["effort"] = args.llm_effort
-    config = LLMConfig(**config_kwargs)
-    return FrontierLLMPieceProgramProvider(FrontierLLMClient(config))
+    return LLMConfig(**config_kwargs)
+
+
+def _build_llm_piece_provider(args: argparse.Namespace) -> FrontierLLMPieceProgramProvider:
+    return FrontierLLMPieceProgramProvider(FrontierLLMClient(_llm_config_from_args(args)))
+
+
+def _build_strategy_provider(args: argparse.Namespace) -> StrategyProvider | None:
+    provider_name = getattr(args, "strategy_provider", "none")
+    if provider_name in {None, "none"}:
+        return None
+    if provider_name == "json_file":
+        if args.strategy_file is None:
+            raise ValueError("--strategy-file is required for --strategy-provider json_file")
+        return JsonFileStrategyProvider(args.strategy_file)
+    if provider_name == "llm":
+        return FrontierLLMStrategyProvider(FrontierLLMClient(_llm_config_from_args(args)))
+    raise ValueError(f"unsupported strategy provider: {provider_name}")
 
 
 def _parse_scheduled_curriculum_tasks(
@@ -1086,6 +1318,9 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
         )
         examples = flatten_selfplay_examples(games)
         search_metrics = _summarize_example_search_metrics(examples)
+        benchmark_metadata_summary = summarize_benchmark_metadata_records(
+            example.metadata for example in examples
+        )
 
         if args.games_out is not None:
             write_selfplay_games_jsonl(args.games_out, games)
@@ -1118,6 +1353,7 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
                     "examples_generated": len(examples),
                     "outcomes": _outcome_counts(games),
                     "search_metrics": search_metrics,
+                    "benchmark_metadata_summary": benchmark_metadata_summary,
                     "inference_stats": (
                         inference_stats.to_dict()
                         if inference_stats is not None
@@ -1148,6 +1384,7 @@ def _handle_selfplay(args: argparse.Namespace) -> int:
                     ),
                     "outcomes": _outcome_counts(games),
                     "seed_state_count": len(initial_states),
+                    "benchmark_metadata_summary": benchmark_metadata_summary,
                     "randomized_special_pieces": args.randomize_handauthored_specials,
                     "special_piece_dir": (
                         str(args.special_piece_dir)
@@ -1223,6 +1460,9 @@ def _handle_view_replay(args: argparse.Namespace) -> int:
 
 def _handle_train(args: argparse.Namespace) -> int:
     examples = read_selfplay_examples_jsonl(args.examples)
+    benchmark_metadata_summary = summarize_benchmark_metadata_records(
+        example.metadata for example in examples
+    )
     resume_checkpoint = None
     model = None
     optimizer_state_dict = None
@@ -1257,6 +1497,9 @@ def _handle_train(args: argparse.Namespace) -> int:
         weight_decay=args.weight_decay,
         policy_weight=args.policy_weight,
         value_weight=args.value_weight,
+        uncertainty_weight=args.uncertainty_weight,
+        root_value_target_weight=args.root_value_target_weight,
+        outcome_target_weight=args.outcome_target_weight,
         device=args.device,
         shuffle=args.shuffle,
         seed=args.seed,
@@ -1288,6 +1531,7 @@ def _handle_train(args: argparse.Namespace) -> int:
         metadata={
             "examples_path": str(args.examples),
             "example_count": len(examples),
+            "benchmark_metadata_summary": benchmark_metadata_summary,
             "resumed_from": (
                 str(args.resume_checkpoint)
                 if args.resume_checkpoint is not None
@@ -1313,11 +1557,15 @@ def _handle_train(args: argparse.Namespace) -> int:
                     "batches_completed": run_result.metrics.batches_completed,
                     "average_policy_loss": run_result.metrics.average_policy_loss,
                     "average_value_loss": run_result.metrics.average_value_loss,
+                    "average_uncertainty_loss": (
+                        run_result.metrics.average_uncertainty_loss
+                    ),
                     "average_total_loss": run_result.metrics.average_total_loss,
                     "device": run_result.metrics.device,
                 },
                 "replay_bucket_counts": replay_bucket_counts,
                 "model_config": _model_config_summary(model_config),
+                "benchmark_metadata_summary": benchmark_metadata_summary,
             },
             indent=2,
         )
@@ -1328,6 +1576,9 @@ def _handle_train(args: argparse.Namespace) -> int:
 def _handle_eval_model(args: argparse.Namespace) -> int:
     checkpoint = load_training_checkpoint(args.checkpoint, device=args.device)
     examples = read_selfplay_examples_jsonl(args.examples)
+    benchmark_metadata_summary = summarize_benchmark_metadata_records(
+        example.metadata for example in examples
+    )
     metrics = evaluate_policy_value_model(
         model=checkpoint.model,
         examples=examples,
@@ -1348,10 +1599,58 @@ def _handle_eval_model(args: argparse.Namespace) -> int:
                 "examples_loaded": len(examples),
                 "metrics": metrics.to_dict(),
                 "model_config": _model_config_summary(checkpoint.model_config),
+                "checkpoint_metadata": dict(checkpoint.metadata),
+                "benchmark_metadata_summary": benchmark_metadata_summary,
             },
             indent=2,
         )
     )
+    return 0
+
+
+def _handle_benchmark_model(args: argparse.Namespace) -> int:
+    checkpoint = load_training_checkpoint(args.checkpoint, device=args.device)
+    report = run_benchmark_manifest(
+        model=checkpoint.model,
+        manifest_path=args.manifest,
+        progress_callback=(
+            None
+            if args.quiet
+            else _build_benchmark_progress_logger()
+        ),
+    )
+    payload = {
+        "status": "ok",
+        "checkpoint": str(args.checkpoint),
+        "manifest": str(args.manifest),
+        "output": str(args.output) if args.output is not None else None,
+        "model_config": _model_config_summary(checkpoint.model_config),
+        "checkpoint_metadata": dict(checkpoint.metadata),
+        "report": report,
+    }
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(canonical_json(payload, indent=2), encoding="utf-8")
+    print(canonical_json(payload, indent=2))
+    return 0
+
+
+def _handle_build_benchmark_corpus(args: argparse.Namespace) -> int:
+    summary = build_benchmark_corpus(
+        config=BenchmarkCorpusConfig(
+            output_dir=args.output_dir,
+            manifest_name=args.manifest_name,
+            manifest_description=args.manifest_description,
+            games_per_world=args.games_per_world,
+            simulations=args.simulations,
+            max_plies=args.max_plies,
+            seed_offset=args.seed_offset,
+        ),
+        progress_callback=(
+            None if args.quiet else _build_benchmark_corpus_progress_logger()
+        ),
+    )
+    print(canonical_json(summary, indent=2))
     return 0
 
 
@@ -1740,12 +2039,12 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         raise ValueError("--cycles must be at least 1")
     if args.replay_window_cycles < 1:
         raise ValueError("--replay-window-cycles must be at least 1")
+    if args.curriculum_recent_window < 1:
+        raise ValueError("--curriculum-recent-window must be at least 1")
     if args.train_games < 1:
         raise ValueError("--train-games must be at least 1")
     if args.val_games < 1:
         raise ValueError("--val-games must be at least 1")
-    if args.use_verified_pieces and not args.randomize_handauthored_specials:
-        raise ValueError("--use-verified-pieces requires randomized special-piece openings")
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
     if args.viewer and args.workers != 1:
@@ -1756,6 +2055,24 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         raise ValueError("--best-checkpoint requires --promotion-gate")
     if args.best_checkpoint_out is not None and not args.promotion_gate:
         raise ValueError("--best-checkpoint-out requires --promotion-gate")
+    if args.benchmark_dir is not None and args.benchmark_manifest is None:
+        raise ValueError("--benchmark-dir requires --benchmark-manifest")
+    bucket_weights = _curriculum_bucket_weights(args)
+    if any(weight < 0.0 for weight in bucket_weights.values()):
+        raise ValueError("curriculum bucket weights must be non-negative")
+    if sum(bucket_weights.values()) <= 0.0:
+        raise ValueError("at least one curriculum bucket weight must be positive")
+    if not args.adaptive_search and (
+        args.adaptive_min_simulations is not None
+        or args.adaptive_max_simulations is not None
+    ):
+        raise ValueError(
+            "--adaptive-min-simulations/--adaptive-max-simulations require --adaptive-search"
+        )
+    if args.strategy_provider == "json_file" and args.strategy_file is None:
+        raise ValueError("--strategy-file is required for --strategy-provider json_file")
+    if args.strategy_provider != "json_file" and args.strategy_file is not None:
+        raise ValueError("--strategy-file is only valid with --strategy-provider json_file")
     if args.promotion_gate:
         if args.arena_games < 1:
             raise ValueError("--arena-games must be at least 1")
@@ -1764,16 +2081,31 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         if args.promotion_score_threshold < 0.0 or args.promotion_score_threshold > 1.0:
             raise ValueError("--promotion-score-threshold must be in [0, 1]")
     scheduled_curriculum_tasks = _parse_scheduled_curriculum_tasks(args.curriculum_task)
+    strategy_provider = _build_strategy_provider(args)
 
     data_dir = args.output_dir / "selfplay"
     checkpoint_dir = args.output_dir / "checkpoints"
     metrics_dir = args.output_dir / "metrics"
     arena_dir = args.output_dir / "arena"
+    benchmark_dir = (
+        args.benchmark_dir
+        if args.benchmark_dir is not None
+        else args.output_dir / "benchmarks"
+    )
     data_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     if args.promotion_gate:
         arena_dir.mkdir(parents=True, exist_ok=True)
+    benchmark_manifest_path: Path | None = None
+    benchmark_manifest_snapshot_path: Path | None = None
+    if args.benchmark_manifest is not None:
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        benchmark_manifest_path = args.benchmark_manifest
+        benchmark_manifest_snapshot_path = benchmark_dir / "manifest.json"
+        if benchmark_manifest_path.resolve() != benchmark_manifest_snapshot_path.resolve():
+            shutil.copyfile(benchmark_manifest_path, benchmark_manifest_snapshot_path)
+        benchmark_manifest_path = benchmark_manifest_snapshot_path
 
     model = None
     optimizer_state_dict = None
@@ -1832,11 +2164,17 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 cycle=cycle_index,
             ),
         )
-        verified_records, special_piece_classes = _load_special_piece_pool(
+        handauthored_piece_classes, verified_records = _load_curriculum_piece_sources(
             randomize_specials=args.randomize_handauthored_specials,
             special_piece_dir=args.special_piece_dir,
             use_verified_pieces=args.use_verified_pieces,
             piece_registry=args.piece_registry,
+        )
+        curriculum_world_seeds = _build_curriculum_world_seeds(
+            piece_registry=args.piece_registry,
+            verified_records=verified_records,
+            cycle_index=cycle_index,
+            recent_window=args.curriculum_recent_window,
         )
         train_seed = args.seed + cycle_index * 1000
         val_seed = args.seed + cycle_index * 1000 + 999
@@ -1853,13 +2191,20 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             seed=train_seed,
             adjudicate_max_plies=args.adjudicate_max_plies,
             adjudication_threshold=args.adjudication_threshold,
+            adaptive_search=args.adaptive_search,
+            adaptive_min_simulations=args.adaptive_min_simulations,
+            adaptive_max_simulations=args.adaptive_max_simulations,
         )
-        train_states = _sample_loop_initial_states(
+        train_states, train_world_bucket_counts, curriculum_world_pool_counts = (
+            _sample_curriculum_states(
             games=args.train_games,
             seed=train_seed,
-            randomize_specials=args.randomize_handauthored_specials,
-            special_piece_classes=special_piece_classes,
-            inclusion_probability=args.special_piece_inclusion_probability,
+            curriculum_world_seeds=curriculum_world_seeds,
+            bucket_weights=bucket_weights,
+            fallback_randomize_specials=args.randomize_handauthored_specials,
+            fallback_special_piece_classes=handauthored_piece_classes,
+            fallback_inclusion_probability=args.special_piece_inclusion_probability,
+        )
         )
         selfplay_progress_logger = (
             None
@@ -1887,6 +2232,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 games=args.train_games,
                 config=selfplay_config,
                 policy_value_model=None if args.no_guided_selfplay else model,
+                strategy_provider=strategy_provider,
                 progress_callback=selfplay_progress_logger,
                 trace_callback=_build_selfplay_viewer_trace_callback(
                     viewer,
@@ -1904,6 +2250,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 device=parallel_selfplay_device,
                 batched_inference_config=inference_config,
                 inference_device=args.inference_device or args.device,
+                strategy_provider=strategy_provider,
                 progress_callback=selfplay_progress_logger,
             )
         _annotate_games_with_registry(
@@ -1918,6 +2265,9 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         )
         train_examples = flatten_selfplay_examples(train_games)
         train_search_metrics = _summarize_example_search_metrics(train_examples)
+        train_benchmark_metadata_summary = summarize_benchmark_metadata_records(
+            example.metadata for example in train_examples
+        )
         train_termination_summary = _summarize_game_termination(train_games)
         train_games_path = data_dir / f"cycle_{cycle_index:03d}_train_games.jsonl"
         train_examples_path = data_dir / f"cycle_{cycle_index:03d}_train_examples.jsonl"
@@ -1930,6 +2280,9 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             for cycle_examples in replay_example_window
             for example in cycle_examples
         ]
+        replay_benchmark_metadata_summary = summarize_benchmark_metadata_records(
+            example.metadata for example in replay_examples
+        )
 
         training_config = TrainingConfig(
             epochs=args.epochs_per_cycle,
@@ -1938,6 +2291,9 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             weight_decay=args.weight_decay,
             policy_weight=args.policy_weight,
             value_weight=args.value_weight,
+            uncertainty_weight=args.uncertainty_weight,
+            root_value_target_weight=args.root_value_target_weight,
+            outcome_target_weight=args.outcome_target_weight,
             device=args.device,
             shuffle=True,
             seed=train_seed,
@@ -1985,6 +2341,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             metadata={
                 "cycle": cycle_index,
                 "train_examples_path": str(train_examples_path),
+                "benchmark_metadata_summary": replay_benchmark_metadata_summary,
                 "previous_checkpoint": (
                     str(previous_checkpoint_path)
                     if previous_checkpoint_path is not None
@@ -2005,13 +2362,18 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             seed=val_seed,
             adjudicate_max_plies=args.adjudicate_max_plies,
             adjudication_threshold=args.adjudication_threshold,
+            adaptive_search=args.adaptive_search,
+            adaptive_min_simulations=args.adaptive_min_simulations,
+            adaptive_max_simulations=args.adaptive_max_simulations,
         )
-        val_states = _sample_loop_initial_states(
+        val_states, val_world_bucket_counts, _ = _sample_curriculum_states(
             games=args.val_games,
             seed=val_seed,
-            randomize_specials=args.randomize_handauthored_specials,
-            special_piece_classes=special_piece_classes,
-            inclusion_probability=args.special_piece_inclusion_probability,
+            curriculum_world_seeds=curriculum_world_seeds,
+            bucket_weights=bucket_weights,
+            fallback_randomize_specials=args.randomize_handauthored_specials,
+            fallback_special_piece_classes=handauthored_piece_classes,
+            fallback_inclusion_probability=args.special_piece_inclusion_probability,
         )
         val_inference_stats = None
         if args.workers == 1:
@@ -2020,6 +2382,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 games=args.val_games,
                 config=val_config,
                 policy_value_model=None if args.no_guided_selfplay else model,
+                strategy_provider=strategy_provider,
                 progress_callback=(
                     None
                     if args.quiet
@@ -2041,6 +2404,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 device=parallel_selfplay_device,
                 batched_inference_config=inference_config,
                 inference_device=args.inference_device or args.device,
+                strategy_provider=strategy_provider,
                 progress_callback=(
                     None
                     if args.quiet
@@ -2059,6 +2423,9 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         )
         val_examples = flatten_selfplay_examples(val_games)
         val_search_metrics = _summarize_example_search_metrics(val_examples)
+        val_benchmark_metadata_summary = summarize_benchmark_metadata_records(
+            example.metadata for example in val_examples
+        )
         val_termination_summary = _summarize_game_termination(val_games)
         val_games_path = data_dir / f"cycle_{cycle_index:03d}_val_games.jsonl"
         val_examples_path = data_dir / f"cycle_{cycle_index:03d}_val_examples.jsonl"
@@ -2101,10 +2468,28 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 ),
             ),
         )
+        candidate_benchmark_report = None
+        candidate_benchmark_report_path = None
+        if benchmark_manifest_path is not None:
+            candidate_benchmark_report = run_benchmark_manifest(
+                model=model,
+                manifest_path=benchmark_manifest_path,
+                progress_callback=(
+                    None if args.quiet else _build_benchmark_progress_logger()
+                ),
+            )
+            candidate_benchmark_report_path = (
+                benchmark_dir / f"cycle_{cycle_index:03d}_candidate.json"
+            )
+            candidate_benchmark_report_path.write_text(
+                canonical_json(candidate_benchmark_report, indent=2),
+                encoding="utf-8",
+            )
         arena_summary = None
         promotion_decision = None
         arena_summary_path = None
         arena_games_path = None
+        arena_world_bucket_counts = None
         candidate_checkpoint_path = checkpoint_path
         active_checkpoint_path = checkpoint_path
         if args.promotion_gate:
@@ -2129,12 +2514,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                     adjudicate_max_plies=args.adjudicate_max_plies,
                     adjudication_threshold=args.adjudication_threshold,
                 )
-                arena_states = _sample_loop_initial_states(
+                arena_states, arena_world_bucket_counts, _ = _sample_curriculum_states(
                     games=args.arena_games,
                     seed=arena_seed,
-                    randomize_specials=args.randomize_handauthored_specials,
-                    special_piece_classes=special_piece_classes,
-                    inclusion_probability=args.special_piece_inclusion_probability,
+                    curriculum_world_seeds=curriculum_world_seeds,
+                    bucket_weights=bucket_weights,
+                    fallback_randomize_specials=args.randomize_handauthored_specials,
+                    fallback_special_piece_classes=handauthored_piece_classes,
+                    fallback_inclusion_probability=args.special_piece_inclusion_probability,
                 )
                 arena_summary = run_checkpoint_arena_from_paths(
                     candidate_checkpoint=candidate_checkpoint_path,
@@ -2185,6 +2572,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 )
         else:
             previous_checkpoint_path = checkpoint_path
+            arena_world_bucket_counts = None
         cycle_summary = {
             "cycle": cycle_index,
             "checkpoint": str(checkpoint_path),
@@ -2229,18 +2617,40 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "model_config": _model_config_summary(model_config),
             "train_eval_metrics": train_eval_metrics.to_dict(),
             "val_eval_metrics": val_eval_metrics.to_dict(),
+            "candidate_benchmark_manifest": (
+                str(benchmark_manifest_path)
+                if benchmark_manifest_path is not None
+                else None
+            ),
+            "candidate_benchmark_report_path": (
+                str(candidate_benchmark_report_path)
+                if candidate_benchmark_report_path is not None
+                else None
+            ),
+            "candidate_benchmark_aggregate": (
+                dict(candidate_benchmark_report["aggregate"])
+                if candidate_benchmark_report is not None
+                else None
+            ),
             "root_dirichlet_alpha": selfplay_config.root_dirichlet_alpha,
             "root_exploration_fraction": selfplay_config.root_exploration_fraction,
+            "curriculum_bucket_weights": bucket_weights,
+            "curriculum_world_pool_counts": curriculum_world_pool_counts,
+            "train_world_bucket_counts": train_world_bucket_counts,
+            "val_world_bucket_counts": val_world_bucket_counts,
+            "arena_world_bucket_counts": arena_world_bucket_counts,
             "workers": args.workers,
             "selfplay_device": args.selfplay_device or args.device,
             "batched_inference": args.batched_inference,
             "inference_device": args.inference_device or args.device,
+            "strategy_provider": args.strategy_provider,
             "train_inference_stats": (
                 train_inference_stats.to_dict()
                 if train_inference_stats is not None
                 else None
             ),
             "train_search_metrics": train_search_metrics,
+            "train_benchmark_metadata_summary": train_benchmark_metadata_summary,
             "train_termination_summary": train_termination_summary,
             "val_inference_stats": (
                 val_inference_stats.to_dict()
@@ -2248,7 +2658,9 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 else None
             ),
             "val_search_metrics": val_search_metrics,
+            "val_benchmark_metadata_summary": val_benchmark_metadata_summary,
             "val_termination_summary": val_termination_summary,
+            "replay_benchmark_metadata_summary": replay_benchmark_metadata_summary,
             "used_verified_pieces": args.use_verified_pieces,
             "piece_registry": (
                 str(args.piece_registry) if args.use_verified_pieces else None
@@ -2256,7 +2668,16 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "verified_piece_count": len(verified_records),
             "verified_piece_digests": registry_piece_digest_metadata(verified_records),
             "verified_piece_record_metadata": registry_piece_record_metadata(verified_records),
-            "special_piece_class_count": len(special_piece_classes),
+            "special_piece_class_count": len(
+                _merge_piece_classes(
+                    handauthored_piece_classes,
+                    *(
+                        seed_world.piece_classes
+                        for bucket in curriculum_world_seeds.values()
+                        for seed_world in bucket
+                    ),
+                )
+            ),
             "curriculum_results": [result.to_dict() for result in curriculum_results],
             "curriculum_tasks_run": len(curriculum_results),
             "curriculum_tasks_accepted": sum(1 for result in curriculum_results if result.accepted),
@@ -2266,6 +2687,19 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         metrics_path = metrics_dir / f"cycle_{cycle_index:03d}.json"
         metrics_path.write_text(canonical_json(cycle_summary, indent=2), encoding="utf-8")
         if not args.quiet:
+            benchmark_metrics = (
+                dict(
+                    dict(candidate_benchmark_report["aggregate"]).get("metrics", {})
+                )
+                if candidate_benchmark_report is not None
+                else {}
+            )
+            benchmark_summary = ""
+            if benchmark_metrics:
+                benchmark_summary = (
+                    f" bench_top1={benchmark_metrics.get('top1_agreement', 0.0):.3f}"
+                    f" bench_v_mse={benchmark_metrics.get('value_mse', 0.0):.4f}"
+                )
             _stderr_print(
                 "cycle "
                 f"{cycle_index} summary: "
@@ -2275,16 +2709,30 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                 f"val_top1={val_eval_metrics.top1_agreement:.3f} "
                 f"train_cutoff_rate={train_termination_summary['max_plies_rate']:.3f} "
                 f"val_cutoff_rate={val_termination_summary['max_plies_rate']:.3f}"
+                f"{benchmark_summary}"
             )
 
     summary = {
         "status": "ok",
         "output_dir": str(args.output_dir),
         "model_config": _model_config_summary(model_config),
+        "curriculum_bucket_weights": bucket_weights,
+        "strategy_provider": args.strategy_provider,
         "cycles": cycle_summaries,
         "latest_checkpoint": cycle_summaries[-1]["checkpoint"],
         "latest_candidate_checkpoint": cycle_summaries[-1]["candidate_checkpoint"],
         "best_checkpoint": cycle_summaries[-1]["best_checkpoint"],
+        "benchmark_manifest": (
+            str(benchmark_manifest_path) if benchmark_manifest_path is not None else None
+        ),
+        "benchmark_manifest_snapshot": (
+            str(benchmark_manifest_snapshot_path)
+            if benchmark_manifest_snapshot_path is not None
+            else None
+        ),
+        "benchmark_dir": (
+            str(benchmark_dir) if benchmark_manifest_path is not None else None
+        ),
         "viewer_url": viewer.url if viewer is not None else None,
     }
     (args.output_dir / "summary.json").write_text(
@@ -2317,12 +2765,26 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "replay_foundation_bucket_weight": args.replay_foundation_bucket_weight,
             "curriculum_task": list(args.curriculum_task or []),
             "curriculum_oracle": args.curriculum_oracle,
+            "curriculum_foundation_weight": args.curriculum_foundation_weight,
+            "curriculum_known_weight": args.curriculum_known_weight,
+            "curriculum_recent_weight": args.curriculum_recent_weight,
+            "curriculum_composition_weight": args.curriculum_composition_weight,
+            "curriculum_recent_window": args.curriculum_recent_window,
             "promotion_gate": args.promotion_gate,
             "arena_games": args.arena_games,
             "arena_simulations": args.arena_simulations,
             "randomize_handauthored_specials": args.randomize_handauthored_specials,
             "special_piece_inclusion_probability": args.special_piece_inclusion_probability,
             "use_verified_pieces": args.use_verified_pieces,
+            "strategy_provider": args.strategy_provider,
+            "strategy_file": (
+                str(args.strategy_file) if args.strategy_file is not None else None
+            ),
+            "benchmark_manifest": (
+                str(benchmark_manifest_path)
+                if benchmark_manifest_path is not None
+                else None
+            ),
         },
         artifacts={
             "summary": str(args.output_dir / "summary.json"),
@@ -2331,6 +2793,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "metrics_dir": str(metrics_dir),
             "selfplay_dir": str(data_dir),
             "arena_dir": str(arena_dir) if args.promotion_gate else None,
+            "benchmark_dir": (
+                str(benchmark_dir) if benchmark_manifest_path is not None else None
+            ),
+            "benchmark_manifest": (
+                str(benchmark_manifest_snapshot_path)
+                if benchmark_manifest_snapshot_path is not None
+                else None
+            ),
         },
     )
     print(canonical_json(summary, indent=2))
@@ -2418,7 +2888,7 @@ def _records_for_training_pool(records):
     return filtered
 
 
-def _load_special_piece_pool(
+def _load_curriculum_piece_sources(
     *,
     randomize_specials: bool,
     special_piece_dir: Path,
@@ -2435,16 +2905,7 @@ def _load_special_piece_pool(
         if use_verified_pieces
         else []
     )
-    active_verified_records = _records_for_training_pool(verified_records)
-    verified_piece_classes = (
-        load_piece_classes_for_records(piece_registry, active_verified_records)
-        if use_verified_pieces
-        else ()
-    )
-    return active_verified_records, _merge_piece_classes(
-        handauthored_piece_classes,
-        verified_piece_classes,
-    )
+    return handauthored_piece_classes, _records_for_training_pool(verified_records)
 
 
 def _merge_piece_classes(*groups) -> list[PieceClass]:
@@ -2458,6 +2919,198 @@ def _merge_piece_classes(*groups) -> list[PieceClass]:
     ]
 
 
+def _curriculum_bucket_weights(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "foundation": float(args.curriculum_foundation_weight),
+        "known_mechanic": float(args.curriculum_known_weight),
+        "recent_admission": float(args.curriculum_recent_weight),
+        "composition": float(args.curriculum_composition_weight),
+    }
+
+
+def _record_family_id(record) -> str | None:
+    family_id = record.metadata.get("family_id")
+    if family_id is None:
+        return None
+    return str(family_id)
+
+
+def _record_admission_cycle(record) -> int | None:
+    value = record.metadata.get("admission_cycle")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_is_recent(record, *, cycle_index: int, recent_window: int) -> bool:
+    novelty_tier = record.metadata.get("novelty_tier")
+    if novelty_tier is not None and str(novelty_tier) == "recent_admission":
+        return True
+    admission_cycle = _record_admission_cycle(record)
+    if admission_cycle is None:
+        return False
+    return admission_cycle >= max(1, cycle_index - recent_window + 1)
+
+
+def _build_curriculum_world_seeds(
+    *,
+    piece_registry: Path,
+    verified_records,
+    cycle_index: int,
+    recent_window: int,
+) -> dict[str, list[TrainingWorldSeed]]:
+    bucketed_records: dict[str, list[object]] = {
+        bucket_id: []
+        for bucket_id in TRAINING_WORLD_BUCKET_IDS
+    }
+    if not verified_records:
+        return bucketed_records
+
+    compiled_piece_classes = load_piece_classes_for_records(piece_registry, verified_records)
+    piece_classes_by_id = {
+        record.piece_id: piece_class
+        for record, piece_class in zip(verified_records, compiled_piece_classes, strict=True)
+    }
+
+    known_records = []
+    recent_records = []
+    for record in verified_records:
+        if _record_is_recent(
+            record,
+            cycle_index=cycle_index,
+            recent_window=recent_window,
+        ):
+            recent_records.append(record)
+        else:
+            known_records.append(record)
+
+    def make_seed(bucket_id: str, records_for_seed) -> TrainingWorldSeed:
+        sorted_records = sorted(records_for_seed, key=lambda record: record.piece_id)
+        piece_ids = tuple(record.piece_id for record in sorted_records)
+        family_ids = tuple(
+            sorted(
+                {
+                    family_id
+                    for family_id in (_record_family_id(record) for record in sorted_records)
+                    if family_id is not None
+                }
+            )
+        )
+        return TrainingWorldSeed(
+            bucket_id=bucket_id,
+            piece_ids=piece_ids,
+            piece_classes=tuple(piece_classes_by_id[piece_id] for piece_id in piece_ids),
+            family_ids=family_ids,
+        )
+
+    bucketed_records["foundation"].append(
+        TrainingWorldSeed(
+            bucket_id="foundation",
+            piece_ids=(),
+            piece_classes=(),
+            family_ids=("foundation",),
+        )
+    )
+    bucketed_records["known_mechanic"] = [
+        make_seed("known_mechanic", (record,))
+        for record in known_records
+    ]
+    bucketed_records["recent_admission"] = [
+        make_seed("recent_admission", (record,))
+        for record in recent_records
+    ]
+
+    composition_pairs = []
+    for left_record, right_record in combinations(verified_records, 2):
+        left_family = _record_family_id(left_record)
+        right_family = _record_family_id(right_record)
+        if left_family is None or right_family is None or left_family == right_family:
+            continue
+        composition_pairs.append((left_record, right_record))
+    bucketed_records["composition"] = [
+        make_seed("composition", pair)
+        for pair in composition_pairs
+    ]
+    return bucketed_records
+
+
+def _sample_curriculum_states(
+    *,
+    games: int,
+    seed: int,
+    curriculum_world_seeds: dict[str, list[TrainingWorldSeed]],
+    bucket_weights: dict[str, float],
+    fallback_randomize_specials: bool,
+    fallback_special_piece_classes: tuple[PieceClass, ...] | list[PieceClass],
+    fallback_inclusion_probability: float,
+) -> tuple[list[GameState], dict[str, int], dict[str, int]]:
+    if games < 1:
+        raise ValueError("games must be at least 1")
+
+    available_bucket_ids = [
+        bucket_id
+        for bucket_id in TRAINING_WORLD_BUCKET_IDS
+        if curriculum_world_seeds.get(bucket_id)
+        and bucket_weights.get(bucket_id, 0.0) > 0.0
+    ]
+    if not available_bucket_ids:
+        return (
+            _sample_loop_initial_states(
+                games=games,
+                seed=seed,
+                randomize_specials=fallback_randomize_specials,
+                special_piece_classes=fallback_special_piece_classes,
+                inclusion_probability=fallback_inclusion_probability,
+            ),
+            {
+                "foundation": games if not fallback_randomize_specials else 0,
+                "known_mechanic": 0,
+                "recent_admission": 0,
+                "composition": 0,
+                "legacy_randomized": games if fallback_randomize_specials else 0,
+            },
+            {
+                bucket_id: len(curriculum_world_seeds.get(bucket_id, ()))
+                for bucket_id in TRAINING_WORLD_BUCKET_IDS
+            },
+        )
+
+    rng = random.Random(seed)
+    sampled_states: list[GameState] = []
+    sampled_bucket_counts: Counter[str] = Counter()
+    bucket_population = {
+        bucket_id: len(curriculum_world_seeds.get(bucket_id, ()))
+        for bucket_id in TRAINING_WORLD_BUCKET_IDS
+    }
+    weights = [bucket_weights[bucket_id] for bucket_id in available_bucket_ids]
+
+    for _ in range(games):
+        bucket_id = rng.choices(available_bucket_ids, weights=weights, k=1)[0]
+        seed_world = rng.choice(curriculum_world_seeds[bucket_id])
+        if not seed_world.piece_classes:
+            state = standard_initial_state()
+        else:
+            state = sample_standard_initial_state(
+                rng,
+                special_piece_classes=seed_world.piece_classes,
+                inclusion_probability=1.0,
+            )
+        sampled_states.append(state)
+        sampled_bucket_counts[bucket_id] += 1
+
+    return (
+        sampled_states,
+        {
+            bucket_id: sampled_bucket_counts.get(bucket_id, 0)
+            for bucket_id in (*TRAINING_WORLD_BUCKET_IDS, "legacy_randomized")
+        },
+        bucket_population,
+    )
+
+
 def _annotate_games_with_registry(
     games,
     *,
@@ -2468,32 +3121,71 @@ def _annotate_games_with_registry(
         return
     active_digest_metadata = registry_piece_digest_metadata(verified_records)
     active_training_metadata = registry_piece_training_metadata(verified_records)
-    game_metadata = {
+    shared_metadata = {
         "piece_registry": str(registry_path),
         "active_verified_piece_digests": active_digest_metadata,
         "active_verified_piece_training_metadata": active_training_metadata,
     }
     for game in games:
-        game.metadata.update(game_metadata)
-        game.replay_trace.metadata.update(game_metadata)
+        present_game_piece_digests = present_piece_metadata_for_state(
+            game.replay_trace.initial_state,
+            active_digest_metadata,
+        )
+        present_game_training_metadata = present_piece_metadata_for_state(
+            game.replay_trace.initial_state,
+            active_training_metadata,
+        )
+        game.metadata.update(shared_metadata)
+        game.replay_trace.metadata.update(shared_metadata)
+        if present_game_piece_digests:
+            game.metadata["verified_piece_digests"] = present_game_piece_digests
+            game.replay_trace.metadata["verified_piece_digests"] = present_game_piece_digests
+        else:
+            game.metadata.pop("verified_piece_digests", None)
+            game.replay_trace.metadata.pop("verified_piece_digests", None)
+        if present_game_training_metadata:
+            game.metadata["verified_piece_training_metadata"] = present_game_training_metadata
+            game.replay_trace.metadata["verified_piece_training_metadata"] = (
+                present_game_training_metadata
+            )
+        else:
+            game.metadata.pop("verified_piece_training_metadata", None)
+            game.replay_trace.metadata.pop("verified_piece_training_metadata", None)
+        game.metadata.update(
+            benchmark_metadata_for_state(
+                game.replay_trace.initial_state,
+                game.metadata,
+            )
+        )
+        game.replay_trace.metadata.update(
+            benchmark_metadata_for_state(
+                game.replay_trace.initial_state,
+                game.replay_trace.metadata,
+            )
+        )
         for example in game.examples:
             example.metadata["piece_registry"] = str(registry_path)
-            present_piece_ids = _present_verified_piece_ids(
+            present_piece_digests = present_piece_metadata_for_state(
                 example.state,
-                active_digest_metadata=active_digest_metadata,
+                active_digest_metadata,
             )
-            if not present_piece_ids:
+            if not present_piece_digests:
                 example.metadata.pop("verified_piece_digests", None)
                 example.metadata.pop("verified_piece_training_metadata", None)
-                continue
-            example.metadata["verified_piece_digests"] = {
-                piece_id: active_digest_metadata[piece_id]
-                for piece_id in present_piece_ids
-            }
-            example.metadata["verified_piece_training_metadata"] = {
-                piece_id: active_training_metadata[piece_id]
-                for piece_id in present_piece_ids
-            }
+            else:
+                example.metadata["verified_piece_digests"] = present_piece_digests
+                example.metadata["verified_piece_training_metadata"] = (
+                    present_piece_metadata_for_state(
+                        example.state,
+                        active_training_metadata,
+                    )
+                )
+            example.metadata.update(
+                benchmark_metadata_for_state(
+                    example.state,
+                    example.metadata,
+                )
+            )
 
 
 def _annotate_games_with_viewer_phase(
@@ -2511,20 +3203,6 @@ def _annotate_games_with_viewer_phase(
         game.replay_trace.metadata.update(metadata)
         for example in game.examples:
             example.metadata.update(metadata)
-
-
-def _present_verified_piece_ids(
-    state: GameState,
-    *,
-    active_digest_metadata: dict[str, JsonValue],
-) -> tuple[str, ...]:
-    active_piece_ids = set(active_digest_metadata)
-    present_piece_ids = {
-        piece_instance.piece_class_id
-        for piece_instance in state.piece_instances.values()
-        if piece_instance.piece_class_id in active_piece_ids
-    }
-    return tuple(sorted(present_piece_ids))
 
 
 def _safe_path_component(value: str) -> str:
@@ -2589,6 +3267,7 @@ def _training_metrics_dict(metrics) -> dict[str, object]:
         "batches_completed": metrics.batches_completed,
         "average_policy_loss": metrics.average_policy_loss,
         "average_value_loss": metrics.average_value_loss,
+        "average_uncertainty_loss": metrics.average_uncertainty_loss,
         "average_total_loss": metrics.average_total_loss,
         "device": metrics.device,
     }
@@ -2959,6 +3638,11 @@ def _build_training_progress_logger(
                     f" loss={progress.total_loss:.4f}"
                     f" policy={progress.policy_loss:.4f}"
                     f" value={progress.value_loss:.4f}"
+                    + (
+                        ""
+                        if progress.uncertainty_loss is None
+                        else f" uncertainty={progress.uncertainty_loss:.4f}"
+                    )
                 )
             return
         if progress.event == "epoch_completed":
@@ -2974,6 +3658,11 @@ def _build_training_progress_logger(
                 f" avg_loss={progress.total_loss:.4f}"
                 f" avg_policy={progress.policy_loss:.4f}"
                 f" avg_value={progress.value_loss:.4f}"
+                + (
+                    ""
+                    if progress.uncertainty_loss is None
+                    else f" avg_uncertainty={progress.uncertainty_loss:.4f}"
+                )
             )
 
     return callback
@@ -3005,6 +3694,54 @@ def _build_model_eval_progress_logger(
         if progress.event == "eval_completed":
             _stderr_print(
                 f"[{elapsed:7.1f}s] eval-model completed examples={progress.examples_total}"
+            )
+
+    return callback
+
+
+def _build_benchmark_progress_logger():
+    start_time = time.monotonic()
+
+    def callback(progress: BenchmarkProgress) -> None:
+        elapsed = time.monotonic() - start_time
+        if progress.event == "suite_started":
+            _stderr_print(
+                f"[{elapsed:7.1f}s] benchmark suite "
+                f"{progress.suite_index}/{progress.suites_total} started"
+                f" id={progress.suite_id}"
+            )
+            return
+        if progress.event == "suite_completed":
+            _stderr_print(
+                f"[{elapsed:7.1f}s] benchmark suite "
+                f"{progress.suite_index}/{progress.suites_total} completed"
+                f" id={progress.suite_id}"
+                f" games={progress.games}"
+                f" examples={progress.examples}"
+            )
+
+    return callback
+
+
+def _build_benchmark_corpus_progress_logger():
+    start_time = time.monotonic()
+
+    def callback(progress: BenchmarkCorpusProgress) -> None:
+        elapsed = time.monotonic() - start_time
+        if progress.event == "suite_started":
+            _stderr_print(
+                f"[{elapsed:7.1f}s] benchmark corpus suite "
+                f"{progress.suite_index}/{progress.suites_total} started"
+                f" id={progress.suite_id}"
+                f" games={progress.games}"
+            )
+            return
+        if progress.event == "suite_completed":
+            _stderr_print(
+                f"[{elapsed:7.1f}s] benchmark corpus suite "
+                f"{progress.suite_index}/{progress.suites_total} completed"
+                f" id={progress.suite_id}"
+                f" games={progress.games}"
             )
 
     return callback

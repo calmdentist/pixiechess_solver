@@ -15,6 +15,10 @@ from pixie_solver.model.policy_value import (
     resolve_device,
 )
 from pixie_solver.training.dataset import SelfPlayExample
+from pixie_solver.training.targets import (
+    blended_value_target_for_example,
+    uncertainty_target_for_example,
+)
 from pixie_solver.utils.serialization import JsonValue, canonical_json
 
 UNIFORM_REPLAY_SAMPLING_STRATEGY = "uniform"
@@ -51,6 +55,9 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     policy_weight: float = 1.0
     value_weight: float = 1.0
+    uncertainty_weight: float = 0.0
+    root_value_target_weight: float = 0.0
+    outcome_target_weight: float = 1.0
     device: str | None = None
     shuffle: bool = True
     seed: int = 0
@@ -72,6 +79,7 @@ class TrainingMetrics:
     average_value_loss: float
     average_total_loss: float
     device: str
+    average_uncertainty_loss: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +93,7 @@ class TrainingProgress:
     examples_seen: int | None = None
     policy_loss: float | None = None
     value_loss: float | None = None
+    uncertainty_loss: float | None = None
     total_loss: float | None = None
     device: str | None = None
 
@@ -127,6 +136,21 @@ def train_from_replays(
     ):
         if weight <= 0.0:
             raise ValueError(f"{field_name} must be positive")
+    for field_name, weight in (
+        ("uncertainty_weight", active_config.uncertainty_weight),
+        ("root_value_target_weight", active_config.root_value_target_weight),
+        ("outcome_target_weight", active_config.outcome_target_weight),
+    ):
+        if weight < 0.0:
+            raise ValueError(f"{field_name} must be non-negative")
+    if (
+        active_config.root_value_target_weight
+        + active_config.outcome_target_weight
+        <= 0.0
+    ):
+        raise ValueError(
+            "At least one value target weight must be positive"
+        )
 
     device = resolve_device(active_config.device)
     _set_training_seed(active_config.seed)
@@ -168,6 +192,7 @@ def train_from_replays(
 
     total_policy_loss = 0.0
     total_value_loss = 0.0
+    total_uncertainty_loss = 0.0
     total_total_loss = 0.0
     examples_seen = 0
     batches_completed = 0
@@ -188,6 +213,7 @@ def train_from_replays(
             optimizer.zero_grad(set_to_none=True)
             batch_policy_loss = torch.zeros((), dtype=torch.float32, device=device)
             batch_value_loss = torch.zeros((), dtype=torch.float32, device=device)
+            batch_uncertainty_loss = torch.zeros((), dtype=torch.float32, device=device)
             valid_batch = [
                 example
                 for example in batch
@@ -218,24 +244,47 @@ def train_from_replays(
                 )
                 log_probs = torch.log_softmax(forward_output.policy_logits, dim=0)
                 policy_loss = -(target_policy * log_probs).sum()
-                target_value = torch.tensor(
-                    float(example.outcome),
-                    dtype=torch.float32,
+                target_value = _target_value_tensor(
+                    example=example,
+                    config=active_config,
                     device=device,
                 )
                 value_loss = F.mse_loss(
                     forward_output.value.float(),
                     target_value,
                 )
+                if active_config.uncertainty_weight > 0.0:
+                    if not forward_output.uncertainty.requires_grad:
+                        raise ValueError(
+                            "uncertainty_weight requires a model with trainable "
+                            "uncertainty predictions"
+                        )
+                    target_uncertainty = _target_uncertainty_tensor(
+                        example=example,
+                        device=device,
+                    )
+                    uncertainty_loss = F.mse_loss(
+                        forward_output.uncertainty.float(),
+                        target_uncertainty,
+                    )
+                else:
+                    uncertainty_loss = torch.zeros(
+                        (),
+                        dtype=torch.float32,
+                        device=device,
+                    )
                 batch_policy_loss = batch_policy_loss + policy_loss
                 batch_value_loss = batch_value_loss + value_loss
+                batch_uncertainty_loss = batch_uncertainty_loss + uncertainty_loss
                 examples_seen += 1
 
             mean_policy_loss = batch_policy_loss / valid_examples
             mean_value_loss = batch_value_loss / valid_examples
+            mean_uncertainty_loss = batch_uncertainty_loss / valid_examples
             total_loss = (
                 active_config.policy_weight * mean_policy_loss
                 + active_config.value_weight * mean_value_loss
+                + active_config.uncertainty_weight * mean_uncertainty_loss
             )
             total_loss.backward()
             optimizer.step()
@@ -243,9 +292,13 @@ def train_from_replays(
             batches_completed += 1
             mean_policy_loss_value = float(mean_policy_loss.detach().cpu().item())
             mean_value_loss_value = float(mean_value_loss.detach().cpu().item())
+            mean_uncertainty_loss_value = float(
+                mean_uncertainty_loss.detach().cpu().item()
+            )
             total_loss_value = float(total_loss.detach().cpu().item())
             total_policy_loss += mean_policy_loss_value
             total_value_loss += mean_value_loss_value
+            total_uncertainty_loss += mean_uncertainty_loss_value
             total_total_loss += total_loss_value
             if progress_callback is not None:
                 progress_callback(
@@ -259,6 +312,7 @@ def train_from_replays(
                         examples_seen=examples_seen,
                         policy_loss=mean_policy_loss_value,
                         value_loss=mean_value_loss_value,
+                        uncertainty_loss=mean_uncertainty_loss_value,
                         total_loss=total_loss_value,
                         device=str(device),
                     )
@@ -286,6 +340,7 @@ def train_from_replays(
             batches_completed=batches_completed,
             average_policy_loss=total_policy_loss / completed_batches,
             average_value_loss=total_value_loss / completed_batches,
+            average_uncertainty_loss=total_uncertainty_loss / completed_batches,
             average_total_loss=total_total_loss / completed_batches,
             device=str(device),
         ),
@@ -302,6 +357,7 @@ def train_from_replays(
                 examples_seen=examples_seen,
                 policy_loss=result.metrics.average_policy_loss,
                 value_loss=result.metrics.average_value_loss,
+                uncertainty_loss=result.metrics.average_uncertainty_loss,
                 total_loss=result.metrics.average_total_loss,
                 device=str(device),
             )
@@ -377,6 +433,36 @@ def _target_policy_tensor(
     return torch.full(
         (len(move_ids),),
         1.0 / len(move_ids),
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _target_value_tensor(
+    *,
+    example: SelfPlayExample,
+    config: TrainingConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    blended_target = blended_value_target_for_example(
+        example,
+        root_value_weight=config.root_value_target_weight,
+        outcome_weight=config.outcome_target_weight,
+    )
+    return torch.tensor(
+        blended_target,
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _target_uncertainty_tensor(
+    *,
+    example: SelfPlayExample,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.tensor(
+        uncertainty_target_for_example(example),
         dtype=torch.float32,
         device=device,
     )

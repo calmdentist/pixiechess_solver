@@ -23,6 +23,10 @@ from pixie_solver.strategy import (
 )
 from pixie_solver.simulator.engine import apply_move, result
 from pixie_solver.training.dataset import SelfPlayExample, SelfPlayGame
+from pixie_solver.training.benchmark_metadata import (
+    SEARCH_ONLY_MODEL_ARCHITECTURE,
+    benchmark_metadata_for_state,
+)
 from pixie_solver.training.checkpoint import load_training_checkpoint
 from pixie_solver.training.inference_service import (
     BatchedInferenceClient,
@@ -392,6 +396,7 @@ def _play_single_game(
     termination_reason = "max_plies"
     game_result: str | None = None
     adjudication: CutoffAdjudication | None = None
+    model_architecture = _model_architecture(policy_value_model)
     initial_strategy_payload, strategy_provider_metadata = _resolve_strategy(
         state=state,
         strategy=config.strategy,
@@ -517,15 +522,24 @@ def _play_single_game(
                 visit_counts=search_result.visit_counts,
                 selected_move_id=chosen_move_id,
                 root_value=search_result.root_value,
-                metadata={
-                    "game_index": game_index,
-                    "ply": ply,
-                    "temperature": config.temperature_for_ply(ply),
-                    "strategy": current_strategy_payload,
-                    "strategy_digest": strategy_digest,
-                    "strategy_scope": strategy_scope,
-                    **dict(search_result.metadata),
-                },
+                metadata=benchmark_metadata_for_state(
+                    state,
+                    {
+                        "game_index": game_index,
+                        "ply": ply,
+                        "temperature": config.temperature_for_ply(ply),
+                        "strategy": current_strategy_payload,
+                        "strategy_digest": strategy_digest,
+                        "strategy_scope": strategy_scope,
+                        "model_architecture": model_architecture,
+                        **dict(search_result.metadata),
+                    },
+                    search_budget=_coerce_search_budget(
+                        search_result.metadata.get("simulations_used"),
+                        default=config.simulations,
+                    ),
+                    model_architecture=model_architecture,
+                ),
             )
         )
         moves.append(chosen_move)
@@ -575,67 +589,83 @@ def _play_single_game(
     replay_trace = build_replay_trace(
         initial_state,
         moves,
-        metadata={
-            "game_index": game_index,
-            "base_seed": config.seed,
-            "seed": game_seed,
-            "simulations": config.simulations,
-            "max_plies": config.max_plies,
-            "opening_temperature": config.opening_temperature,
-            "final_temperature": config.final_temperature,
-            "temperature_drop_after_ply": config.temperature_drop_after_ply,
-            "c_puct": config.c_puct,
-            "root_dirichlet_alpha": config.root_dirichlet_alpha,
-            "root_exploration_fraction": config.root_exploration_fraction,
-            "adjudicate_max_plies": config.adjudicate_max_plies,
-            "adjudication_threshold": config.adjudication_threshold,
-            "initial_strategy": initial_strategy_payload,
-            "strategy": current_strategy_payload,
-            "strategy_digest": strategy_digest,
-            "strategy_scope": strategy_scope,
-            "strategy_refreshes": strategy_refreshes,
-            "strategy_provider": strategy_provider_metadata,
-            "strategy_refresh_on_uncertainty": config.strategy_refresh_on_uncertainty,
-            "strategy_refresh_uncertainty_threshold": (
-                config.strategy_refresh_uncertainty_threshold
-            ),
-            "adaptive_search": config.adaptive_search,
-            "adaptive_min_simulations": config.adaptive_min_simulations,
-            "adaptive_max_simulations": config.adaptive_max_simulations,
-            "cutoff_adjudication": (
-                adjudication.to_dict() if adjudication is not None else None
-            ),
-            "termination_reason": termination_reason,
-            "outcome": outcome,
-        },
+        metadata=benchmark_metadata_for_state(
+            initial_state,
+            {
+                "game_index": game_index,
+                "base_seed": config.seed,
+                "seed": game_seed,
+                "simulations": config.simulations,
+                "max_plies": config.max_plies,
+                "opening_temperature": config.opening_temperature,
+                "final_temperature": config.final_temperature,
+                "temperature_drop_after_ply": config.temperature_drop_after_ply,
+                "c_puct": config.c_puct,
+                "root_dirichlet_alpha": config.root_dirichlet_alpha,
+                "root_exploration_fraction": config.root_exploration_fraction,
+                "adjudicate_max_plies": config.adjudicate_max_plies,
+                "adjudication_threshold": config.adjudication_threshold,
+                "initial_strategy": initial_strategy_payload,
+                "strategy": current_strategy_payload,
+                "strategy_digest": strategy_digest,
+                "strategy_scope": strategy_scope,
+                "strategy_refreshes": strategy_refreshes,
+                "strategy_provider": strategy_provider_metadata,
+                "strategy_refresh_on_uncertainty": (
+                    config.strategy_refresh_on_uncertainty
+                ),
+                "strategy_refresh_uncertainty_threshold": (
+                    config.strategy_refresh_uncertainty_threshold
+                ),
+                "adaptive_search": config.adaptive_search,
+                "adaptive_min_simulations": config.adaptive_min_simulations,
+                "adaptive_max_simulations": config.adaptive_max_simulations,
+                "cutoff_adjudication": (
+                    adjudication.to_dict() if adjudication is not None else None
+                ),
+                "termination_reason": termination_reason,
+                "outcome": outcome,
+                "model_architecture": model_architecture,
+            },
+            search_budget=config.simulations,
+            model_architecture=model_architecture,
+        ),
     )
     game = SelfPlayGame(
         replay_trace=replay_trace,
         examples=tuple(examples),
         outcome=outcome,
-        metadata={
-            "game_index": game_index,
-            "base_seed": config.seed,
-            "seed": game_seed,
-            "plies_played": len(moves),
-            "termination_reason": termination_reason,
-            "cutoff_adjudication": (
-                adjudication.to_dict() if adjudication is not None else None
-            ),
-            "initial_strategy": initial_strategy_payload,
-            "strategy": current_strategy_payload,
-            "strategy_digest": strategy_digest,
-            "strategy_scope": strategy_scope,
-            "strategy_refreshes": strategy_refreshes,
-            "strategy_provider": strategy_provider_metadata,
-            "strategy_refresh_on_uncertainty": config.strategy_refresh_on_uncertainty,
-            "strategy_refresh_uncertainty_threshold": (
-                config.strategy_refresh_uncertainty_threshold
-            ),
-            "adaptive_search": config.adaptive_search,
-            "adaptive_min_simulations": config.adaptive_min_simulations,
-            "adaptive_max_simulations": config.adaptive_max_simulations,
-        },
+        metadata=benchmark_metadata_for_state(
+            initial_state,
+            {
+                "game_index": game_index,
+                "base_seed": config.seed,
+                "seed": game_seed,
+                "plies_played": len(moves),
+                "termination_reason": termination_reason,
+                "cutoff_adjudication": (
+                    adjudication.to_dict() if adjudication is not None else None
+                ),
+                "initial_strategy": initial_strategy_payload,
+                "strategy": current_strategy_payload,
+                "strategy_digest": strategy_digest,
+                "strategy_scope": strategy_scope,
+                "strategy_refreshes": strategy_refreshes,
+                "strategy_provider": strategy_provider_metadata,
+                "strategy_refresh_on_uncertainty": (
+                    config.strategy_refresh_on_uncertainty
+                ),
+                "strategy_refresh_uncertainty_threshold": (
+                    config.strategy_refresh_uncertainty_threshold
+                ),
+                "adaptive_search": config.adaptive_search,
+                "adaptive_min_simulations": config.adaptive_min_simulations,
+                "adaptive_max_simulations": config.adaptive_max_simulations,
+                "model_architecture": model_architecture,
+            },
+            search_budget=config.simulations,
+            model_architecture=model_architecture,
+        ),
     )
     if trace_callback is not None:
         trace_callback(
@@ -837,6 +867,33 @@ def _strategy_scope(strategy: dict[str, JsonValue] | None) -> str | None:
         return None
     scope = strategy.get("scope")
     return None if scope is None else str(scope)
+
+
+def _model_architecture(policy_value_model: PolicyValueModel | None) -> str:
+    if policy_value_model is None:
+        return SEARCH_ONLY_MODEL_ARCHITECTURE
+    config = getattr(policy_value_model, "config", None)
+    architecture = getattr(config, "architecture", None)
+    if architecture is None:
+        return type(policy_value_model).__name__
+    return str(architecture)
+
+
+def _coerce_search_budget(value: JsonValue | None, *, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            try:
+                return int(stripped)
+            except ValueError:
+                return default
+    return default
 
 
 def _world_summary(state: GameState) -> dict[str, JsonValue]:
