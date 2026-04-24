@@ -1,10 +1,10 @@
 {
-  "games_per_world": 1,
+  "games_per_world": 2,
   "manifest_name": "phase0_serious_run_v0",
   "manifest_path": "data/benchmarks/frozen/phase0_serious_v0/manifest.json",
-  "max_plies": 8,
+  "max_plies": 12,
   "output_dir": "data/benchmarks/frozen/phase0_serious_v0",
-  "simulations": 1,
+  "simulations": 2,
   "status": "ok",
   "suite_count": 6,
   "suites": [
@@ -12,34 +12,35 @@
       "benchmark_metadata_summary": {
         "admission_cycle": null,
         "family_counts": {
-          "foundation": 8
+          "foundation": 24
         },
         "model_architecture_counts": {
-          "search_only": 8
+          "search_only": 24
         },
         "novelty_tier_counts": {
-          "foundation": 8
+          "foundation": 24
         },
-        "records": 8,
+        "records": 24,
         "search_budget": {
-          "average": 1.0,
-          "max": 1,
-          "min": 1
+          "average": 2.0,
+          "max": 2,
+          "min": 2
         },
         "split_counts": {
-          "foundation": 8
+          "foundation": 24
         },
-        "unique_strategy_digests": 0,
+        "unique_strategy_digests": 1,
         "unique_worlds": 1
       },
       "description": "Foundation-world regression suite.",
-      "examples": 8,
+      "examples": 24,
       "examples_path": "data/benchmarks/frozen/phase0_serious_v0/foundation_examples.jsonl",
-      "games": 1,
+      "games": 2,
       "games_path": "data/benchmarks/frozen/phase0_serious_v0/foundation_games.jsonl",
       "suite_id": "foundation",
       "tags": [
-        "foundation"
+        "foundation",
+        "strategy_conditioned"
       ],
       "worlds": 1
     },
@@ -51,37 +52,38 @@
           "min": 1
         },
         "family_counts": {
-          "capture_sprint": 8,
-          "phase_rook": 8,
-          "turn_charge": 8
+          "capture_sprint": 24,
+          "phase_rook": 24,
+          "turn_charge": 24
         },
         "model_architecture_counts": {
-          "search_only": 24
+          "search_only": 72
         },
         "novelty_tier_counts": {
-          "introduced": 24
+          "introduced": 72
         },
-        "records": 24,
+        "records": 72,
         "search_budget": {
-          "average": 1.0,
-          "max": 1,
-          "min": 1
+          "average": 2.0,
+          "max": 2,
+          "min": 2
         },
         "split_counts": {
-          "train": 24
+          "train": 72
         },
-        "unique_strategy_digests": 0,
+        "unique_strategy_digests": 3,
         "unique_worlds": 3
       },
       "description": "Seen mechanic families under stable admitted semantics.",
-      "examples": 24,
+      "examples": 72,
       "examples_path": "data/benchmarks/frozen/phase0_serious_v0/known_mechanic_examples.jsonl",
-      "games": 3,
+      "games": 6,
       "games_path": "data/benchmarks/frozen/phase0_serious_v0/known_mechanic_games.jsonl",
       "suite_id": "known_mechanic",
       "tags": [
         "known_mechanic",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ],
       "worlds": 3
     },
@@ -93,37 +95,38 @@
           "min": 21
         },
         "family_counts": {
-          "capture_sprint": 8,
-          "phase_rook": 8,
-          "turn_charge": 8
+          "capture_sprint": 24,
+          "phase_rook": 24,
+          "turn_charge": 24
         },
         "model_architecture_counts": {
-          "search_only": 24
+          "search_only": 72
         },
         "novelty_tier_counts": {
-          "recent_admission": 24
+          "recent_admission": 72
         },
-        "records": 24,
+        "records": 72,
         "search_budget": {
-          "average": 1.0,
-          "max": 1,
-          "min": 1
+          "average": 2.0,
+          "max": 2,
+          "min": 2
         },
         "split_counts": {
-          "train": 24
+          "train": 72
         },
-        "unique_strategy_digests": 0,
+        "unique_strategy_digests": 3,
         "unique_worlds": 3
       },
       "description": "Recently admitted worlds that should measure fast adaptation.",
-      "examples": 24,
+      "examples": 72,
       "examples_path": "data/benchmarks/frozen/phase0_serious_v0/recent_admission_examples.jsonl",
-      "games": 3,
+      "games": 6,
       "games_path": "data/benchmarks/frozen/phase0_serious_v0/recent_admission_games.jsonl",
       "suite_id": "recent_admission",
       "tags": [
         "recent_admission",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ],
       "worlds": 3
     },
@@ -135,35 +138,36 @@
           "min": 31
         },
         "family_counts": {
-          "composition": 24
+          "composition": 72
         },
         "model_architecture_counts": {
-          "search_only": 24
+          "search_only": 72
         },
         "novelty_tier_counts": {
-          "composition": 24
+          "composition": 72
         },
-        "records": 24,
+        "records": 72,
         "search_budget": {
-          "average": 1.0,
-          "max": 1,
-          "min": 1
+          "average": 2.0,
+          "max": 2,
+          "min": 2
         },
         "split_counts": {
-          "mixed": 24
+          "mixed": 72
         },
-        "unique_strategy_digests": 0,
+        "unique_strategy_digests": 3,
         "unique_worlds": 3
       },
       "description": "Worlds containing interacting mechanics from seen families.",
-      "examples": 24,
+      "examples": 72,
       "examples_path": "data/benchmarks/frozen/phase0_serious_v0/composition_examples.jsonl",
-      "games": 3,
+      "games": 6,
       "games_path": "data/benchmarks/frozen/phase0_serious_v0/composition_games.jsonl",
       "suite_id": "composition",
       "tags": [
         "composition",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ],
       "worlds": 3
     },
@@ -171,37 +175,38 @@
       "benchmark_metadata_summary": {
         "admission_cycle": null,
         "family_counts": {
-          "capture_sprint": 8,
-          "phase_rook": 8,
-          "turn_charge": 8
+          "capture_sprint": 24,
+          "phase_rook": 24,
+          "turn_charge": 24
         },
         "model_architecture_counts": {
-          "search_only": 24
+          "search_only": 72
         },
         "novelty_tier_counts": {
-          "heldout_seen_family": 24
+          "heldout_seen_family": 72
         },
-        "records": 24,
+        "records": 72,
         "search_budget": {
-          "average": 1.0,
-          "max": 1,
-          "min": 1
+          "average": 2.0,
+          "max": 2,
+          "min": 2
         },
         "split_counts": {
-          "test_seen_family": 24
+          "test_seen_family": 72
         },
-        "unique_strategy_digests": 0,
+        "unique_strategy_digests": 3,
         "unique_worlds": 3
       },
       "description": "Held-out parameterizations within seen mechanic families.",
-      "examples": 24,
+      "examples": 72,
       "examples_path": "data/benchmarks/frozen/phase0_serious_v0/heldout_seen_family_examples.jsonl",
-      "games": 3,
+      "games": 6,
       "games_path": "data/benchmarks/frozen/phase0_serious_v0/heldout_seen_family_games.jsonl",
       "suite_id": "heldout_seen_family",
       "tags": [
         "heldout_seen_family",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ],
       "worlds": 3
     },
@@ -209,34 +214,35 @@
       "benchmark_metadata_summary": {
         "admission_cycle": null,
         "family_counts": {
-          "edge_sumo": 16
+          "edge_sumo": 48
         },
         "model_architecture_counts": {
-          "search_only": 16
+          "search_only": 48
         },
         "novelty_tier_counts": {
-          "heldout_family": 16
+          "heldout_family": 48
         },
-        "records": 16,
+        "records": 48,
         "search_budget": {
-          "average": 1.0,
-          "max": 1,
-          "min": 1
+          "average": 2.0,
+          "max": 2,
+          "min": 2
         },
         "split_counts": {
-          "test_heldout_family": 16
+          "test_heldout_family": 48
         },
-        "unique_strategy_digests": 0,
+        "unique_strategy_digests": 2,
         "unique_worlds": 2
       },
       "description": "Mechanic families excluded from training.",
-      "examples": 16,
+      "examples": 48,
       "examples_path": "data/benchmarks/frozen/phase0_serious_v0/heldout_family_examples.jsonl",
-      "games": 2,
+      "games": 4,
       "games_path": "data/benchmarks/frozen/phase0_serious_v0/heldout_family_games.jsonl",
       "suite_id": "heldout_family",
       "tags": [
-        "heldout_family"
+        "heldout_family",
+        "strategy_conditioned"
       ],
       "worlds": 2
     }

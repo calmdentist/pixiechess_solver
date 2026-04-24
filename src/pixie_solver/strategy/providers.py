@@ -5,8 +5,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from pixie_solver.core.hash import stable_digest
 from pixie_solver.llm.frontier import FrontierLLMClient
-from pixie_solver.strategy.canonicalize import canonicalize_strategy_hypothesis
+from pixie_solver.strategy.canonicalize import (
+    canonicalize_strategy_hypothesis,
+    strategy_digest as compute_strategy_digest,
+)
 from pixie_solver.strategy.schema import StrategyHypothesis
 from pixie_solver.utils.serialization import JsonValue, to_primitive
 
@@ -18,6 +22,15 @@ The response must contain a single strategy hypothesis that is concise, concrete
 Do not invent unsupported fields.
 Prefer a small, focused strategy over a verbose one.
 """
+
+NO_STRATEGY_CACHE_SCOPE = "none"
+WORLD_PHASE_STRATEGY_CACHE_SCOPE = "world_phase"
+FULL_REQUEST_STRATEGY_CACHE_SCOPE = "full_request"
+SUPPORTED_STRATEGY_CACHE_SCOPES = (
+    NO_STRATEGY_CACHE_SCOPE,
+    WORLD_PHASE_STRATEGY_CACHE_SCOPE,
+    FULL_REQUEST_STRATEGY_CACHE_SCOPE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +103,44 @@ class StrategyProvider(Protocol):
         ...
 
 
+@dataclass(slots=True)
+class CachedStrategyProvider:
+    provider: StrategyProvider
+    scope: str = WORLD_PHASE_STRATEGY_CACHE_SCOPE
+    _cache: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.scope not in SUPPORTED_STRATEGY_CACHE_SCOPES:
+            supported = ", ".join(SUPPORTED_STRATEGY_CACHE_SCOPES)
+            raise ValueError(
+                f"strategy cache scope must be one of {supported}, got {self.scope!r}"
+            )
+
+    def propose_strategy(self, request: StrategyRequest) -> StrategyResponse:
+        if self.scope == NO_STRATEGY_CACHE_SCOPE:
+            response = self.provider.propose_strategy(request)
+            return _with_cache_metadata(
+                response,
+                scope=self.scope,
+                cache_hit=False,
+            )
+        cache_key = _strategy_cache_key(request, scope=self.scope)
+        cached_payload = self._cache.get(cache_key)
+        if cached_payload is not None:
+            return _with_cache_metadata(
+                StrategyResponse.from_dict(cached_payload),
+                scope=self.scope,
+                cache_hit=True,
+            )
+        response = self.provider.propose_strategy(request)
+        self._cache[cache_key] = response.to_dict()
+        return _with_cache_metadata(
+            response,
+            scope=self.scope,
+            cache_hit=False,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class StaticStrategyProvider:
     strategy: StrategyHypothesis | dict[str, JsonValue]
@@ -159,3 +210,38 @@ class FrontierLLMStrategyProvider:
             explanation=parsed.explanation,
             metadata={**dict(parsed.metadata), **response.metadata},
         )
+
+
+def _strategy_cache_key(request: StrategyRequest, *, scope: str) -> str:
+    if scope == WORLD_PHASE_STRATEGY_CACHE_SCOPE:
+        return stable_digest(
+            {
+                "world_summary": dict(request.world_summary),
+                "phase": request.phase,
+                "prior_strategy_digest": (
+                    None
+                    if request.prior_strategy is None
+                    else compute_strategy_digest(request.prior_strategy)
+                ),
+            }
+        )
+    if scope == FULL_REQUEST_STRATEGY_CACHE_SCOPE:
+        return stable_digest(request.to_dict())
+    raise ValueError(f"unsupported strategy cache scope: {scope}")
+
+
+def _with_cache_metadata(
+    response: StrategyResponse,
+    *,
+    scope: str,
+    cache_hit: bool,
+) -> StrategyResponse:
+    return StrategyResponse(
+        strategy=response.strategy,
+        explanation=response.explanation,
+        metadata={
+            **dict(response.metadata),
+            "cache_scope": scope,
+            "cache_hit": cache_hit,
+        },
+    )

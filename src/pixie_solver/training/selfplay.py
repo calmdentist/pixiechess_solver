@@ -3,10 +3,11 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 
 from pixie_solver.core import Color, GameState, Move, StateDelta, stable_move_id
+from pixie_solver.core.hash import stable_digest
 from pixie_solver.model.policy_value import PolicyValueModel
 from pixie_solver.search import (
     DirichletRootNoise,
@@ -16,6 +17,10 @@ from pixie_solver.search import (
     run_mcts,
 )
 from pixie_solver.strategy import (
+    CachedStrategyProvider,
+    FrontierLLMStrategyProvider,
+    JsonFileStrategyProvider,
+    StaticStrategyProvider,
     StrategyHypothesis,
     StrategyProvider,
     StrategyRequest,
@@ -39,6 +44,7 @@ from pixie_solver.utils.serialization import JsonValue, to_primitive
 
 SELFPLAY_SEED_STRIDE = 1_000_003
 _WORKER_MODEL_CACHE: dict[tuple[str, str | None], PolicyValueModel] = {}
+_WORKER_STRATEGY_PROVIDER_CACHE: dict[str, StrategyProvider] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,11 +235,6 @@ def generate_selfplay_games_parallel(
             ),
             None,
         )
-    if strategy_provider is not None and active_config.strategy_refresh_on_uncertainty:
-        raise ValueError(
-            "parallel self-play does not support uncertainty-triggered strategy refresh"
-        )
-
     config_payload = asdict(active_config)
     checkpoint_payload = str(checkpoint_path) if checkpoint_path is not None else None
     inference_stats = None
@@ -257,6 +258,11 @@ def generate_selfplay_games_parallel(
                 checkpoint_payload=None,
                 device=device,
                 inference_client=inference_service.client(),
+                strategy_provider=(
+                    strategy_provider
+                    if active_config.strategy_refresh_on_uncertainty
+                    else None
+                ),
                 progress_callback=progress_callback,
             )
             inference_stats = inference_service.stats()
@@ -277,6 +283,11 @@ def generate_selfplay_games_parallel(
             checkpoint_payload=checkpoint_payload,
             device=device,
             inference_client=None,
+            strategy_provider=(
+                strategy_provider
+                if active_config.strategy_refresh_on_uncertainty
+                else None
+            ),
             progress_callback=progress_callback,
         ),
         inference_stats,
@@ -293,6 +304,7 @@ def _run_parallel_selfplay_jobs(
     checkpoint_payload: str | None,
     device: str | None,
     inference_client: BatchedInferenceClient | None,
+    strategy_provider: StrategyProvider | None,
     progress_callback: Callable[[SelfPlayProgress], None] | None,
 ) -> list[SelfPlayGame]:
     jobs = [
@@ -307,6 +319,7 @@ def _run_parallel_selfplay_jobs(
             "checkpoint_path": checkpoint_payload,
             "device": device,
             "inference_client": inference_client,
+            "strategy_provider": strategy_provider,
         }
         for game_index in range(games)
     ]
@@ -450,12 +463,16 @@ def _play_single_game(
             adaptive_search=config.adaptive_search,
             adaptive_min_simulations=config.adaptive_min_simulations,
             adaptive_max_simulations=config.adaptive_max_simulations,
+            measure_root_uncertainty=config.strategy_refresh_on_uncertainty,
+        )
+        root_uncertainty = _coerce_optional_float(
+            search_result.metadata.get("root_uncertainty")
         )
         if (
             strategy_provider is not None
             and config.strategy_refresh_on_uncertainty
-            and float(search_result.metadata.get("root_uncertainty", 0.0))
-            >= config.strategy_refresh_uncertainty_threshold
+            and root_uncertainty is not None
+            and root_uncertainty >= config.strategy_refresh_uncertainty_threshold
         ):
             refreshed_strategy, refresh_metadata = _resolve_strategy(
                 state=state,
@@ -466,7 +483,7 @@ def _play_single_game(
                     "game_index": game_index,
                     "games_total": games_total,
                     "ply": ply,
-                    "root_uncertainty": search_result.metadata.get("root_uncertainty"),
+                    "root_uncertainty": root_uncertainty,
                 },
             )
             refreshed_digest = _strategy_digest(refreshed_strategy)
@@ -491,6 +508,7 @@ def _play_single_game(
                     adaptive_search=config.adaptive_search,
                     adaptive_min_simulations=config.adaptive_min_simulations,
                     adaptive_max_simulations=config.adaptive_max_simulations,
+                    measure_root_uncertainty=config.strategy_refresh_on_uncertainty,
                 )
         chosen_move, chosen_move_id = _select_move_for_selfplay(
             search_result=search_result,
@@ -767,6 +785,9 @@ def _parallel_selfplay_worker(job: dict[str, object]) -> dict[str, JsonValue]:
     game_seed = seed_for_game(config.seed, game_index)
     checkpoint_path = job.get("checkpoint_path")
     inference_client = job.get("inference_client")
+    strategy_provider = job.get("strategy_provider")
+    if strategy_provider is not None:
+        strategy_provider = _worker_strategy_provider(strategy_provider)
     model = None
     if inference_client is not None:
         model = inference_client
@@ -786,7 +807,7 @@ def _parallel_selfplay_worker(job: dict[str, object]) -> dict[str, JsonValue]:
         rng=random.Random(game_seed),
         policy_value_model=model,
         evaluator=None,
-        strategy_provider=None,
+        strategy_provider=strategy_provider,
         progress_callback=None,
         trace_callback=None,
     )
@@ -896,6 +917,22 @@ def _coerce_search_budget(value: JsonValue | None, *, default: int) -> int:
     return default
 
 
+def _coerce_optional_float(value: JsonValue | None) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
 def _world_summary(state: GameState) -> dict[str, JsonValue]:
     return {
         "side_to_move": state.side_to_move.value,
@@ -904,4 +941,51 @@ def _world_summary(state: GameState) -> dict[str, JsonValue]:
             for class_id, piece_class in sorted(state.piece_classes.items())
         },
         "active_piece_count": len(state.active_pieces()),
+    }
+
+
+def _worker_strategy_provider(strategy_provider: object) -> StrategyProvider:
+    cache_key = _strategy_provider_cache_key(strategy_provider)
+    cached_provider = _WORKER_STRATEGY_PROVIDER_CACHE.get(cache_key)
+    if cached_provider is not None:
+        return cached_provider
+    _WORKER_STRATEGY_PROVIDER_CACHE[cache_key] = strategy_provider  # type: ignore[assignment]
+    return strategy_provider  # type: ignore[return-value]
+
+
+def _strategy_provider_cache_key(strategy_provider: object) -> str:
+    return stable_digest(_strategy_provider_cache_payload(strategy_provider))
+
+
+def _strategy_provider_cache_payload(strategy_provider: object) -> JsonValue:
+    if isinstance(strategy_provider, CachedStrategyProvider):
+        return {
+            "type": "CachedStrategyProvider",
+            "scope": strategy_provider.scope,
+            "provider": _strategy_provider_cache_payload(strategy_provider.provider),
+        }
+    if isinstance(strategy_provider, StaticStrategyProvider):
+        return {
+            "type": "StaticStrategyProvider",
+            "strategy": dict(to_primitive(strategy_provider.strategy)),
+            "explanation": strategy_provider.explanation,
+        }
+    if isinstance(strategy_provider, JsonFileStrategyProvider):
+        return {
+            "type": "JsonFileStrategyProvider",
+            "path": str(strategy_provider.path),
+        }
+    if isinstance(strategy_provider, FrontierLLMStrategyProvider):
+        return {
+            "type": "FrontierLLMStrategyProvider",
+            "config": strategy_provider.client.config.safe_metadata(),
+        }
+    if is_dataclass(strategy_provider):
+        return {
+            "type": type(strategy_provider).__name__,
+            "payload": asdict(strategy_provider),
+        }
+    return {
+        "type": type(strategy_provider).__name__,
+        "repr": repr(strategy_provider),
     }

@@ -155,6 +155,16 @@ CURRICULUM_COMPOSITION_WEIGHT="${CURRICULUM_COMPOSITION_WEIGHT:-0.0}"
 CURRICULUM_RECENT_WINDOW="${CURRICULUM_RECENT_WINDOW:-2}"
 STRATEGY_PROVIDER="${STRATEGY_PROVIDER:-llm}"
 STRATEGY_FILE="${STRATEGY_FILE:-}"
+STRATEGY_CACHE_SCOPE="${STRATEGY_CACHE_SCOPE:-world_phase}"
+STRATEGY_REFRESH_ON_UNCERTAINTY="${STRATEGY_REFRESH_ON_UNCERTAINTY:-auto}"
+if [[ "$STRATEGY_REFRESH_ON_UNCERTAINTY" == "auto" ]]; then
+  if [[ "$STRATEGY_PROVIDER" == "none" ]]; then
+    STRATEGY_REFRESH_ON_UNCERTAINTY="0"
+  else
+    STRATEGY_REFRESH_ON_UNCERTAINTY="1"
+  fi
+fi
+STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD="${STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD:-0.75}"
 BENCHMARK_MANIFEST="${BENCHMARK_MANIFEST:-}"
 if [[ -z "$BENCHMARK_MANIFEST" && -f "$DEFAULT_BENCHMARK_MANIFEST" ]]; then
   BENCHMARK_MANIFEST="$DEFAULT_BENCHMARK_MANIFEST"
@@ -166,7 +176,7 @@ SPECIAL_PIECE_INCLUSION_PROBABILITY="${SPECIAL_PIECE_INCLUSION_PROBABILITY:-1.0}
 RANDOMIZE_HANDAUTHORED_SPECIALS="${RANDOMIZE_HANDAUTHORED_SPECIALS:-0}"
 REPLAY_WINDOW_CYCLES="${REPLAY_WINDOW_CYCLES:-6}"
 ENABLE_SCHEDULED_CURRICULUM="${ENABLE_SCHEDULED_CURRICULUM:-1}"
-CURRICULUM_PROVIDER_MODE="${CURRICULUM_PROVIDER_MODE:-oracle}"
+CURRICULUM_PROVIDER_MODE="${CURRICULUM_PROVIDER_MODE:-live_llm}"
 CURRICULUM_TASKS="${CURRICULUM_TASKS:-1:101:capture_sprint:train:introduced;2:202:phase_rook:train:introduced;3:303:turn_charge:train:introduced;4:404:edge_sumo:train:introduced;5:505:capture_sprint:train:introduced;6:606:phase_rook:train:introduced}"
 RUN_THROUGHPUT_PREFLIGHT="${RUN_THROUGHPUT_PREFLIGHT:-1}"
 AUTO_TUNE_WORKERS="${AUTO_TUNE_WORKERS:-1}"
@@ -195,6 +205,16 @@ fi
 
 if [[ "$ADAPTIVE_SEARCH" != "0" && "$ADAPTIVE_SEARCH" != "1" ]]; then
   echo "ADAPTIVE_SEARCH must be 0 or 1, found: $ADAPTIVE_SEARCH" >&2
+  exit 1
+fi
+
+if [[ "$STRATEGY_REFRESH_ON_UNCERTAINTY" != "0" && "$STRATEGY_REFRESH_ON_UNCERTAINTY" != "1" ]]; then
+  echo "STRATEGY_REFRESH_ON_UNCERTAINTY must resolve to 0 or 1, found: $STRATEGY_REFRESH_ON_UNCERTAINTY" >&2
+  exit 1
+fi
+
+if [[ "$STRATEGY_REFRESH_ON_UNCERTAINTY" == "1" && "$STRATEGY_PROVIDER" == "none" ]]; then
+  echo "STRATEGY_REFRESH_ON_UNCERTAINTY=1 requires STRATEGY_PROVIDER to be non-none" >&2
   exit 1
 fi
 
@@ -355,7 +375,7 @@ cat <<EOF
 [aws-run-proof] value_targets=root:$ROOT_VALUE_TARGET_WEIGHT outcome:$OUTCOME_TARGET_WEIGHT uncertainty_weight=$UNCERTAINTY_WEIGHT
 [aws-run-proof] adaptive_search=$ADAPTIVE_SEARCH adaptive_min=${ADAPTIVE_MIN_SIMULATIONS:-<none>} adaptive_max=${ADAPTIVE_MAX_SIMULATIONS:-<none>}
 [aws-run-proof] curriculum_weights=foundation:$CURRICULUM_FOUNDATION_WEIGHT known:$CURRICULUM_KNOWN_WEIGHT recent:$CURRICULUM_RECENT_WEIGHT composition:$CURRICULUM_COMPOSITION_WEIGHT recent_window=$CURRICULUM_RECENT_WINDOW
-[aws-run-proof] strategy_provider=$STRATEGY_PROVIDER strategy_file=${STRATEGY_FILE:-<none>}
+[aws-run-proof] strategy_provider=$STRATEGY_PROVIDER strategy_file=${STRATEGY_FILE:-<none>} strategy_cache_scope=$STRATEGY_CACHE_SCOPE strategy_refresh=$STRATEGY_REFRESH_ON_UNCERTAINTY strategy_refresh_threshold=$STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD
 [aws-run-proof] randomize_handauthored_specials=$RANDOMIZE_HANDAUTHORED_SPECIALS
 [aws-run-proof] throughput_preflight=$RUN_THROUGHPUT_PREFLIGHT auto_tune_workers=$AUTO_TUNE_WORKERS periodic_sync=$PERIODIC_SYNC sync_interval_seconds=$SYNC_INTERVAL_SECONDS
 [aws-run-proof] benchmark_manifest=${BENCHMARK_MANIFEST:-<none>}
@@ -472,6 +492,15 @@ fi
 
 if [[ -n "$STRATEGY_FILE" ]]; then
   train_loop_cmd+=(--strategy-file "$STRATEGY_FILE")
+fi
+
+train_loop_cmd+=(--strategy-cache-scope "$STRATEGY_CACHE_SCOPE")
+
+if [[ "$STRATEGY_REFRESH_ON_UNCERTAINTY" == "1" ]]; then
+  train_loop_cmd+=(
+    --strategy-refresh-on-uncertainty
+    --strategy-refresh-uncertainty-threshold "$STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD"
+  )
 fi
 
 if [[ -n "$BENCHMARK_MANIFEST" ]]; then

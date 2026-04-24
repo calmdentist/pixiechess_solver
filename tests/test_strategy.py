@@ -11,11 +11,15 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from pixie_solver.strategy import (
+    CachedStrategyProvider,
+    FULL_REQUEST_STRATEGY_CACHE_SCOPE,
     StaticStrategyProvider,
     StrategyHypothesis,
+    StrategyProvider,
     StrategyRequest,
     StrategyResponse,
     StrategyValidationError,
+    WORLD_PHASE_STRATEGY_CACHE_SCOPE,
     canonicalize_strategy_hypothesis,
     strategy_digest,
     validate_strategy_hypothesis,
@@ -101,6 +105,70 @@ class StrategyTest(unittest.TestCase):
 
         self.assertEqual("pressure_king", response.strategy["strategy_id"])
         self.assertEqual("raw_strategy", response.metadata["response_shape"])
+
+    def test_cached_strategy_provider_reuses_world_phase_requests(self) -> None:
+        provider = _CountingStrategyProvider()
+        cached = CachedStrategyProvider(
+            provider=provider,
+            scope=WORLD_PHASE_STRATEGY_CACHE_SCOPE,
+        )
+        request = StrategyRequest(
+            state={"side_to_move": "white", "ply": 1},
+            world_summary={"family": "capture_sprint", "active_piece_count": 3},
+            phase="game_start",
+        )
+
+        first = cached.propose_strategy(request)
+        second = cached.propose_strategy(request)
+
+        self.assertEqual(1, provider.calls)
+        self.assertFalse(bool(first.metadata["cache_hit"]))
+        self.assertTrue(bool(second.metadata["cache_hit"]))
+        self.assertEqual(
+            WORLD_PHASE_STRATEGY_CACHE_SCOPE,
+            second.metadata["cache_scope"],
+        )
+
+    def test_cached_strategy_provider_can_use_full_request_scope(self) -> None:
+        provider = _CountingStrategyProvider()
+        cached = CachedStrategyProvider(
+            provider=provider,
+            scope=FULL_REQUEST_STRATEGY_CACHE_SCOPE,
+        )
+
+        cached.propose_strategy(
+            StrategyRequest(
+                state={"side_to_move": "white", "ply": 1},
+                world_summary={"family": "capture_sprint", "active_piece_count": 3},
+                phase="game_start",
+            )
+        )
+        cached.propose_strategy(
+            StrategyRequest(
+                state={"side_to_move": "white", "ply": 2},
+                world_summary={"family": "capture_sprint", "active_piece_count": 3},
+                phase="game_start",
+            )
+        )
+
+        self.assertEqual(2, provider.calls)
+
+
+class _CountingStrategyProvider(StrategyProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def propose_strategy(self, request: StrategyRequest) -> StrategyResponse:
+        self.calls += 1
+        return StrategyResponse(
+            strategy={
+                "strategy_id": f"plan_{self.calls}",
+                "summary": f"plan {self.calls}",
+                "confidence": 0.5,
+                "scope": request.phase,
+            },
+            metadata={"provider": "counting"},
+        )
 
 
 if __name__ == "__main__":

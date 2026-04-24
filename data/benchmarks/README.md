@@ -7,7 +7,7 @@ For a serious run, start from
 `data/benchmarks/phase0_suite_template.json` and replace the `frozen/*` paths
 with the benchmark corpus you want to lock for the experiment.
 
-An initial deterministic corpus is checked into
+An initial deterministic strategy-conditioned corpus is checked into
 `data/benchmarks/frozen/phase0_serious_v0/manifest.json`.
 
 ## Manifest schema
@@ -65,3 +65,7 @@ self-play and registry annotation:
 - `strategy_digest`
 - `search_budget`
 - `model_architecture`
+
+The checked-in `phase0_serious_v0` corpus currently uses two games per world and
+deterministic world-specific strategy hypotheses so executor benchmarks actually
+exercise strategy tokens instead of leaving them empty.

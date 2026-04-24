@@ -94,20 +94,23 @@ one undifferentiated random special-piece pool. Use `--curriculum-foundation-wei
 `--curriculum-known-weight`, `--curriculum-recent-weight`, and
 `--curriculum-composition-weight` to control the mixture, and
 `--strategy-provider llm` or `--strategy-provider json_file --strategy-file ...`
-to inject a strategy hypothesis at game start for each sampled world.
+to inject a strategy hypothesis at game start for each sampled world. Replay
+sampling now preserves those same world families through `foundation`,
+`known_mechanic`, `recent`, and `composition` buckets instead of collapsing
+everything into one coarse verified bucket.
 
 For decision-grade runs, add `--benchmark-manifest data/benchmarks/phase0_suite_template.json`
 (after replacing the template paths with your frozen benchmark corpus). `pixie train-loop`
 will snapshot the manifest into the run directory and write one candidate benchmark report per
 cycle under `benchmarks/`.
 
-An initial frozen corpus now lives at
+An initial frozen strategy-conditioned corpus now lives at
 `data/benchmarks/frozen/phase0_serious_v0/manifest.json`. Regenerate or scale it with:
 
 ```bash
 PYTHONPATH=src python3 -m pixie_solver build-benchmark-corpus \
   --output-dir data/benchmarks/frozen/phase0_serious_v0 \
-  --games-per-world 1 \
+  --games-per-world 2 \
   --simulations 1 \
   --max-plies 8
 ```
