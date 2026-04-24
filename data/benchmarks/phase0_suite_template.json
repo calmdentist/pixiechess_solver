@@ -1,0 +1,49 @@
+{
+  "format_version": 1,
+  "name": "phase0_serious_run_template",
+  "description": "Replace the frozen/* paths with the benchmark corpus you want to lock for a serious validation run.",
+  "suites": [
+    {
+      "suite_id": "foundation",
+      "description": "Foundation-world regression suite.",
+      "games": "frozen/foundation_games.jsonl",
+      "examples": "frozen/foundation_examples.jsonl",
+      "tags": ["foundation"]
+    },
+    {
+      "suite_id": "known_mechanic",
+      "description": "Seen mechanic families under held-back parameterizations or openings.",
+      "games": "frozen/known_mechanic_games.jsonl",
+      "examples": "frozen/known_mechanic_examples.jsonl",
+      "tags": ["known_mechanic"]
+    },
+    {
+      "suite_id": "recent_admission",
+      "description": "Newly admitted worlds used to measure recovery after world changes.",
+      "games": "frozen/recent_admission_games.jsonl",
+      "examples": "frozen/recent_admission_examples.jsonl",
+      "tags": ["recent_admission"]
+    },
+    {
+      "suite_id": "composition",
+      "description": "Composed worlds that combine multiple known mechanics.",
+      "games": "frozen/composition_games.jsonl",
+      "examples": "frozen/composition_examples.jsonl",
+      "tags": ["composition"]
+    },
+    {
+      "suite_id": "heldout_seen_family",
+      "description": "Held-out parameterizations/compositions within seen families.",
+      "games": "frozen/heldout_seen_family_games.jsonl",
+      "examples": "frozen/heldout_seen_family_examples.jsonl",
+      "tags": ["heldout_seen_family"]
+    },
+    {
+      "suite_id": "heldout_family",
+      "description": "Mechanic families excluded from training.",
+      "games": "frozen/heldout_family_games.jsonl",
+      "examples": "frozen/heldout_family_examples.jsonl",
+      "tags": ["heldout_family"]
+    }
+  ]
+}

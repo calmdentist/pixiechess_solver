@@ -89,6 +89,34 @@ checkpoints do not collapse into a narrow opening sample. Set
 `pixie selfplay`, `pixie train`, `pixie eval-model`, and `pixie train-loop` emit progress logs to `stderr` during long runs.
 Use `--quiet` if you only want the final JSON summary on `stdout`.
 
+`pixie train-loop` now samples from verified-world curriculum buckets instead of
+one undifferentiated random special-piece pool. Use `--curriculum-foundation-weight`,
+`--curriculum-known-weight`, `--curriculum-recent-weight`, and
+`--curriculum-composition-weight` to control the mixture, and
+`--strategy-provider llm` or `--strategy-provider json_file --strategy-file ...`
+to inject a strategy hypothesis at game start for each sampled world.
+
+For decision-grade runs, add `--benchmark-manifest data/benchmarks/phase0_suite_template.json`
+(after replacing the template paths with your frozen benchmark corpus). `pixie train-loop`
+will snapshot the manifest into the run directory and write one candidate benchmark report per
+cycle under `benchmarks/`.
+
+An initial frozen corpus now lives at
+`data/benchmarks/frozen/phase0_serious_v0/manifest.json`. Regenerate or scale it with:
+
+```bash
+PYTHONPATH=src python3 -m pixie_solver build-benchmark-corpus \
+  --output-dir data/benchmarks/frozen/phase0_serious_v0 \
+  --games-per-world 1 \
+  --simulations 1 \
+  --max-plies 8
+```
+
+For single-GPU AWS validation runs, `scripts/aws_run_proof.sh` now defaults to a
+serious workload, honors `WORKERS=auto`, runs a short throughput preflight to
+pick a better worker count on 64-vCPU hosts, writes the preflight summary under
+`preflight/`, and periodically syncs artifacts to S3 during the run.
+
 The train/train-loop stack now supports multiple executor architectures through
 `--model-architecture`, including:
 

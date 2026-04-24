@@ -4,6 +4,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 
@@ -13,6 +15,7 @@ if str(SRC) not in sys.path:
 from pixie_solver.core import stable_move_id, standard_initial_state
 from pixie_solver.core.state import GameState
 from pixie_solver.model import PolicyValueConfig, PolicyValueModel
+from pixie_solver.model import PolicyValueForwardOutput
 from pixie_solver.simulator.movegen import legal_moves
 from pixie_solver.training.dataset import SelfPlayExample
 from pixie_solver.training.train import (
@@ -48,6 +51,31 @@ class StrategyRecordingPolicyValueModel(PolicyValueModel):
             strategy_id = str(strategy.get("strategy_id"))
         self.seen_strategies.append(strategy_id)
         return super().forward_batch(requests, strategy=strategy)
+
+
+class FixedValuePolicyValueModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias = torch.nn.Parameter(torch.tensor(0.0))
+        self.uncertainty_bias = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward_batch(self, requests, *, strategy=None):
+        del strategy
+        outputs = []
+        for _, moves in requests:
+            outputs.append(
+                PolicyValueForwardOutput(
+                    move_ids=tuple(stable_move_id(move) for move in moves),
+                    policy_logits=torch.zeros(
+                        len(moves),
+                        dtype=torch.float32,
+                        device=self.bias.device,
+                    ),
+                    value=self.bias.squeeze(),
+                    uncertainty=torch.sigmoid(self.uncertainty_bias),
+                )
+            )
+        return tuple(outputs)
 
 
 class TrainingCurriculumTest(unittest.TestCase):
@@ -191,6 +219,99 @@ class TrainingCurriculumTest(unittest.TestCase):
 
         self.assertEqual(2, result.metrics.examples_seen)
         self.assertEqual([None, "aggressive_plan"], model.seen_strategies)
+
+    def test_train_from_replays_can_blend_root_value_and_outcome_targets(self) -> None:
+        state = standard_initial_state()
+        moves = tuple(legal_moves(state))
+        selected_move_id = stable_move_id(moves[0])
+        example = SelfPlayExample(
+            state=state,
+            legal_moves=moves,
+            legal_move_ids=tuple(stable_move_id(move) for move in moves),
+            visit_distribution={selected_move_id: 1.0},
+            visit_counts={selected_move_id: 1},
+            selected_move_id=selected_move_id,
+            root_value=0.75,
+            outcome=-1.0,
+        )
+
+        root_only_result = train_from_replays(
+            [example],
+            model=FixedValuePolicyValueModel(),
+            config=TrainingConfig(
+                epochs=1,
+                batch_size=1,
+                shuffle=False,
+                device="cpu",
+                policy_weight=0.0,
+                value_weight=1.0,
+                root_value_target_weight=1.0,
+                outcome_target_weight=0.0,
+            ),
+        )
+        outcome_only_result = train_from_replays(
+            [example],
+            model=FixedValuePolicyValueModel(),
+            config=TrainingConfig(
+                epochs=1,
+                batch_size=1,
+                shuffle=False,
+                device="cpu",
+                policy_weight=0.0,
+                value_weight=1.0,
+                root_value_target_weight=0.0,
+                outcome_target_weight=1.0,
+            ),
+        )
+        blended_result = train_from_replays(
+            [example],
+            model=FixedValuePolicyValueModel(),
+            config=TrainingConfig(
+                epochs=1,
+                batch_size=1,
+                shuffle=False,
+                device="cpu",
+                policy_weight=0.0,
+                value_weight=1.0,
+                root_value_target_weight=1.0,
+                outcome_target_weight=1.0,
+            ),
+        )
+
+        self.assertAlmostEqual(0.75**2, root_only_result.metrics.average_value_loss)
+        self.assertAlmostEqual(1.0, outcome_only_result.metrics.average_value_loss)
+        self.assertAlmostEqual(0.125**2, blended_result.metrics.average_value_loss)
+
+    def test_train_from_replays_can_train_uncertainty_from_root_outcome_disagreement(self) -> None:
+        state = standard_initial_state()
+        moves = tuple(legal_moves(state))
+        selected_move_id = stable_move_id(moves[0])
+        example = SelfPlayExample(
+            state=state,
+            legal_moves=moves,
+            legal_move_ids=tuple(stable_move_id(move) for move in moves),
+            visit_distribution={selected_move_id: 1.0},
+            visit_counts={selected_move_id: 1},
+            selected_move_id=selected_move_id,
+            root_value=1.0,
+            outcome=-1.0,
+        )
+
+        result = train_from_replays(
+            [example],
+            model=FixedValuePolicyValueModel(),
+            config=TrainingConfig(
+                epochs=1,
+                batch_size=1,
+                shuffle=False,
+                device="cpu",
+                policy_weight=0.0,
+                value_weight=0.0,
+                uncertainty_weight=1.0,
+            ),
+        )
+
+        self.assertAlmostEqual(0.25, result.metrics.average_uncertainty_loss)
 
 
 def _example(

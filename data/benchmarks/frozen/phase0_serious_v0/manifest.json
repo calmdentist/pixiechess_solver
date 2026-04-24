@@ -1,0 +1,65 @@
+{
+  "description": "Deterministic PixieChess benchmark corpus for serious adaptation runs.",
+  "format_version": 1,
+  "name": "phase0_serious_run_v0",
+  "suites": [
+    {
+      "description": "Foundation-world regression suite.",
+      "examples": "foundation_examples.jsonl",
+      "games": "foundation_games.jsonl",
+      "suite_id": "foundation",
+      "tags": [
+        "foundation"
+      ]
+    },
+    {
+      "description": "Seen mechanic families under stable admitted semantics.",
+      "examples": "known_mechanic_examples.jsonl",
+      "games": "known_mechanic_games.jsonl",
+      "suite_id": "known_mechanic",
+      "tags": [
+        "known_mechanic",
+        "seen_family"
+      ]
+    },
+    {
+      "description": "Recently admitted worlds that should measure fast adaptation.",
+      "examples": "recent_admission_examples.jsonl",
+      "games": "recent_admission_games.jsonl",
+      "suite_id": "recent_admission",
+      "tags": [
+        "recent_admission",
+        "seen_family"
+      ]
+    },
+    {
+      "description": "Worlds containing interacting mechanics from seen families.",
+      "examples": "composition_examples.jsonl",
+      "games": "composition_games.jsonl",
+      "suite_id": "composition",
+      "tags": [
+        "composition",
+        "seen_family"
+      ]
+    },
+    {
+      "description": "Held-out parameterizations within seen mechanic families.",
+      "examples": "heldout_seen_family_examples.jsonl",
+      "games": "heldout_seen_family_games.jsonl",
+      "suite_id": "heldout_seen_family",
+      "tags": [
+        "heldout_seen_family",
+        "seen_family"
+      ]
+    },
+    {
+      "description": "Mechanic families excluded from training.",
+      "examples": "heldout_family_examples.jsonl",
+      "games": "heldout_family_games.jsonl",
+      "suite_id": "heldout_family",
+      "tags": [
+        "heldout_family"
+      ]
+    }
+  ]
+}

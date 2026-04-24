@@ -56,6 +56,8 @@ def print_snapshot(output_dir: Path, *, top_moves: int) -> None:
 
     _print_cycle_metrics(output_dir)
     print()
+    _print_benchmark_metrics(output_dir)
+    print()
     _print_throughput_metrics(output_dir)
     print()
     _print_promotion_gate(output_dir)
@@ -154,6 +156,58 @@ def _print_promotion_gate(output_dir: Path) -> None:
     else:
         print(
             "  latest_arena: initial champion selected; arena comparison starts on the next cycle."
+        )
+
+
+def _print_benchmark_metrics(output_dir: Path) -> None:
+    metric_paths = sorted((output_dir / "metrics").glob("cycle_*.json"))
+    print("Benchmarks")
+    if not metric_paths:
+        print("  No metrics files found yet.")
+        return
+
+    rows: list[JsonObject] = []
+    for path in metric_paths:
+        payload = _read_json_object(path)
+        if payload is None:
+            continue
+        aggregate = payload.get("candidate_benchmark_aggregate")
+        if isinstance(aggregate, dict):
+            rows.append(payload)
+
+    if not rows:
+        print("  No benchmark metrics found. Run train-loop with --benchmark-manifest.")
+        return
+
+    print(
+        "  cycle  bench_examples  bench_top1  bench_v_mse  "
+        "bench_v_ece  bench_u_ece"
+    )
+    for payload in rows:
+        aggregate = dict(payload.get("candidate_benchmark_aggregate") or {})
+        metrics = dict(aggregate.get("metrics") or {})
+        print(
+            "  "
+            f"{int(payload.get('cycle', 0)):>5}  "
+            f"{str(metrics.get('examples', '-')):>14}  "
+            f"{_fmt(metrics.get('top1_agreement')):>10}  "
+            f"{_fmt(metrics.get('value_mse')):>11}  "
+            f"{_fmt(metrics.get('value_expected_calibration_error')):>11}  "
+            f"{_fmt(metrics.get('uncertainty_expected_calibration_error')):>11}"
+        )
+
+    latest = rows[-1]
+    latest_aggregate = dict(latest.get("candidate_benchmark_aggregate") or {})
+    metadata_summary = dict(latest_aggregate.get("benchmark_metadata_summary") or {})
+    report_path = latest.get("candidate_benchmark_report_path")
+    if report_path is not None:
+        print(f"  latest_report={report_path}")
+    if metadata_summary:
+        print(
+            "  latest_metadata: "
+            f"families={metadata_summary.get('family_counts', {})} "
+            f"splits={metadata_summary.get('split_counts', {})} "
+            f"novelty={metadata_summary.get('novelty_tier_counts', {})}"
         )
 
 

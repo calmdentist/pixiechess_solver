@@ -11,6 +11,15 @@ from pixie_solver.eval.engine_matches import (
     run_engine_match,
     write_arena_games_jsonl,
 )
+from pixie_solver.eval.benchmark import (
+    BenchmarkProgress,
+    run_benchmark_manifest,
+)
+from pixie_solver.eval.benchmark_corpus import (
+    BenchmarkCorpusConfig,
+    BenchmarkCorpusProgress,
+    build_benchmark_corpus,
+)
 from pixie_solver.eval.model_eval import (
     ModelEvalMetrics,
     ModelEvalProgress,
@@ -33,6 +42,9 @@ from pixie_solver.eval.stress import (
 __all__ = [
     "ModelEvalMetrics",
     "ModelEvalProgress",
+    "BenchmarkProgress",
+    "BenchmarkCorpusConfig",
+    "BenchmarkCorpusProgress",
     "ArenaConfig",
     "ArenaGameResult",
     "ArenaProgress",
@@ -48,6 +60,8 @@ __all__ = [
     "decide_promotion",
     "evaluate_policy_value_model",
     "evaluate_tactical_suite",
+    "build_benchmark_corpus",
+    "run_benchmark_manifest",
     "read_arena_games_jsonl",
     "run_checkpoint_arena",
     "run_checkpoint_arena_from_paths",

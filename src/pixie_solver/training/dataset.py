@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pixie_solver.core.move import Move
 from pixie_solver.core.state import GameState
+from pixie_solver.training.benchmark_metadata import benchmark_metadata_for_state
 from pixie_solver.utils.serialization import JsonValue, ReplayTrace, read_jsonl, write_jsonl
 
 
@@ -32,7 +33,7 @@ class SelfPlayExample:
             str(move_id): int(value)
             for move_id, value in sorted(self.visit_counts.items())
         }
-        self.metadata = dict(self.metadata)
+        self.metadata = benchmark_metadata_for_state(self.state, self.metadata)
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -85,7 +86,16 @@ class SelfPlayGame:
 
     def __post_init__(self) -> None:
         self.examples = tuple(self.examples)
-        self.metadata = dict(self.metadata)
+        self.replay_trace.metadata.update(
+            benchmark_metadata_for_state(
+                self.replay_trace.initial_state,
+                self.replay_trace.metadata,
+            )
+        )
+        self.metadata = benchmark_metadata_for_state(
+            self.replay_trace.initial_state,
+            self.metadata,
+        )
 
     @property
     def final_state_hash(self) -> str:

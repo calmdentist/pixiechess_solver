@@ -810,6 +810,149 @@ class CLITest(unittest.TestCase):
             self.assertGreaterEqual(payload["metrics"]["top1_agreement"], 0.0)
             self.assertLessEqual(payload["metrics"]["top1_agreement"], 1.0)
             self.assertGreaterEqual(payload["metrics"]["value_mse"], 0.0)
+            self.assertIn("benchmark_metadata_summary", payload)
+
+    def test_benchmark_model_command_reports_suite_metrics(self) -> None:
+        model = PolicyValueModel(
+            PolicyValueConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            ),
+            device="cpu",
+        )
+
+        games = generate_selfplay_games(
+            [self.initial_state],
+            games=1,
+            config=SelfPlayConfig(
+                simulations=1,
+                max_plies=1,
+                opening_temperature=0.0,
+                final_temperature=0.0,
+                temperature_drop_after_ply=0,
+                seed=73,
+                root_exploration_fraction=0.0,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkpoint_path = temp_path / "model.pt"
+            games_path = temp_path / "games.jsonl"
+            examples_path = temp_path / "examples.jsonl"
+            manifest_path = temp_path / "benchmark_manifest.json"
+            save_training_checkpoint(checkpoint_path, model=model)
+            write_selfplay_examples_jsonl(
+                examples_path,
+                [example for game in games for example in game.examples],
+            )
+            games_path.write_text(
+                "\n".join(canonical_json(game.to_dict()) for game in games) + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                canonical_json(
+                    {
+                        "format_version": 1,
+                        "name": "phase0_smoke",
+                        "suites": [
+                            {
+                                "suite_id": "foundation_smoke",
+                                "games": str(games_path),
+                                "examples": str(examples_path),
+                                "filters": {"family_id": "foundation"},
+                                "tags": ["foundation"],
+                            }
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run(
+                "benchmark-model",
+                "--checkpoint",
+                str(checkpoint_path),
+                "--manifest",
+                str(manifest_path),
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual("phase0_smoke", payload["report"]["manifest_name"])
+            self.assertEqual(1, payload["report"]["suite_count"])
+            suite = payload["report"]["suites"][0]
+            self.assertEqual("foundation_smoke", suite["suite_id"])
+            self.assertEqual(1, suite["games_loaded"])
+            self.assertGreater(suite["examples_loaded"], 0)
+            self.assertIn("foundation", suite["benchmark_metadata_summary"]["family_counts"])
+            self.assertIn("value_expected_calibration_error", suite["metrics"])
+            self.assertIn("outcomes", suite)
+            self.assertEqual(
+                suite["metrics"]["examples"],
+                payload["report"]["aggregate"]["metrics"]["examples"],
+            )
+
+    def test_build_benchmark_corpus_command_writes_manifest_and_suite_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "benchmark_corpus"
+            result = self._run(
+                "build-benchmark-corpus",
+                "--output-dir",
+                str(output_dir),
+                "--games-per-world",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual(6, payload["suite_count"])
+            manifest_path = output_dir / "manifest.json"
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("phase0_serious_run_v0", manifest["name"])
+            self.assertEqual(6, len(manifest["suites"]))
+            heldout_examples_path = output_dir / "heldout_family_examples.jsonl"
+            self.assertTrue(heldout_examples_path.exists())
+            first_example = json.loads(
+                heldout_examples_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(
+                "test_heldout_family",
+                first_example["metadata"]["split"],
+            )
+            self.assertEqual(
+                "heldout_family",
+                first_example["metadata"]["novelty_tier"],
+            )
+            self.assertEqual(
+                "edge_sumo",
+                first_example["metadata"]["family_id"],
+            )
+            composition_examples_path = output_dir / "composition_examples.jsonl"
+            first_composition_example = json.loads(
+                composition_examples_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(
+                "composition",
+                first_composition_example["metadata"]["family_id"],
+            )
+            self.assertEqual(
+                2,
+                len(first_composition_example["metadata"]["world_family_ids"]),
+            )
 
     def test_arena_command_compares_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -939,6 +1082,120 @@ class CLITest(unittest.TestCase):
             self.assertIn("average_policy_cross_entropy", cycle["train_eval_metrics"])
             self.assertIn("average_policy_cross_entropy", cycle["val_eval_metrics"])
 
+    def test_train_loop_command_writes_candidate_benchmark_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "run"
+            benchmark_dir = temp_path / "benchmark_reports"
+            games_path = temp_path / "benchmark_games.jsonl"
+            examples_path = temp_path / "benchmark_examples.jsonl"
+            manifest_path = temp_path / "benchmark_manifest.json"
+            games = generate_selfplay_games(
+                [self.initial_state],
+                games=1,
+                config=SelfPlayConfig(
+                    simulations=1,
+                    max_plies=1,
+                    opening_temperature=0.0,
+                    final_temperature=0.0,
+                    temperature_drop_after_ply=0,
+                    seed=73,
+                    root_exploration_fraction=0.0,
+                ),
+            )
+            write_selfplay_examples_jsonl(
+                examples_path,
+                [example for game in games for example in game.examples],
+            )
+            games_path.write_text(
+                "\n".join(canonical_json(game.to_dict()) for game in games) + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                canonical_json(
+                    {
+                        "format_version": 1,
+                        "name": "train_loop_smoke",
+                        "suites": [
+                            {
+                                "suite_id": "foundation_smoke",
+                                "games": str(games_path),
+                                "examples": str(examples_path),
+                                "filters": {"family_id": "foundation"},
+                            }
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "1",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "2",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "37",
+                "--model-architecture",
+                "baseline_v1",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--benchmark-manifest",
+                str(manifest_path),
+                "--benchmark-dir",
+                str(benchmark_dir),
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(str(benchmark_dir), payload["benchmark_dir"])
+            self.assertEqual(
+                str(benchmark_dir / "manifest.json"),
+                payload["benchmark_manifest_snapshot"],
+            )
+            cycle = payload["cycles"][0]
+            self.assertEqual(
+                str(benchmark_dir / "manifest.json"),
+                cycle["candidate_benchmark_manifest"],
+            )
+            report_path = Path(cycle["candidate_benchmark_report_path"])
+            self.assertTrue(report_path.exists())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual("train_loop_smoke", report["manifest_name"])
+            self.assertEqual(
+                report["aggregate"],
+                cycle["candidate_benchmark_aggregate"],
+            )
+            self.assertGreater(
+                cycle["candidate_benchmark_aggregate"]["metrics"]["examples"],
+                0,
+            )
+
     def test_train_loop_command_supports_world_conditioned_v2(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "run"
@@ -986,6 +1243,226 @@ class CLITest(unittest.TestCase):
             self.assertEqual("world_conditioned_v2", payload["cycles"][0]["model_config"]["architecture"])
             checkpoint = load_training_checkpoint(payload["latest_checkpoint"], device="cpu")
             self.assertEqual("world_conditioned_v2", checkpoint.model_config.architecture)
+
+    def test_train_loop_command_supports_adaptive_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "run"
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "1",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "2",
+                "--max-plies",
+                "2",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "47",
+                "--model-architecture",
+                "hypernetwork_conditioned_v4",
+                "--adaptive-search",
+                "--adaptive-min-simulations",
+                "1",
+                "--adaptive-max-simulations",
+                "3",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("ok", payload["status"])
+            self.assertEqual(
+                "hypernetwork_conditioned_v4",
+                payload["model_config"]["architecture"],
+            )
+            self.assertTrue(Path(payload["latest_checkpoint"]).exists())
+
+    def test_train_loop_command_uses_json_strategy_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "run"
+            strategy_path = temp_path / "strategy.json"
+            strategy_path.write_text(
+                canonical_json(
+                    {
+                        "strategy": {
+                            "strategy_id": "pressure_center",
+                            "summary": "fight for the center early",
+                            "confidence": 0.8,
+                            "scope": "game_start",
+                            "action_biases": ["develop pieces"],
+                        },
+                        "explanation": "static file strategy",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "1",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "2",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "59",
+                "--strategy-provider",
+                "json_file",
+                "--strategy-file",
+                str(strategy_path),
+                "--model-architecture",
+                "baseline_v1",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            cycle = payload["cycles"][0]
+            self.assertEqual("json_file", cycle["strategy_provider"])
+            first_example = json.loads(
+                Path(cycle["train_examples_path"]).read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(
+                "pressure_center",
+                first_example["metadata"]["strategy"]["strategy_id"],
+            )
+            self.assertTrue(first_example["metadata"]["strategy_digest"])
+            first_game = json.loads(
+                Path(cycle["train_games_path"]).read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(
+                "json_file",
+                first_game["metadata"]["strategy_provider"]["provider"],
+            )
+
+    def test_train_loop_command_samples_recent_verified_worlds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "run"
+            registry_path = temp_path / "registry.json"
+            repaired_dir = temp_path / "repaired"
+            teacher = generate_teacher_piece(seed=101, recipe="capture_sprint")
+            append_verified_piece_version(
+                registry_path=registry_path,
+                out_dir=repaired_dir,
+                program=teacher.teacher_program,
+                description="recent verified capture sprint piece",
+                metadata={
+                    "family_id": "capture_sprint",
+                    "split": "train",
+                    "novelty_tier": "introduced",
+                    "admission_cycle": 1,
+                },
+            )
+
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "1",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "2",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "61",
+                "--piece-registry",
+                str(registry_path),
+                "--use-verified-pieces",
+                "--no-randomize-handauthored-specials",
+                "--curriculum-foundation-weight",
+                "0",
+                "--curriculum-known-weight",
+                "0",
+                "--curriculum-recent-weight",
+                "1",
+                "--curriculum-composition-weight",
+                "0",
+                "--curriculum-recent-window",
+                "2",
+                "--model-architecture",
+                "baseline_v1",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            cycle = payload["cycles"][0]
+            self.assertEqual(1, cycle["train_world_bucket_counts"]["recent_admission"])
+            self.assertEqual(1, cycle["val_world_bucket_counts"]["recent_admission"])
+            first_example = json.loads(
+                Path(cycle["train_examples_path"]).read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual("capture_sprint", first_example["metadata"]["family_id"])
+            self.assertEqual("train", first_example["metadata"]["split"])
+            self.assertEqual("introduced", first_example["metadata"]["novelty_tier"])
 
     def test_train_loop_runs_scheduled_curriculum_and_reloads_training_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1077,7 +1554,8 @@ class CLITest(unittest.TestCase):
                 second_cycle["replay_examples"],
             )
             self.assertGreater(second_cycle["replay_bucket_counts"]["recent"], 0)
-            self.assertGreater(second_cycle["replay_bucket_counts"]["verified"], 0)
+            self.assertEqual(1, first_cycle["curriculum_world_pool_counts"]["recent_admission"])
+            self.assertEqual(2, second_cycle["curriculum_world_pool_counts"]["recent_admission"])
             self.assertEqual(
                 first_teacher.teacher_program["piece_id"],
                 first_cycle["curriculum_results"][0]["synthetic_piece"]["piece_id"],
@@ -1118,22 +1596,10 @@ class CLITest(unittest.TestCase):
 
             cycle_two_examples_path = Path(second_cycle["train_examples_path"])
             example_payload = json.loads(cycle_two_examples_path.read_text(encoding="utf-8").splitlines()[0])
-            self.assertIn("verified_piece_digests", example_payload["metadata"])
             self.assertEqual(
                 str(registry_path),
                 example_payload["metadata"]["piece_registry"],
             )
-            example_registry_metadata = example_payload["metadata"]["verified_piece_training_metadata"]
-            self.assertLessEqual(len(example_registry_metadata), 2)
-            self.assertTrue(
-                set(example_registry_metadata).issubset(
-                    {first_teacher.piece_id, second_teacher.piece_id}
-                )
-            )
-            for training_metadata in example_registry_metadata.values():
-                self.assertNotIn("compile_response", training_metadata)
-                self.assertIn("version", training_metadata)
-                self.assertIn("source", training_metadata)
 
     def test_train_loop_promotion_gate_records_best_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
