@@ -73,9 +73,14 @@ from pixie_solver.rules import (
 )
 from pixie_solver.rules.repair import default_dsl_reference
 from pixie_solver.strategy import (
+    CachedStrategyProvider,
+    FULL_REQUEST_STRATEGY_CACHE_SCOPE,
     FrontierLLMStrategyProvider,
     JsonFileStrategyProvider,
+    NO_STRATEGY_CACHE_SCOPE,
+    SUPPORTED_STRATEGY_CACHE_SCOPES,
     StrategyProvider,
+    WORLD_PHASE_STRATEGY_CACHE_SCOPE,
 )
 from pixie_solver.training import (
     BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
@@ -532,6 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     arena_parser.add_argument("--adjudication-threshold", type=float, default=0.2, help="White-perspective heuristic cutoff threshold in [0, 1].")
     arena_parser.add_argument("--log-every-games", type=int, default=1, help="Emit an arena progress line every N completed games.")
     arena_parser.add_argument("--quiet", action="store_true", help="Suppress progress logs on stderr and only print final JSON.")
+    _add_llm_args(arena_parser)
+    _add_strategy_args(arena_parser, default_provider="none")
     arena_parser.set_defaults(handler=_handle_arena)
 
     stress_parser = subparsers.add_parser(
@@ -719,17 +726,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="Number of most recent admission cycles treated as recent worlds.",
     )
-    train_loop_parser.add_argument(
-        "--strategy-provider",
-        choices=("none", "llm", "json_file"),
-        default="none",
-        help="Optional strategy provider used to propose a strategy at game start for each sampled world.",
-    )
-    train_loop_parser.add_argument(
-        "--strategy-file",
-        type=Path,
-        help="JSON file used when --strategy-provider json_file.",
-    )
+    _add_strategy_args(train_loop_parser, default_provider="none")
     train_loop_parser.add_argument("--no-guided-selfplay", action="store_true", help="Always generate self-play with search-only MCTS instead of the latest model.")
     train_loop_parser.add_argument("--randomize-handauthored-specials", action="store_true", default=True, help="Randomize hand-authored special pieces in standard openings.")
     train_loop_parser.add_argument("--no-randomize-handauthored-specials", dest="randomize_handauthored_specials", action="store_false", help="Use plain orthodox standard openings.")
@@ -813,6 +810,44 @@ def _add_llm_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_strategy_args(
+    parser: argparse.ArgumentParser,
+    *,
+    default_provider: str,
+) -> None:
+    parser.add_argument(
+        "--strategy-provider",
+        choices=("none", "llm", "json_file"),
+        default=default_provider,
+        help="Optional strategy provider used to propose a strategy for each sampled world.",
+    )
+    parser.add_argument(
+        "--strategy-file",
+        type=Path,
+        help="JSON file used when --strategy-provider json_file.",
+    )
+    parser.add_argument(
+        "--strategy-cache-scope",
+        choices=SUPPORTED_STRATEGY_CACHE_SCOPES,
+        default=WORLD_PHASE_STRATEGY_CACHE_SCOPE,
+        help=(
+            "Cache scope for strategy provider responses. "
+            "'world_phase' reuses one strategy per world/phase/prior-strategy digest."
+        ),
+    )
+    parser.add_argument(
+        "--strategy-refresh-on-uncertainty",
+        action="store_true",
+        help="Refresh the strategy hypothesis when root uncertainty exceeds the configured threshold.",
+    )
+    parser.add_argument(
+        "--strategy-refresh-uncertainty-threshold",
+        type=float,
+        default=0.75,
+        help="Refresh threshold in [0, 1] for uncertainty-triggered strategy updates.",
+    )
+
+
 def _add_replay_sampling_args(
     parser: argparse.ArgumentParser,
     *,
@@ -836,7 +871,7 @@ def _add_replay_sampling_args(
         "--replay-recent-cycle-window",
         type=int,
         default=1,
-        help="Number of most-recent cycles treated as the recent replay bucket.",
+        help="Number of most-recent admission cycles treated as the recent replay bucket.",
     )
     parser.add_argument(
         "--replay-recent-bucket-weight",
@@ -845,10 +880,23 @@ def _add_replay_sampling_args(
         help="Sampling weight for recent-cycle replay examples when using bucket-balanced sampling.",
     )
     parser.add_argument(
+        "--replay-known-bucket-weight",
+        type=float,
+        dest="replay_known_bucket_weight",
+        default=2.0,
+        help="Sampling weight for older known-mechanic replay examples when using bucket-balanced sampling.",
+    )
+    parser.add_argument(
         "--replay-verified-bucket-weight",
         type=float,
-        default=2.0,
-        help="Sampling weight for older verified-world replay examples when using bucket-balanced sampling.",
+        dest="replay_known_bucket_weight",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--replay-composition-bucket-weight",
+        type=float,
+        default=2.5,
+        help="Sampling weight for composition-world replay examples when using bucket-balanced sampling.",
     )
     parser.add_argument(
         "--replay-foundation-bucket-weight",
@@ -921,10 +969,40 @@ def _build_strategy_provider(args: argparse.Namespace) -> StrategyProvider | Non
     if provider_name == "json_file":
         if args.strategy_file is None:
             raise ValueError("--strategy-file is required for --strategy-provider json_file")
-        return JsonFileStrategyProvider(args.strategy_file)
-    if provider_name == "llm":
-        return FrontierLLMStrategyProvider(FrontierLLMClient(_llm_config_from_args(args)))
-    raise ValueError(f"unsupported strategy provider: {provider_name}")
+        provider: StrategyProvider = JsonFileStrategyProvider(args.strategy_file)
+    elif provider_name == "llm":
+        provider = FrontierLLMStrategyProvider(FrontierLLMClient(_llm_config_from_args(args)))
+    else:
+        raise ValueError(f"unsupported strategy provider: {provider_name}")
+    cache_scope = getattr(args, "strategy_cache_scope", NO_STRATEGY_CACHE_SCOPE)
+    if cache_scope != NO_STRATEGY_CACHE_SCOPE:
+        return CachedStrategyProvider(provider=provider, scope=cache_scope)
+    return provider
+
+
+def _validate_strategy_args(args: argparse.Namespace) -> None:
+    provider_name = getattr(args, "strategy_provider", "none")
+    strategy_file = getattr(args, "strategy_file", None)
+    if provider_name == "json_file" and strategy_file is None:
+        raise ValueError("--strategy-file is required for --strategy-provider json_file")
+    if provider_name != "json_file" and strategy_file is not None:
+        raise ValueError("--strategy-file is only valid with --strategy-provider json_file")
+    strategy_cache_scope = getattr(args, "strategy_cache_scope", NO_STRATEGY_CACHE_SCOPE)
+    if strategy_cache_scope not in SUPPORTED_STRATEGY_CACHE_SCOPES:
+        supported = ", ".join(SUPPORTED_STRATEGY_CACHE_SCOPES)
+        raise ValueError(
+            f"--strategy-cache-scope must be one of {supported}"
+        )
+    refresh_enabled = getattr(args, "strategy_refresh_on_uncertainty", False)
+    refresh_threshold = getattr(args, "strategy_refresh_uncertainty_threshold", 0.75)
+    if refresh_threshold < 0.0 or refresh_threshold > 1.0:
+        raise ValueError(
+            "--strategy-refresh-uncertainty-threshold must be in [0, 1]"
+        )
+    if refresh_enabled and provider_name in {None, "none"}:
+        raise ValueError(
+            "--strategy-refresh-on-uncertainty requires a non-none --strategy-provider"
+        )
 
 
 def _parse_scheduled_curriculum_tasks(
@@ -1506,7 +1584,8 @@ def _handle_train(args: argparse.Namespace) -> int:
         sampling_strategy=args.replay_sampling_strategy,
         recent_cycle_window=args.replay_recent_cycle_window,
         recent_bucket_weight=args.replay_recent_bucket_weight,
-        verified_bucket_weight=args.replay_verified_bucket_weight,
+        known_bucket_weight=args.replay_known_bucket_weight,
+        composition_bucket_weight=args.replay_composition_bucket_weight,
         foundation_bucket_weight=args.replay_foundation_bucket_weight,
         model_config=model_config,
     )
@@ -1656,6 +1735,8 @@ def _handle_build_benchmark_corpus(args: argparse.Namespace) -> int:
 
 def _handle_arena(args: argparse.Namespace) -> int:
     initial_states = _load_arena_initial_states(args)
+    _validate_strategy_args(args)
+    strategy_provider = _build_strategy_provider(args)
     config = ArenaConfig(
         games=args.games,
         simulations=args.simulations,
@@ -1665,6 +1746,10 @@ def _handle_arena(args: argparse.Namespace) -> int:
         alternate_colors=True,
         adjudicate_max_plies=args.adjudicate_max_plies,
         adjudication_threshold=args.adjudication_threshold,
+        strategy_refresh_on_uncertainty=args.strategy_refresh_on_uncertainty,
+        strategy_refresh_uncertainty_threshold=(
+            args.strategy_refresh_uncertainty_threshold
+        ),
     )
     summary = run_checkpoint_arena_from_paths(
         candidate_checkpoint=args.candidate,
@@ -1672,6 +1757,7 @@ def _handle_arena(args: argparse.Namespace) -> int:
         initial_states=initial_states,
         config=config,
         device=args.device,
+        strategy_provider=strategy_provider,
         progress_callback=(
             None
             if args.quiet
@@ -2069,10 +2155,11 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         raise ValueError(
             "--adaptive-min-simulations/--adaptive-max-simulations require --adaptive-search"
         )
-    if args.strategy_provider == "json_file" and args.strategy_file is None:
-        raise ValueError("--strategy-file is required for --strategy-provider json_file")
-    if args.strategy_provider != "json_file" and args.strategy_file is not None:
-        raise ValueError("--strategy-file is only valid with --strategy-provider json_file")
+    _validate_strategy_args(args)
+    if args.strategy_refresh_on_uncertainty and args.no_guided_selfplay:
+        raise ValueError(
+            "--strategy-refresh-on-uncertainty requires model-guided self-play"
+        )
     if args.promotion_gate:
         if args.arena_games < 1:
             raise ValueError("--arena-games must be at least 1")
@@ -2194,6 +2281,10 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             adaptive_search=args.adaptive_search,
             adaptive_min_simulations=args.adaptive_min_simulations,
             adaptive_max_simulations=args.adaptive_max_simulations,
+            strategy_refresh_on_uncertainty=args.strategy_refresh_on_uncertainty,
+            strategy_refresh_uncertainty_threshold=(
+                args.strategy_refresh_uncertainty_threshold
+            ),
         )
         train_states, train_world_bucket_counts, curriculum_world_pool_counts = (
             _sample_curriculum_states(
@@ -2300,7 +2391,8 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             sampling_strategy=args.replay_sampling_strategy,
             recent_cycle_window=args.replay_recent_cycle_window,
             recent_bucket_weight=args.replay_recent_bucket_weight,
-            verified_bucket_weight=args.replay_verified_bucket_weight,
+            known_bucket_weight=args.replay_known_bucket_weight,
+            composition_bucket_weight=args.replay_composition_bucket_weight,
             foundation_bucket_weight=args.replay_foundation_bucket_weight,
             sampling_reference_cycle=cycle_index,
             model_config=model_config,
@@ -2513,6 +2605,12 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                     alternate_colors=True,
                     adjudicate_max_plies=args.adjudicate_max_plies,
                     adjudication_threshold=args.adjudication_threshold,
+                    strategy_refresh_on_uncertainty=(
+                        args.strategy_refresh_on_uncertainty
+                    ),
+                    strategy_refresh_uncertainty_threshold=(
+                        args.strategy_refresh_uncertainty_threshold
+                    ),
                 )
                 arena_states, arena_world_bucket_counts, _ = _sample_curriculum_states(
                     games=args.arena_games,
@@ -2529,6 +2627,7 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
                     initial_states=arena_states,
                     config=arena_config,
                     device=args.device,
+                    strategy_provider=strategy_provider,
                     progress_callback=(
                         None
                         if args.quiet
@@ -2644,6 +2743,16 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "batched_inference": args.batched_inference,
             "inference_device": args.inference_device or args.device,
             "strategy_provider": args.strategy_provider,
+            "strategy_cache_scope": args.strategy_cache_scope,
+            "strategy_refresh_on_uncertainty": (
+                args.strategy_refresh_on_uncertainty
+            ),
+            "strategy_refresh_uncertainty_threshold": (
+                args.strategy_refresh_uncertainty_threshold
+            ),
+            "curriculum_provider_mode": (
+                "oracle" if args.curriculum_oracle else "live_llm"
+            ),
             "train_inference_stats": (
                 train_inference_stats.to_dict()
                 if train_inference_stats is not None
@@ -2718,6 +2827,14 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
         "model_config": _model_config_summary(model_config),
         "curriculum_bucket_weights": bucket_weights,
         "strategy_provider": args.strategy_provider,
+        "strategy_cache_scope": args.strategy_cache_scope,
+        "strategy_refresh_on_uncertainty": args.strategy_refresh_on_uncertainty,
+        "strategy_refresh_uncertainty_threshold": (
+            args.strategy_refresh_uncertainty_threshold
+        ),
+        "curriculum_provider_mode": (
+            "oracle" if args.curriculum_oracle else "live_llm"
+        ),
         "cycles": cycle_summaries,
         "latest_checkpoint": cycle_summaries[-1]["checkpoint"],
         "latest_candidate_checkpoint": cycle_summaries[-1]["candidate_checkpoint"],
@@ -2761,10 +2878,15 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "replay_window_cycles": args.replay_window_cycles,
             "replay_recent_cycle_window": args.replay_recent_cycle_window,
             "replay_recent_bucket_weight": args.replay_recent_bucket_weight,
-            "replay_verified_bucket_weight": args.replay_verified_bucket_weight,
+            "replay_known_bucket_weight": args.replay_known_bucket_weight,
+            "replay_verified_bucket_weight": args.replay_known_bucket_weight,
+            "replay_composition_bucket_weight": args.replay_composition_bucket_weight,
             "replay_foundation_bucket_weight": args.replay_foundation_bucket_weight,
             "curriculum_task": list(args.curriculum_task or []),
             "curriculum_oracle": args.curriculum_oracle,
+            "curriculum_provider_mode": (
+                "oracle" if args.curriculum_oracle else "live_llm"
+            ),
             "curriculum_foundation_weight": args.curriculum_foundation_weight,
             "curriculum_known_weight": args.curriculum_known_weight,
             "curriculum_recent_weight": args.curriculum_recent_weight,
@@ -2777,8 +2899,15 @@ def _handle_train_loop(args: argparse.Namespace) -> int:
             "special_piece_inclusion_probability": args.special_piece_inclusion_probability,
             "use_verified_pieces": args.use_verified_pieces,
             "strategy_provider": args.strategy_provider,
+            "strategy_cache_scope": args.strategy_cache_scope,
             "strategy_file": (
                 str(args.strategy_file) if args.strategy_file is not None else None
+            ),
+            "strategy_refresh_on_uncertainty": (
+                args.strategy_refresh_on_uncertainty
+            ),
+            "strategy_refresh_uncertainty_threshold": (
+                args.strategy_refresh_uncertainty_threshold
             ),
             "benchmark_manifest": (
                 str(benchmark_manifest_path)

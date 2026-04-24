@@ -11,10 +11,22 @@ from pixie_solver.core import Color, GameState, Move
 from pixie_solver.model.policy_value import PolicyValueModel
 from pixie_solver.search import StateEvaluator, run_mcts
 from pixie_solver.simulator.engine import apply_move, result
+from pixie_solver.strategy import (
+    StrategyHypothesis,
+    StrategyProvider,
+    StrategyRequest,
+    strategy_digest as compute_strategy_digest,
+)
 from pixie_solver.training import load_training_checkpoint
 from pixie_solver.training.selfplay import CutoffAdjudication, adjudicate_cutoff
 from pixie_solver.utils import build_replay_trace
-from pixie_solver.utils.serialization import JsonValue, ReplayTrace, read_jsonl, write_jsonl
+from pixie_solver.utils.serialization import (
+    JsonValue,
+    ReplayTrace,
+    read_jsonl,
+    to_primitive,
+    write_jsonl,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +39,9 @@ class ArenaConfig:
     alternate_colors: bool = True
     adjudicate_max_plies: bool = True
     adjudication_threshold: float = 0.2
+    strategy: StrategyHypothesis | dict[str, JsonValue] | None = None
+    strategy_refresh_on_uncertainty: bool = False
+    strategy_refresh_uncertainty_threshold: float = 0.75
 
     def __post_init__(self) -> None:
         if self.games < 1:
@@ -37,6 +52,15 @@ class ArenaConfig:
             raise ValueError("max_plies must be non-negative")
         if self.adjudication_threshold < 0.0 or self.adjudication_threshold > 1.0:
             raise ValueError("adjudication_threshold must be in [0, 1]")
+        if (
+            self.strategy_refresh_uncertainty_threshold < 0.0
+            or self.strategy_refresh_uncertainty_threshold > 1.0
+        ):
+            raise ValueError(
+                "strategy_refresh_uncertainty_threshold must be in [0, 1]"
+            )
+        if self.strategy is not None:
+            object.__setattr__(self, "strategy", dict(to_primitive(self.strategy)))
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -48,6 +72,15 @@ class ArenaConfig:
             "alternate_colors": self.alternate_colors,
             "adjudicate_max_plies": self.adjudicate_max_plies,
             "adjudication_threshold": self.adjudication_threshold,
+            "strategy": (
+                None if self.strategy is None else dict(self.strategy)
+            ),
+            "strategy_refresh_on_uncertainty": (
+                self.strategy_refresh_on_uncertainty
+            ),
+            "strategy_refresh_uncertainty_threshold": (
+                self.strategy_refresh_uncertainty_threshold
+            ),
         }
 
     @classmethod
@@ -61,6 +94,15 @@ class ArenaConfig:
             alternate_colors=bool(data.get("alternate_colors", True)),
             adjudicate_max_plies=bool(data.get("adjudicate_max_plies", True)),
             adjudication_threshold=float(data.get("adjudication_threshold", 0.2)),
+            strategy=(
+                dict(data["strategy"]) if data.get("strategy") is not None else None
+            ),
+            strategy_refresh_on_uncertainty=bool(
+                data.get("strategy_refresh_on_uncertainty", False)
+            ),
+            strategy_refresh_uncertainty_threshold=float(
+                data.get("strategy_refresh_uncertainty_threshold", 0.75)
+            ),
         )
 
 
@@ -348,6 +390,7 @@ def run_checkpoint_arena(
     baseline_id: str,
     config: ArenaConfig | None = None,
     evaluator: StateEvaluator | None = None,
+    strategy_provider: StrategyProvider | None = None,
     progress_callback: Callable[[ArenaProgress], None] | None = None,
 ) -> ArenaSummary:
     if not initial_states:
@@ -376,6 +419,7 @@ def run_checkpoint_arena(
                 baseline_id=baseline_id,
                 config=active_config,
                 evaluator=evaluator,
+                strategy_provider=strategy_provider,
                 progress_callback=progress_callback,
             )
         )
@@ -396,6 +440,7 @@ def run_checkpoint_arena_from_paths(
     config: ArenaConfig | None = None,
     device: str | None = None,
     evaluator: StateEvaluator | None = None,
+    strategy_provider: StrategyProvider | None = None,
     progress_callback: Callable[[ArenaProgress], None] | None = None,
 ) -> ArenaSummary:
     candidate_path = Path(candidate_checkpoint)
@@ -410,6 +455,7 @@ def run_checkpoint_arena_from_paths(
         baseline_id=str(baseline_path),
         config=config,
         evaluator=evaluator,
+        strategy_provider=strategy_provider,
         progress_callback=progress_callback,
     )
 
@@ -479,6 +525,7 @@ def _play_arena_game(
     baseline_id: str,
     config: ArenaConfig,
     evaluator: StateEvaluator | None,
+    strategy_provider: StrategyProvider | None,
     progress_callback: Callable[[ArenaProgress], None] | None,
 ) -> ArenaGameResult:
     state = initial_state
@@ -489,6 +536,22 @@ def _play_arena_game(
     adjudication: CutoffAdjudication | None = None
     rng = random.Random(game_seed)
     baseline_color = _other_color(candidate_color)
+    initial_strategy_payload, strategy_provider_metadata = _resolve_arena_strategy(
+        state=state,
+        strategy=config.strategy,
+        strategy_provider=strategy_provider,
+        phase="game_start",
+        metadata={
+            "game_index": game_index,
+            "games_total": games_total,
+            "candidate_id": candidate_id,
+            "baseline_id": baseline_id,
+        },
+    )
+    current_strategy_payload = initial_strategy_payload
+    strategy_digest = _strategy_digest(current_strategy_payload)
+    strategy_scope = _strategy_scope(current_strategy_payload)
+    strategy_refreshes = 0
     if progress_callback is not None:
         progress_callback(
             ArenaProgress(
@@ -518,7 +581,55 @@ def _play_arena_game(
             c_puct=config.c_puct,
             root_noise=None,
             rng=rng,
+            strategy=current_strategy_payload,
+            measure_root_uncertainty=config.strategy_refresh_on_uncertainty,
         )
+        root_uncertainty = _coerce_optional_float(
+            search_result.metadata.get("root_uncertainty")
+        )
+        if (
+            strategy_provider is not None
+            and config.strategy_refresh_on_uncertainty
+            and root_uncertainty is not None
+            and root_uncertainty >= config.strategy_refresh_uncertainty_threshold
+        ):
+            refreshed_strategy, refresh_metadata = _resolve_arena_strategy(
+                state=state,
+                strategy=current_strategy_payload,
+                strategy_provider=strategy_provider,
+                phase="high_uncertainty",
+                metadata={
+                    "game_index": game_index,
+                    "games_total": games_total,
+                    "ply": ply,
+                    "root_uncertainty": root_uncertainty,
+                    "candidate_id": candidate_id,
+                    "baseline_id": baseline_id,
+                },
+            )
+            refreshed_digest = _strategy_digest(refreshed_strategy)
+            if refreshed_digest != strategy_digest:
+                current_strategy_payload = refreshed_strategy
+                strategy_digest = refreshed_digest
+                strategy_scope = _strategy_scope(current_strategy_payload)
+                strategy_refreshes += 1
+                strategy_provider_metadata = {
+                    **dict(strategy_provider_metadata),
+                    f"refresh_{strategy_refreshes}": refresh_metadata,
+                }
+                search_result = run_mcts(
+                    state,
+                    simulations=config.simulations,
+                    policy_value_model=model,
+                    evaluator=evaluator,
+                    c_puct=config.c_puct,
+                    root_noise=None,
+                    rng=rng,
+                    strategy=current_strategy_payload,
+                    measure_root_uncertainty=(
+                        config.strategy_refresh_on_uncertainty
+                    ),
+                )
         if search_result.selected_move is None or search_result.selected_move_id is None:
             termination_reason = "no_legal_moves"
             break
@@ -575,6 +686,18 @@ def _play_arena_game(
             "root_noise_applied": False,
             "adjudicate_max_plies": config.adjudicate_max_plies,
             "adjudication_threshold": config.adjudication_threshold,
+            "initial_strategy": initial_strategy_payload,
+            "strategy": current_strategy_payload,
+            "strategy_digest": strategy_digest,
+            "strategy_scope": strategy_scope,
+            "strategy_refreshes": strategy_refreshes,
+            "strategy_provider": strategy_provider_metadata,
+            "strategy_refresh_on_uncertainty": (
+                config.strategy_refresh_on_uncertainty
+            ),
+            "strategy_refresh_uncertainty_threshold": (
+                config.strategy_refresh_uncertainty_threshold
+            ),
             "cutoff_adjudication": (
                 adjudication.to_dict() if adjudication is not None else None
             ),
@@ -597,6 +720,18 @@ def _play_arena_game(
         metadata={
             "candidate_id": candidate_id,
             "baseline_id": baseline_id,
+            "initial_strategy": initial_strategy_payload,
+            "strategy": current_strategy_payload,
+            "strategy_digest": strategy_digest,
+            "strategy_scope": strategy_scope,
+            "strategy_refreshes": strategy_refreshes,
+            "strategy_provider": strategy_provider_metadata,
+            "strategy_refresh_on_uncertainty": (
+                config.strategy_refresh_on_uncertainty
+            ),
+            "strategy_refresh_uncertainty_threshold": (
+                config.strategy_refresh_uncertainty_threshold
+            ),
         },
     )
     if progress_callback is not None:
@@ -637,6 +772,81 @@ def _other_color(color: Color) -> Color:
 
 def _clone_state(state: GameState) -> GameState:
     return GameState.from_dict(state.to_dict())
+
+
+def _resolve_arena_strategy(
+    *,
+    state: GameState,
+    strategy: StrategyHypothesis | dict[str, JsonValue] | None,
+    strategy_provider: StrategyProvider | None,
+    phase: str,
+    metadata: dict[str, JsonValue],
+) -> tuple[dict[str, JsonValue] | None, dict[str, JsonValue]]:
+    strategy_payload = _strategy_payload(strategy)
+    if strategy_provider is None:
+        return strategy_payload, {"provider": None, "phase": phase}
+    request = StrategyRequest(
+        state=state.to_dict(),
+        world_summary=_world_summary(state),
+        phase=phase,
+        prior_strategy=strategy_payload,
+        metadata=metadata,
+    )
+    response = strategy_provider.propose_strategy(request)
+    return dict(response.strategy), {
+        "provider": type(strategy_provider).__name__,
+        "phase": phase,
+        "explanation": response.explanation,
+        **dict(response.metadata),
+    }
+
+
+def _strategy_payload(
+    strategy: StrategyHypothesis | dict[str, JsonValue] | None,
+) -> dict[str, JsonValue] | None:
+    if strategy is None:
+        return None
+    return dict(to_primitive(strategy))
+
+
+def _strategy_digest(strategy: dict[str, JsonValue] | None) -> str | None:
+    if strategy is None:
+        return None
+    return compute_strategy_digest(strategy)
+
+
+def _strategy_scope(strategy: dict[str, JsonValue] | None) -> str | None:
+    if strategy is None:
+        return None
+    scope = strategy.get("scope")
+    return None if scope is None else str(scope)
+
+
+def _world_summary(state: GameState) -> dict[str, JsonValue]:
+    return {
+        "side_to_move": state.side_to_move.value,
+        "piece_classes": {
+            class_id: dict(to_primitive(piece_class))
+            for class_id, piece_class in sorted(state.piece_classes.items())
+        },
+        "active_piece_count": len(state.active_pieces()),
+    }
+
+
+def _coerce_optional_float(value: JsonValue | None) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
 
 
 def _counter_dict(values: Iterable[str]) -> dict[str, int]:

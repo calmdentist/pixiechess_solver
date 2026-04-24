@@ -31,7 +31,9 @@ Training config:
   Export the same env vars used by scripts/aws_run_proof.sh before launching to override
   the default serious-run workload, for example:
 
-    WORKERS=auto STRATEGY_PROVIDER=llm RANDOMIZE_HANDAUTHORED_SPECIALS=0 TRAIN_GAMES=384 CYCLES=8 \\
+    WORKERS=auto STRATEGY_PROVIDER=llm STRATEGY_CACHE_SCOPE=world_phase \\
+    STRATEGY_REFRESH_ON_UNCERTAINTY=1 CURRICULUM_PROVIDER_MODE=live_llm \\
+    RANDOMIZE_HANDAUTHORED_SPECIALS=0 TRAIN_GAMES=384 CYCLES=8 \\
     BENCHMARK_MANIFEST=data/benchmarks/frozen/phase0_serious_v0/manifest.json \\
     scripts/aws_launch_training_instance.sh --auto-start
 EOF
@@ -409,6 +411,9 @@ PASSTHROUGH_ENV_VARS=(
   CURRICULUM_RECENT_WINDOW
   STRATEGY_PROVIDER
   STRATEGY_FILE
+  STRATEGY_CACHE_SCOPE
+  STRATEGY_REFRESH_ON_UNCERTAINTY
+  STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD
   BENCHMARK_MANIFEST
   BENCHMARK_DIR
   PIECE_REGISTRY

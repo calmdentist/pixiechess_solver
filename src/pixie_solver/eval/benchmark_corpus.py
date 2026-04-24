@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pixie_solver.core import GameState, sample_standard_initial_state, standard_initial_state
@@ -88,7 +88,7 @@ def build_benchmark_corpus(
     manifest_suites: list[dict[str, JsonValue]] = []
     suite_summaries: list[dict[str, JsonValue]] = []
 
-    selfplay_config = SelfPlayConfig(
+    base_selfplay_config = SelfPlayConfig(
         simulations=config.simulations,
         max_plies=config.max_plies,
         opening_temperature=config.opening_temperature,
@@ -114,20 +114,12 @@ def build_benchmark_corpus(
                 )
             )
 
-        initial_states, game_metadata = _suite_initial_states_and_metadata(
+        games = _generate_suite_games(
             suite_spec,
+            suite_index=suite_index,
             games_per_world=config.games_per_world,
-        )
-        games = generate_selfplay_games(
-            initial_states,
-            games=len(initial_states),
-            config=selfplay_config,
-            policy_value_model=None,
-        )
-        _annotate_suite_games(
-            games,
-            suite_spec=suite_spec,
-            per_game_metadata=game_metadata,
+            base_selfplay_config=base_selfplay_config,
+            seed_offset=config.seed_offset,
         )
         examples = flatten_selfplay_examples(games)
 
@@ -200,32 +192,60 @@ def build_benchmark_corpus(
     return summary
 
 
-def _suite_initial_states_and_metadata(
+def _generate_suite_games(
     suite_spec: BenchmarkSuiteSpec,
     *,
+    suite_index: int,
     games_per_world: int,
-) -> tuple[list[GameState], list[dict[str, JsonValue]]]:
-    initial_states: list[GameState] = []
-    game_metadata: list[dict[str, JsonValue]] = []
+    base_selfplay_config: SelfPlayConfig,
+    seed_offset: int,
+) -> list:
+    games = []
+    suite_game_index = 0
     for world_index, world_spec in enumerate(suite_spec.worlds):
         state = _build_world_state(world_spec)
-        shared_metadata = {
-            "family_id": world_spec.family_id,
-            "split": world_spec.split,
-            "novelty_tier": world_spec.novelty_tier,
-            "admission_cycle": world_spec.admission_cycle,
-            "benchmark_suite_id": suite_spec.suite_id,
-            "benchmark_world_id": world_spec.world_id,
-            "benchmark_world_index": world_index,
-            "benchmark_world_recipes": list(world_spec.recipes),
-            "benchmark_world_piece_seeds": list(world_spec.piece_seeds),
-            "benchmark_world_tags": list(world_spec.tags),
-            "world_family_ids": list(world_spec.world_family_ids),
-        }
-        for _ in range(games_per_world):
-            initial_states.append(state)
-            game_metadata.append(dict(shared_metadata))
-    return initial_states, game_metadata
+        strategy = _benchmark_strategy_for_world(world_spec)
+        world_config = replace(
+            base_selfplay_config,
+            seed=seed_offset + suite_index * 10_000 + world_index * 1_000,
+            strategy=strategy,
+        )
+        world_games = generate_selfplay_games(
+            [state],
+            games=games_per_world,
+            config=world_config,
+            policy_value_model=None,
+        )
+        per_game_metadata = []
+        for local_game_index in range(games_per_world):
+            per_game_metadata.append(
+                {
+                    "family_id": world_spec.family_id,
+                    "split": world_spec.split,
+                    "novelty_tier": world_spec.novelty_tier,
+                    "admission_cycle": world_spec.admission_cycle,
+                    "benchmark_suite_id": suite_spec.suite_id,
+                    "benchmark_world_id": world_spec.world_id,
+                    "benchmark_world_index": world_index,
+                    "benchmark_suite_game_index": suite_game_index + local_game_index,
+                    "benchmark_world_game_index": local_game_index,
+                    "benchmark_world_recipes": list(world_spec.recipes),
+                    "benchmark_world_piece_seeds": list(world_spec.piece_seeds),
+                    "benchmark_world_tags": list(world_spec.tags),
+                    "benchmark_strategy_id": strategy["strategy_id"],
+                    "benchmark_strategy_source": "deterministic_world_strategy",
+                    "strategy": dict(strategy),
+                    "world_family_ids": list(world_spec.world_family_ids),
+                }
+            )
+        _annotate_suite_games(
+            world_games,
+            suite_spec=suite_spec,
+            per_game_metadata=per_game_metadata,
+        )
+        games.extend(world_games)
+        suite_game_index += len(world_games)
+    return games
 
 
 def _build_world_state(world_spec: BenchmarkWorldSpec) -> GameState:
@@ -289,12 +309,125 @@ def _annotate_suite_games(
             )
 
 
+def _benchmark_strategy_for_world(
+    world_spec: BenchmarkWorldSpec,
+) -> dict[str, JsonValue]:
+    family_ids = (
+        tuple(world_spec.world_family_ids)
+        if world_spec.world_family_ids
+        else tuple(world_spec.recipes)
+    )
+    if world_spec.family_id == "foundation":
+        return {
+            "strategy_id": "foundation_development",
+            "summary": "Develop orthodox pieces, secure the king, and improve central control before forcing tactics.",
+            "confidence": 0.72,
+            "scope": "game_start",
+            "subgoals": [
+                "complete development",
+                "protect king safety",
+                "contest the center",
+            ],
+            "action_biases": [
+                "develop toward active squares",
+                "connect major pieces",
+            ],
+            "avoid_biases": [
+                "premature queen sorties",
+                "unforced king exposure",
+            ],
+            "metadata": {
+                "family_id": world_spec.family_id,
+                "benchmark_world_id": world_spec.world_id,
+            },
+        }
+    if world_spec.family_id == "composition":
+        family_summary = " + ".join(family_ids)
+        return {
+            "strategy_id": f"compose_{'_'.join(family_ids)}",
+            "summary": (
+                f"Exploit the interaction between {family_summary} while preserving king safety "
+                "and converting tactical windows quickly."
+            ),
+            "confidence": 0.78,
+            "scope": "game_start",
+            "subgoals": [
+                "activate interacting mechanics",
+                "force favorable tactical sequences",
+                "avoid coordination breakdowns",
+            ],
+            "action_biases": [
+                f"sequence {family_ids[0]} pressure into {family_ids[-1]} follow-through",
+                "prioritize multi-piece coordination",
+            ],
+            "avoid_biases": [
+                "isolated one-piece attacks",
+                "tempo loss before interaction triggers",
+            ],
+            "metadata": {
+                "family_id": world_spec.family_id,
+                "world_family_ids": list(family_ids),
+                "benchmark_world_id": world_spec.world_id,
+            },
+        }
+    if world_spec.family_id == "capture_sprint":
+        summary = "Trade into immediate follow-up captures and keep initiative after every material swing."
+        action_biases = [
+            "force capture races on favorable terms",
+            "keep pieces ready for consecutive captures",
+        ]
+    elif world_spec.family_id == "phase_rook":
+        summary = "Use phasing lanes to pressure blocked files and convert access into direct rook activity."
+        action_biases = [
+            "open phasing lanes",
+            "occupy contested files through blockers",
+        ]
+    elif world_spec.family_id == "turn_charge":
+        summary = "Build charge tempo deliberately, then convert stored momentum into forcing attacks."
+        action_biases = [
+            "prepare charge turns safely",
+            "spend stored momentum on forcing lines",
+        ]
+    elif world_spec.family_id == "edge_sumo":
+        summary = "Dominate edge files, create displacement threats, and convert spatial control into material wins."
+        action_biases = [
+            "press along the board edge",
+            "use displacement threats to win tempo",
+        ]
+    else:
+        summary = "Probe the new mechanic carefully, keep the king safe, and cash in concrete tactical edges."
+        action_biases = [
+            "test the mechanic in forcing lines",
+            "prefer moves with reversible risk",
+        ]
+    return {
+        "strategy_id": f"{world_spec.family_id}_benchmark_plan",
+        "summary": summary,
+        "confidence": 0.75,
+        "scope": "game_start",
+        "subgoals": [
+            "identify the mechanic's strongest tactical window",
+            "convert initiative without overextending",
+        ],
+        "action_biases": action_biases,
+        "avoid_biases": [
+            "drifting without activating the signature mechanic",
+            "king exposure before initiative is secured",
+        ],
+        "metadata": {
+            "family_id": world_spec.family_id,
+            "benchmark_world_id": world_spec.world_id,
+            "novelty_tier": world_spec.novelty_tier,
+        },
+    }
+
+
 def _default_suite_specs(*, seed_offset: int) -> tuple[BenchmarkSuiteSpec, ...]:
     return (
         BenchmarkSuiteSpec(
             suite_id="foundation",
             description="Foundation-world regression suite.",
-            tags=("foundation",),
+            tags=("foundation", "strategy_conditioned"),
             worlds=(
                 BenchmarkWorldSpec(
                     world_id="foundation_standard",
@@ -309,7 +442,7 @@ def _default_suite_specs(*, seed_offset: int) -> tuple[BenchmarkSuiteSpec, ...]:
         BenchmarkSuiteSpec(
             suite_id="known_mechanic",
             description="Seen mechanic families under stable admitted semantics.",
-            tags=("known_mechanic", "seen_family"),
+            tags=("known_mechanic", "seen_family", "strategy_conditioned"),
             worlds=(
                 _single_piece_world(
                     world_id="known_capture_sprint",
@@ -343,7 +476,7 @@ def _default_suite_specs(*, seed_offset: int) -> tuple[BenchmarkSuiteSpec, ...]:
         BenchmarkSuiteSpec(
             suite_id="recent_admission",
             description="Recently admitted worlds that should measure fast adaptation.",
-            tags=("recent_admission", "seen_family"),
+            tags=("recent_admission", "seen_family", "strategy_conditioned"),
             worlds=(
                 _single_piece_world(
                     world_id="recent_capture_sprint",
@@ -377,7 +510,7 @@ def _default_suite_specs(*, seed_offset: int) -> tuple[BenchmarkSuiteSpec, ...]:
         BenchmarkSuiteSpec(
             suite_id="composition",
             description="Worlds containing interacting mechanics from seen families.",
-            tags=("composition", "seen_family"),
+            tags=("composition", "seen_family", "strategy_conditioned"),
             worlds=(
                 BenchmarkWorldSpec(
                     world_id="composition_capture_phase",
@@ -420,7 +553,7 @@ def _default_suite_specs(*, seed_offset: int) -> tuple[BenchmarkSuiteSpec, ...]:
         BenchmarkSuiteSpec(
             suite_id="heldout_seen_family",
             description="Held-out parameterizations within seen mechanic families.",
-            tags=("heldout_seen_family", "seen_family"),
+            tags=("heldout_seen_family", "seen_family", "strategy_conditioned"),
             worlds=(
                 _single_piece_world(
                     world_id="heldout_seen_capture_sprint",
@@ -454,7 +587,7 @@ def _default_suite_specs(*, seed_offset: int) -> tuple[BenchmarkSuiteSpec, ...]:
         BenchmarkSuiteSpec(
             suite_id="heldout_family",
             description="Mechanic families excluded from training.",
-            tags=("heldout_family",),
+            tags=("heldout_family", "strategy_conditioned"),
             worlds=(
                 _single_piece_world(
                     world_id="heldout_family_edge_sumo_a",

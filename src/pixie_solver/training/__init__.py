@@ -35,7 +35,9 @@ from pixie_solver.training.inference_service import (
 )
 from pixie_solver.training.train import (
     BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
+    COMPOSITION_REPLAY_BUCKET,
     FOUNDATION_REPLAY_BUCKET,
+    KNOWN_MECHANIC_REPLAY_BUCKET,
     RECENT_REPLAY_BUCKET,
     SUPPORTED_REPLAY_SAMPLING_STRATEGIES,
     TrainingConfig,
@@ -77,11 +79,13 @@ __all__ = [
     "BatchedInferenceService",
     "BatchedInferenceStats",
     "COMPOSITION_FAMILY_ID",
+    "COMPOSITION_REPLAY_BUCKET",
     "CutoffAdjudication",
     "FOUNDATION_REPLAY_BUCKET",
     "FOUNDATION_FAMILY_ID",
     "FOUNDATION_NOVELTY_TIER",
     "FOUNDATION_SPLIT",
+    "KNOWN_MECHANIC_REPLAY_BUCKET",
     "LoadedTrainingCheckpoint",
     "MIXED_SPLIT",
     "RECENT_REPLAY_BUCKET",

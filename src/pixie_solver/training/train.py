@@ -27,9 +27,11 @@ SUPPORTED_REPLAY_SAMPLING_STRATEGIES = (
     UNIFORM_REPLAY_SAMPLING_STRATEGY,
     BUCKET_BALANCED_REPLAY_SAMPLING_STRATEGY,
 )
+KNOWN_MECHANIC_REPLAY_BUCKET = "known_mechanic"
+COMPOSITION_REPLAY_BUCKET = "composition"
 RECENT_REPLAY_BUCKET = "recent"
-VERIFIED_REPLAY_BUCKET = "verified"
 FOUNDATION_REPLAY_BUCKET = "foundation"
+VERIFIED_REPLAY_BUCKET = KNOWN_MECHANIC_REPLAY_BUCKET
 
 
 class SelfPlayDataset(Dataset[SelfPlayExample]):
@@ -64,8 +66,10 @@ class TrainingConfig:
     sampling_strategy: str = UNIFORM_REPLAY_SAMPLING_STRATEGY
     recent_cycle_window: int = 1
     recent_bucket_weight: float = 1.0
-    verified_bucket_weight: float = 1.0
+    known_bucket_weight: float = 1.0
+    composition_bucket_weight: float = 1.0
     foundation_bucket_weight: float = 1.0
+    verified_bucket_weight: float | None = None
     sampling_reference_cycle: int | None = None
     model_config: PolicyValueConfig = field(default_factory=PolicyValueConfig)
 
@@ -131,11 +135,17 @@ def train_from_replays(
         raise ValueError("recent_cycle_window must be at least 1")
     for field_name, weight in (
         ("recent_bucket_weight", active_config.recent_bucket_weight),
-        ("verified_bucket_weight", active_config.verified_bucket_weight),
+        ("known_bucket_weight", _resolved_known_bucket_weight(active_config)),
+        ("composition_bucket_weight", active_config.composition_bucket_weight),
         ("foundation_bucket_weight", active_config.foundation_bucket_weight),
     ):
         if weight <= 0.0:
             raise ValueError(f"{field_name} must be positive")
+    if (
+        active_config.verified_bucket_weight is not None
+        and active_config.verified_bucket_weight <= 0.0
+    ):
+        raise ValueError("verified_bucket_weight must be positive")
     for field_name, weight in (
         ("uncertainty_weight", active_config.uncertainty_weight),
         ("root_value_target_weight", active_config.root_value_target_weight),
@@ -486,15 +496,19 @@ def replay_bucket_for_example(
     reference_cycle: int | None,
     recent_cycle_window: int,
 ) -> str:
-    example_cycle = _example_cycle(example)
+    if _is_composition_example(example):
+        return COMPOSITION_REPLAY_BUCKET
+    example_cycle = _example_admission_cycle(example)
     if (
         reference_cycle is not None
         and example_cycle is not None
         and example_cycle >= reference_cycle - recent_cycle_window + 1
     ):
         return RECENT_REPLAY_BUCKET
-    if _has_verified_piece_metadata(example):
-        return VERIFIED_REPLAY_BUCKET
+    if _is_foundation_example(example) and not _has_verified_piece_metadata(example):
+        return FOUNDATION_REPLAY_BUCKET
+    if _has_verified_piece_metadata(example) or not _is_foundation_example(example):
+        return KNOWN_MECHANIC_REPLAY_BUCKET
     return FOUNDATION_REPLAY_BUCKET
 
 
@@ -510,8 +524,9 @@ def summarize_replay_buckets(
     )
     counts = {
         FOUNDATION_REPLAY_BUCKET: 0,
-        VERIFIED_REPLAY_BUCKET: 0,
+        KNOWN_MECHANIC_REPLAY_BUCKET: 0,
         RECENT_REPLAY_BUCKET: 0,
+        COMPOSITION_REPLAY_BUCKET: 0,
     }
     for example in replays:
         bucket = replay_bucket_for_example(
@@ -564,8 +579,10 @@ def _bucket_weight_for_example(
     )
     if bucket == RECENT_REPLAY_BUCKET:
         return float(config.recent_bucket_weight)
-    if bucket == VERIFIED_REPLAY_BUCKET:
-        return float(config.verified_bucket_weight)
+    if bucket == KNOWN_MECHANIC_REPLAY_BUCKET:
+        return _resolved_known_bucket_weight(config)
+    if bucket == COMPOSITION_REPLAY_BUCKET:
+        return float(config.composition_bucket_weight)
     return float(config.foundation_bucket_weight)
 
 
@@ -577,9 +594,15 @@ def _resolve_sampling_reference_cycle(
         return configured_reference_cycle
     cycle_values = [
         cycle_value
-        for cycle_value in (_example_cycle(example) for example in replays)
+        for cycle_value in (_example_admission_cycle(example) for example in replays)
         if cycle_value is not None
     ]
+    if not cycle_values:
+        cycle_values = [
+            cycle_value
+            for cycle_value in (_example_cycle(example) for example in replays)
+            if cycle_value is not None
+        ]
     if not cycle_values:
         return None
     return max(cycle_values)
@@ -595,6 +618,96 @@ def _example_cycle(example: SelfPlayExample) -> int | None:
         return None
 
 
+def _example_admission_cycle(example: SelfPlayExample) -> int | None:
+    admission_cycle = _coerce_optional_int(example.metadata.get("admission_cycle"))
+    if admission_cycle is not None:
+        return admission_cycle
+    world_admission_cycles = example.metadata.get("world_admission_cycles")
+    if isinstance(world_admission_cycles, Sequence) and not isinstance(
+        world_admission_cycles,
+        (str, bytes),
+    ):
+        normalized_cycles = [
+            cycle_value
+            for cycle_value in (
+                _coerce_optional_int(raw_cycle) for raw_cycle in world_admission_cycles
+            )
+            if cycle_value is not None
+        ]
+        if normalized_cycles:
+            return max(normalized_cycles)
+    return _example_cycle(example)
+
+
 def _has_verified_piece_metadata(example: SelfPlayExample) -> bool:
     value = example.metadata.get("verified_piece_digests")
     return isinstance(value, dict) and bool(value)
+
+
+def _is_foundation_example(example: SelfPlayExample) -> bool:
+    family_id = _metadata_string(example, "family_id")
+    split = _metadata_string(example, "split")
+    novelty_tier = _metadata_string(example, "novelty_tier")
+    return (
+        family_id == "foundation"
+        or split == "foundation"
+        or novelty_tier == "foundation"
+    )
+
+
+def _is_composition_example(example: SelfPlayExample) -> bool:
+    family_id = _metadata_string(example, "family_id")
+    novelty_tier = _metadata_string(example, "novelty_tier")
+    if family_id == "composition" or novelty_tier == "composition":
+        return True
+    world_family_ids = example.metadata.get("world_family_ids")
+    if isinstance(world_family_ids, Sequence) and not isinstance(
+        world_family_ids,
+        (str, bytes),
+    ):
+        normalized_families = {
+            family_id
+            for family_id in (
+                _coerce_optional_string(raw_family) for raw_family in world_family_ids
+            )
+            if family_id is not None
+        }
+        return len(normalized_families) > 1
+    return False
+
+
+def _metadata_string(example: SelfPlayExample, key: str) -> str | None:
+    return _coerce_optional_string(example.metadata.get(key))
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return str(value)
+
+
+def _resolved_known_bucket_weight(config: TrainingConfig) -> float:
+    if config.verified_bucket_weight is not None:
+        return float(config.verified_bucket_weight)
+    return float(config.known_bucket_weight)

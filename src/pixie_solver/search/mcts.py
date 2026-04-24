@@ -100,6 +100,7 @@ def run_mcts(
     adaptive_search: bool = False,
     adaptive_min_simulations: int | None = None,
     adaptive_max_simulations: int | None = None,
+    measure_root_uncertainty: bool = False,
 ) -> SearchResult:
     if simulations < 1:
         raise ValueError("simulations must be at least 1")
@@ -136,10 +137,11 @@ def run_mcts(
         "root_exploration_fraction": 0.0,
     }
     adaptive_enabled = adaptive_search and policy_value_model is not None
+    measure_root_uncertainty = measure_root_uncertainty and policy_value_model is not None
     effective_simulations = simulations
     root_uncertainty: float | None = None
     remaining_simulations = simulations
-    if adaptive_enabled:
+    if adaptive_enabled or measure_root_uncertainty:
         value = _expand_node(
             node=root,
             policy_value_model=policy_value_model,
@@ -151,13 +153,16 @@ def run_mcts(
         root.visit_count += 1
         root.value_sum += value
         root_uncertainty = root.model_uncertainty
-        effective_simulations = _adaptive_simulation_budget(
-            requested_simulations=simulations,
-            uncertainty=root_uncertainty,
-            minimum_simulations=adaptive_min_simulations,
-            maximum_simulations=adaptive_max_simulations,
-        )
-        remaining_simulations = max(0, effective_simulations - 1)
+        if adaptive_enabled:
+            effective_simulations = _adaptive_simulation_budget(
+                requested_simulations=simulations,
+                uncertainty=root_uncertainty,
+                minimum_simulations=adaptive_min_simulations,
+                maximum_simulations=adaptive_max_simulations,
+            )
+            remaining_simulations = max(0, effective_simulations - 1)
+        else:
+            remaining_simulations = max(0, simulations - 1)
         if root_noise is not None:
             noise_metadata = _apply_root_dirichlet_noise(
                 root=root,

@@ -9,7 +9,8 @@
       "games": "foundation_games.jsonl",
       "suite_id": "foundation",
       "tags": [
-        "foundation"
+        "foundation",
+        "strategy_conditioned"
       ]
     },
     {
@@ -19,7 +20,8 @@
       "suite_id": "known_mechanic",
       "tags": [
         "known_mechanic",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ]
     },
     {
@@ -29,7 +31,8 @@
       "suite_id": "recent_admission",
       "tags": [
         "recent_admission",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ]
     },
     {
@@ -39,7 +42,8 @@
       "suite_id": "composition",
       "tags": [
         "composition",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ]
     },
     {
@@ -49,7 +53,8 @@
       "suite_id": "heldout_seen_family",
       "tags": [
         "heldout_seen_family",
-        "seen_family"
+        "seen_family",
+        "strategy_conditioned"
       ]
     },
     {
@@ -58,7 +63,8 @@
       "games": "heldout_family_games.jsonl",
       "suite_id": "heldout_family",
       "tags": [
-        "heldout_family"
+        "heldout_family",
+        "strategy_conditioned"
       ]
     }
   ]

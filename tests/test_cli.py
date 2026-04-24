@@ -941,6 +941,11 @@ class CLITest(unittest.TestCase):
                 "edge_sumo",
                 first_example["metadata"]["family_id"],
             )
+            self.assertEqual(
+                "edge_sumo_benchmark_plan",
+                first_example["metadata"]["benchmark_strategy_id"],
+            )
+            self.assertTrue(first_example["metadata"]["strategy_digest"])
             composition_examples_path = output_dir / "composition_examples.jsonl"
             first_composition_example = json.loads(
                 composition_examples_path.read_text(encoding="utf-8").splitlines()[0]
@@ -952,6 +957,10 @@ class CLITest(unittest.TestCase):
             self.assertEqual(
                 2,
                 len(first_composition_example["metadata"]["world_family_ids"]),
+            )
+            self.assertEqual(
+                "compose_capture_sprint_phase_rook",
+                first_composition_example["metadata"]["benchmark_strategy_id"],
             )
 
     def test_arena_command_compares_checkpoints(self) -> None:
@@ -1008,6 +1017,51 @@ class CLITest(unittest.TestCase):
             self.assertTrue(output_path.exists())
             self.assertTrue(games_path.exists())
             self.assertEqual(2, len(games_path.read_text(encoding="utf-8").splitlines()))
+
+    def test_arena_command_rejects_strategy_refresh_without_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            candidate_path = temp_path / "candidate.pt"
+            baseline_path = temp_path / "baseline.pt"
+            model_config = PolicyValueConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dropout=0.0,
+                feedforward_multiplier=2,
+            )
+            save_training_checkpoint(
+                candidate_path,
+                model=PolicyValueModel(model_config, device="cpu"),
+            )
+            save_training_checkpoint(
+                baseline_path,
+                model=PolicyValueModel(model_config, device="cpu"),
+            )
+
+            result = self._run(
+                "arena",
+                "--candidate",
+                str(candidate_path),
+                "--baseline",
+                str(baseline_path),
+                "--games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--device",
+                "cpu",
+                "--strategy-refresh-on-uncertainty",
+                "--quiet",
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn(
+                "--strategy-refresh-on-uncertainty requires a non-none --strategy-provider",
+                result.stderr,
+            )
 
     def test_train_loop_command_runs_one_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1687,6 +1741,97 @@ class CLITest(unittest.TestCase):
             self.assertEqual(0, analyzer.returncode, analyzer.stderr)
             self.assertIn("Promotion Gate", analyzer.stdout)
             self.assertIn("latest_arena", analyzer.stdout)
+
+    def test_train_loop_promotion_gate_passes_strategy_provider_to_arena(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output_dir = temp_path / "run"
+            strategy_path = temp_path / "strategy.json"
+            strategy_path.write_text(
+                canonical_json(
+                    {
+                        "strategy": {
+                            "strategy_id": "pressure_center",
+                            "summary": "fight for the center early",
+                            "confidence": 0.8,
+                            "scope": "game_start",
+                            "action_biases": ["develop pieces"],
+                        },
+                        "explanation": "static file strategy",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._run(
+                "train-loop",
+                "--output-dir",
+                str(output_dir),
+                "--cycles",
+                "2",
+                "--train-games",
+                "1",
+                "--val-games",
+                "1",
+                "--simulations",
+                "1",
+                "--max-plies",
+                "1",
+                "--epochs-per-cycle",
+                "1",
+                "--batch-size",
+                "1",
+                "--device",
+                "cpu",
+                "--seed",
+                "37",
+                "--d-model",
+                "32",
+                "--num-heads",
+                "4",
+                "--num-layers",
+                "1",
+                "--dropout",
+                "0",
+                "--feedforward-multiplier",
+                "2",
+                "--promotion-gate",
+                "--arena-games",
+                "1",
+                "--arena-simulations",
+                "1",
+                "--arena-max-plies",
+                "1",
+                "--promotion-score-threshold",
+                "1.0",
+                "--strategy-provider",
+                "json_file",
+                "--strategy-file",
+                str(strategy_path),
+                "--strategy-refresh-on-uncertainty",
+                "--no-randomize-handauthored-specials",
+                "--quiet",
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual("json_file", payload["strategy_provider"])
+            self.assertEqual("world_phase", payload["strategy_cache_scope"])
+            self.assertTrue(bool(payload["strategy_refresh_on_uncertainty"]))
+            second_cycle = payload["cycles"][1]
+            self.assertEqual("json_file", second_cycle["strategy_provider"])
+            self.assertEqual("world_phase", second_cycle["strategy_cache_scope"])
+            self.assertTrue(bool(second_cycle["strategy_refresh_on_uncertainty"]))
+            arena_game = second_cycle["arena_metrics"]["games"][0]
+            self.assertEqual(
+                "pressure_center",
+                arena_game["metadata"]["initial_strategy"]["strategy_id"],
+            )
+            self.assertEqual(
+                "json_file",
+                arena_game["metadata"]["strategy_provider"]["provider"],
+            )
 
 def _war_automaton_with_forward_offset(offset: int) -> dict[str, object]:
     program = load_piece_program(ROOT / "data/pieces/handauthored/war_automaton.json")

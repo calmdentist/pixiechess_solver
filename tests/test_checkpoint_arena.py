@@ -22,6 +22,7 @@ from pixie_solver.eval import (
     run_checkpoint_arena,
 )
 from pixie_solver.model import PolicyValueConfig, PolicyValueModel, PolicyValueOutput
+from pixie_solver.strategy import StrategyProvider, StrategyRequest, StrategyResponse
 from pixie_solver.utils.serialization import canonical_json
 
 
@@ -52,6 +53,42 @@ class _CapturePreferenceModel(PolicyValueModel):
         is_capture = move.captured_piece_id is not None
         preferred = is_capture if self.prefer_capture else not is_capture
         return 10.0 if preferred else -10.0
+
+
+class _UncertainArenaModel(PolicyValueModel):
+    def infer(
+        self,
+        state: GameState,
+        legal_moves: tuple[Move, ...],
+        *,
+        strategy=None,
+    ) -> PolicyValueOutput:
+        del state, strategy
+        return PolicyValueOutput(
+            policy_logits={move.stable_id(): 0.0 for move in legal_moves},
+            value=0.0,
+            uncertainty=1.0,
+        )
+
+
+class _RefreshingStrategyProvider(StrategyProvider):
+    def __init__(self) -> None:
+        self.phases: list[str] = []
+
+    def propose_strategy(self, request: StrategyRequest) -> StrategyResponse:
+        self.phases.append(request.phase)
+        strategy_id = "opening_plan"
+        if request.phase == "high_uncertainty":
+            strategy_id = "refresh_plan"
+        return StrategyResponse(
+            strategy={
+                "strategy_id": strategy_id,
+                "summary": strategy_id.replace("_", " "),
+                "confidence": 0.8,
+                "scope": request.phase,
+            },
+            metadata={"provider": "test_provider"},
+        )
 
 
 class CheckpointArenaTest(unittest.TestCase):
@@ -188,6 +225,34 @@ class CheckpointArenaTest(unittest.TestCase):
             json.loads(canonical_json(tied_decision.to_dict()))
         )
         self.assertEqual(tied_decision.to_dict(), round_tripped.to_dict())
+
+    def test_checkpoint_arena_records_strategy_refresh_metadata(self) -> None:
+        provider = _RefreshingStrategyProvider()
+        summary = run_checkpoint_arena(
+            candidate_model=_UncertainArenaModel(),
+            baseline_model=_UncertainArenaModel(),
+            initial_states=[self.initial_state],
+            candidate_id="candidate",
+            baseline_id="baseline",
+            config=ArenaConfig(
+                games=1,
+                simulations=1,
+                max_plies=1,
+                seed=7,
+                adjudicate_max_plies=False,
+                strategy_refresh_on_uncertainty=True,
+                strategy_refresh_uncertainty_threshold=0.5,
+            ),
+            strategy_provider=provider,
+        )
+
+        self.assertEqual(["game_start", "high_uncertainty"], provider.phases)
+        game = summary.games[0]
+        self.assertEqual(1, game.metadata["strategy_refreshes"])
+        self.assertEqual("opening_plan", game.metadata["initial_strategy"]["strategy_id"])
+        self.assertEqual("refresh_plan", game.metadata["strategy"]["strategy_id"])
+        self.assertEqual("test_provider", game.metadata["strategy_provider"]["provider"])
+        self.assertTrue(bool(game.metadata["strategy_refresh_on_uncertainty"]))
 
 
 def _arena_game(
