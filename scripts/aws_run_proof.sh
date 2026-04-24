@@ -94,6 +94,28 @@ print(payload["benchmark_summary"]["examples_per_second_average"])
 PY
 }
 
+resolve_llm_api_key_env() {
+  if [[ -n "$LLM_API_KEY_ENV" ]]; then
+    echo "$LLM_API_KEY_ENV"
+    return
+  fi
+  case "$LLM_PROVIDER" in
+    anthropic)
+      echo "ANTHROPIC_API_KEY"
+      ;;
+    openai)
+      echo "OPENAI_API_KEY"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+llm_required_for_run() {
+  [[ "$STRATEGY_PROVIDER" == "llm" || "$CURRICULUM_PROVIDER_MODE" == "live_llm" ]]
+}
+
 DEVICE="${DEVICE:-cuda}"
 SELFPLAY_DEVICE="${SELFPLAY_DEVICE:-cpu}"
 INFERENCE_DEVICE="${INFERENCE_DEVICE:-$DEVICE}"
@@ -153,6 +175,12 @@ CURRICULUM_KNOWN_WEIGHT="${CURRICULUM_KNOWN_WEIGHT:-0.2}"
 CURRICULUM_RECENT_WEIGHT="${CURRICULUM_RECENT_WEIGHT:-0.2}"
 CURRICULUM_COMPOSITION_WEIGHT="${CURRICULUM_COMPOSITION_WEIGHT:-0.0}"
 CURRICULUM_RECENT_WINDOW="${CURRICULUM_RECENT_WINDOW:-2}"
+REPLAY_SAMPLING_STRATEGY="${REPLAY_SAMPLING_STRATEGY:-bucket_balanced}"
+REPLAY_RECENT_CYCLE_WINDOW="${REPLAY_RECENT_CYCLE_WINDOW:-1}"
+REPLAY_RECENT_BUCKET_WEIGHT="${REPLAY_RECENT_BUCKET_WEIGHT:-3.0}"
+REPLAY_KNOWN_BUCKET_WEIGHT="${REPLAY_KNOWN_BUCKET_WEIGHT:-2.0}"
+REPLAY_COMPOSITION_BUCKET_WEIGHT="${REPLAY_COMPOSITION_BUCKET_WEIGHT:-2.5}"
+REPLAY_FOUNDATION_BUCKET_WEIGHT="${REPLAY_FOUNDATION_BUCKET_WEIGHT:-1.0}"
 STRATEGY_PROVIDER="${STRATEGY_PROVIDER:-llm}"
 STRATEGY_FILE="${STRATEGY_FILE:-}"
 STRATEGY_CACHE_SCOPE="${STRATEGY_CACHE_SCOPE:-world_phase}"
@@ -178,6 +206,14 @@ REPLAY_WINDOW_CYCLES="${REPLAY_WINDOW_CYCLES:-6}"
 ENABLE_SCHEDULED_CURRICULUM="${ENABLE_SCHEDULED_CURRICULUM:-1}"
 CURRICULUM_PROVIDER_MODE="${CURRICULUM_PROVIDER_MODE:-live_llm}"
 CURRICULUM_TASKS="${CURRICULUM_TASKS:-1:101:capture_sprint:train:introduced;2:202:phase_rook:train:introduced;3:303:turn_charge:train:introduced;4:404:edge_sumo:train:introduced;5:505:capture_sprint:train:introduced;6:606:phase_rook:train:introduced}"
+LLM_PROVIDER="${LLM_PROVIDER:-${PIXIE_LLM_PROVIDER:-anthropic}}"
+LLM_MODEL="${LLM_MODEL:-${PIXIE_LLM_MODEL:-}}"
+LLM_API_KEY_ENV="${LLM_API_KEY_ENV:-${PIXIE_LLM_API_KEY_ENV:-}}"
+LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-}"
+LLM_TIMEOUT_SECONDS="${LLM_TIMEOUT_SECONDS:-}"
+LLM_TEMPERATURE="${LLM_TEMPERATURE:-}"
+LLM_EFFORT="${LLM_EFFORT:-high}"
+NO_LLM_THINKING="${NO_LLM_THINKING:-0}"
 RUN_THROUGHPUT_PREFLIGHT="${RUN_THROUGHPUT_PREFLIGHT:-1}"
 AUTO_TUNE_WORKERS="${AUTO_TUNE_WORKERS:-1}"
 THROUGHPUT_DIR="${THROUGHPUT_DIR:-$OUTPUT_DIR/preflight}"
@@ -213,6 +249,11 @@ if [[ "$STRATEGY_REFRESH_ON_UNCERTAINTY" != "0" && "$STRATEGY_REFRESH_ON_UNCERTA
   exit 1
 fi
 
+if [[ "$NO_LLM_THINKING" != "0" && "$NO_LLM_THINKING" != "1" ]]; then
+  echo "NO_LLM_THINKING must be 0 or 1, found: $NO_LLM_THINKING" >&2
+  exit 1
+fi
+
 if [[ "$STRATEGY_REFRESH_ON_UNCERTAINTY" == "1" && "$STRATEGY_PROVIDER" == "none" ]]; then
   echo "STRATEGY_REFRESH_ON_UNCERTAINTY=1 requires STRATEGY_PROVIDER to be non-none" >&2
   exit 1
@@ -226,6 +267,22 @@ fi
 if [[ -n "$THROUGHPUT_CHECKPOINT" && ! -f "$THROUGHPUT_CHECKPOINT" ]]; then
   echo "THROUGHPUT_CHECKPOINT does not exist: $THROUGHPUT_CHECKPOINT" >&2
   exit 1
+fi
+
+if llm_required_for_run; then
+  if [[ "$LLM_PROVIDER" != "anthropic" && "$LLM_PROVIDER" != "openai" ]]; then
+    echo "LLM_PROVIDER must be anthropic or openai, found: $LLM_PROVIDER" >&2
+    exit 1
+  fi
+  LLM_KEY_ENV_NAME="$(resolve_llm_api_key_env)"
+  if [[ -z "$LLM_KEY_ENV_NAME" ]]; then
+    echo "Unable to resolve API key environment variable for LLM_PROVIDER=$LLM_PROVIDER" >&2
+    exit 1
+  fi
+  if [[ -z "${!LLM_KEY_ENV_NAME:-}" ]]; then
+    echo "Live LLM run requires $LLM_KEY_ENV_NAME to be set in the environment" >&2
+    exit 1
+  fi
 fi
 
 sync_outputs() {
@@ -375,7 +432,9 @@ cat <<EOF
 [aws-run-proof] value_targets=root:$ROOT_VALUE_TARGET_WEIGHT outcome:$OUTCOME_TARGET_WEIGHT uncertainty_weight=$UNCERTAINTY_WEIGHT
 [aws-run-proof] adaptive_search=$ADAPTIVE_SEARCH adaptive_min=${ADAPTIVE_MIN_SIMULATIONS:-<none>} adaptive_max=${ADAPTIVE_MAX_SIMULATIONS:-<none>}
 [aws-run-proof] curriculum_weights=foundation:$CURRICULUM_FOUNDATION_WEIGHT known:$CURRICULUM_KNOWN_WEIGHT recent:$CURRICULUM_RECENT_WEIGHT composition:$CURRICULUM_COMPOSITION_WEIGHT recent_window=$CURRICULUM_RECENT_WINDOW
+[aws-run-proof] replay_sampling=strategy:$REPLAY_SAMPLING_STRATEGY recent_window:$REPLAY_RECENT_CYCLE_WINDOW recent:$REPLAY_RECENT_BUCKET_WEIGHT known:$REPLAY_KNOWN_BUCKET_WEIGHT composition:$REPLAY_COMPOSITION_BUCKET_WEIGHT foundation:$REPLAY_FOUNDATION_BUCKET_WEIGHT
 [aws-run-proof] strategy_provider=$STRATEGY_PROVIDER strategy_file=${STRATEGY_FILE:-<none>} strategy_cache_scope=$STRATEGY_CACHE_SCOPE strategy_refresh=$STRATEGY_REFRESH_ON_UNCERTAINTY strategy_refresh_threshold=$STRATEGY_REFRESH_UNCERTAINTY_THRESHOLD
+[aws-run-proof] llm_provider=$LLM_PROVIDER llm_model=${LLM_MODEL:-<default>} llm_api_key_env=$(resolve_llm_api_key_env) llm_effort=$LLM_EFFORT llm_thinking=$(( 1 - NO_LLM_THINKING ))
 [aws-run-proof] randomize_handauthored_specials=$RANDOMIZE_HANDAUTHORED_SPECIALS
 [aws-run-proof] throughput_preflight=$RUN_THROUGHPUT_PREFLIGHT auto_tune_workers=$AUTO_TUNE_WORKERS periodic_sync=$PERIODIC_SYNC sync_interval_seconds=$SYNC_INTERVAL_SECONDS
 [aws-run-proof] benchmark_manifest=${BENCHMARK_MANIFEST:-<none>}
@@ -451,6 +510,12 @@ train_loop_cmd=(
   --curriculum-recent-weight "$CURRICULUM_RECENT_WEIGHT"
   --curriculum-composition-weight "$CURRICULUM_COMPOSITION_WEIGHT"
   --curriculum-recent-window "$CURRICULUM_RECENT_WINDOW"
+  --replay-sampling-strategy "$REPLAY_SAMPLING_STRATEGY"
+  --replay-recent-cycle-window "$REPLAY_RECENT_CYCLE_WINDOW"
+  --replay-recent-bucket-weight "$REPLAY_RECENT_BUCKET_WEIGHT"
+  --replay-known-bucket-weight "$REPLAY_KNOWN_BUCKET_WEIGHT"
+  --replay-composition-bucket-weight "$REPLAY_COMPOSITION_BUCKET_WEIGHT"
+  --replay-foundation-bucket-weight "$REPLAY_FOUNDATION_BUCKET_WEIGHT"
   --piece-registry "$PIECE_REGISTRY"
   --special-piece-inclusion-probability "$SPECIAL_PIECE_INCLUSION_PROBABILITY"
   --replay-window-cycles "$REPLAY_WINDOW_CYCLES"
@@ -505,6 +570,31 @@ fi
 
 if [[ -n "$BENCHMARK_MANIFEST" ]]; then
   train_loop_cmd+=(--benchmark-manifest "$BENCHMARK_MANIFEST" --benchmark-dir "$BENCHMARK_DIR")
+fi
+
+if llm_required_for_run || [[ -n "$LLM_MODEL" || -n "$LLM_API_KEY_ENV" || -n "$LLM_MAX_TOKENS" || -n "$LLM_TIMEOUT_SECONDS" || -n "$LLM_TEMPERATURE" || -n "$LLM_EFFORT" || "$NO_LLM_THINKING" == "1" ]]; then
+  train_loop_cmd+=(--llm-provider "$LLM_PROVIDER")
+  if [[ -n "$LLM_MODEL" ]]; then
+    train_loop_cmd+=(--llm-model "$LLM_MODEL")
+  fi
+  if [[ -n "$LLM_API_KEY_ENV" ]]; then
+    train_loop_cmd+=(--llm-api-key-env "$LLM_API_KEY_ENV")
+  fi
+  if [[ -n "$LLM_MAX_TOKENS" ]]; then
+    train_loop_cmd+=(--llm-max-tokens "$LLM_MAX_TOKENS")
+  fi
+  if [[ -n "$LLM_TIMEOUT_SECONDS" ]]; then
+    train_loop_cmd+=(--llm-timeout-seconds "$LLM_TIMEOUT_SECONDS")
+  fi
+  if [[ -n "$LLM_TEMPERATURE" ]]; then
+    train_loop_cmd+=(--llm-temperature "$LLM_TEMPERATURE")
+  fi
+  if [[ -n "$LLM_EFFORT" ]]; then
+    train_loop_cmd+=(--llm-effort "$LLM_EFFORT")
+  fi
+  if [[ "$NO_LLM_THINKING" == "1" ]]; then
+    train_loop_cmd+=(--no-llm-thinking)
+  fi
 fi
 
 if [[ "$ENABLE_SCHEDULED_CURRICULUM" == "1" ]]; then
